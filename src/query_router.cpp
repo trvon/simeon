@@ -44,6 +44,12 @@ QueryFeatures QueryRouter::features(std::string_view query) const {
     std::uint32_t present = 0;
     std::uint64_t char_sum = 0;
     float min_idf_seen = std::numeric_limits<float>::infinity();
+    // Step 1k B2: collect per-distinct-term query counts so simplified
+    // clarity uses the true MLE p(t|Q) (duplicate query terms contribute
+    // once to the KL sum, weighted by their query-side count).
+    std::unordered_map<std::uint64_t, std::uint32_t> q_count;
+    q_count.reserve(words.size());
+    double scq_sum_acc = 0.0;
     for (const auto& w : words) {
         char_sum += w.size();
         const std::uint32_t df = idx_.df(w);
@@ -57,6 +63,15 @@ QueryFeatures QueryRouter::features(std::string_view query) const {
         if (i > f.max_idf) f.max_idf = i;
         if (i < min_idf_seen) min_idf_seen = i;
         ++present;
+        // SCQ: (1 + log(tf_C(t))) * idf(t). Per-occurrence accumulation
+        // matches Zhao 2008's sum-over-query-terms definition (duplicate
+        // terms contribute twice).
+        const std::uint64_t ttf = idx_.total_tf(w);
+        if (ttf > 0) {
+            scq_sum_acc +=
+                (1.0 + std::log(static_cast<double>(ttf))) * static_cast<double>(i);
+        }
+        ++q_count[idx_.hash_term(w)];
     }
     f.oov_rate = static_cast<float>(oov) / static_cast<float>(f.n_terms);
     if (present > 0) {
@@ -70,6 +85,30 @@ QueryFeatures QueryRouter::features(std::string_view query) const {
     }
     f.avg_term_chars = static_cast<float>(static_cast<double>(char_sum) /
                                           static_cast<double>(f.n_terms));
+    f.scq_sum = static_cast<float>(scq_sum_acc);
+    // Simplified clarity: Σ_t p(t|Q) log(p(t|Q) / p(t|C)) over distinct
+    // present query terms. q_count was filled above (only present terms).
+    const std::uint64_t total_tokens = idx_.total_tokens();
+    if (!q_count.empty() && total_tokens > 0) {
+        const double q_norm = static_cast<double>(f.n_terms);
+        const double c_norm = static_cast<double>(total_tokens);
+        double clarity_acc = 0.0;
+        std::unordered_map<std::uint64_t, bool> visited;
+        visited.reserve(q_count.size());
+        for (const auto& w : words) {
+            const std::uint64_t h = idx_.hash_term(w);
+            if (visited[h]) continue;
+            visited[h] = true;
+            const std::uint64_t ttf = idx_.total_tf(w);
+            if (ttf == 0) continue;
+            const auto it = q_count.find(h);
+            if (it == q_count.end() || it->second == 0) continue;
+            const double p_q = static_cast<double>(it->second) / q_norm;
+            const double p_c = static_cast<double>(ttf) / c_norm;
+            clarity_acc += p_q * std::log(p_q / p_c);
+        }
+        f.simplified_clarity = static_cast<float>(clarity_acc);
+    }
     return f;
 }
 
@@ -160,7 +199,9 @@ Recipe QueryRouter::choose(const QueryFeatures& f) const noexcept {
         f.n_terms >= cfg_.atire_min_terms &&
         f.min_idf >= cfg_.atire_min_idf_floor &&
         f.pool_overlap_jaccard <= cfg_.atire_max_pool_jaccard &&
-        f.score_decay_rate >= cfg_.atire_min_score_decay) {
+        f.score_decay_rate >= cfg_.atire_min_score_decay &&
+        f.scq_sum >= cfg_.atire_min_scq &&
+        f.simplified_clarity <= cfg_.atire_max_clarity) {
         return Recipe::Bm25Atire;
     }
     if (f.n_terms >= cfg_.cascade_min_terms && f.avg_idf <= cfg_.cascade_max_idf) {

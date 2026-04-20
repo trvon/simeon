@@ -189,6 +189,67 @@ void test_default_router_unchanged_by_step1f_gates() {
     assert(r.choose("apoptosis") == Recipe::Bm25Atire);
 }
 
+void test_features_scq_and_clarity_present_for_in_vocab() {
+    auto idx = build_idx();
+    QueryRouter r(idx);
+    auto f = r.features("apoptosis");
+    // SCQ = (1 + log(tf_C)) * idf. "apoptosis" appears once; idf > 0.
+    assert(f.scq_sum > 0.0f);
+    // Simplified clarity with a single distinct in-vocab term collapses to
+    //   1 * log(1 / p(t|C)) = -log(p(t|C)) > 0 whenever the term is rarer
+    // than uniform — true on any real-sized corpus.
+    assert(f.simplified_clarity > 0.0f);
+}
+
+void test_features_scq_zero_on_all_oov() {
+    auto idx = build_idx();
+    QueryRouter r(idx);
+    auto f = r.features("blockchain quantum");
+    assert(f.scq_sum == 0.0f);
+    assert(f.simplified_clarity == 0.0f);
+}
+
+void test_features_scq_monotone_with_duplicate_query_terms() {
+    auto idx = build_idx();
+    QueryRouter r(idx);
+    auto f1 = r.features("apoptosis");
+    auto f2 = r.features("apoptosis apoptosis");
+    // SCQ sums per occurrence; duplicates double the sum.
+    assert(f2.scq_sum > f1.scq_sum);
+}
+
+void test_atire_min_scq_blocks_low_scq_query() {
+    auto idx = build_idx();
+    QueryRouter probe(idx, RouterConfig{});
+    auto f = probe.features("apoptosis");
+    RouterConfig cfg;
+    cfg.high_idf_threshold = 1.5f;
+    cfg.atire_min_scq = f.scq_sum + 1.0f;  // set floor above query's SCQ
+    QueryRouter r(idx, cfg);
+    assert(r.choose("apoptosis") != Recipe::Bm25Atire);
+}
+
+void test_atire_max_clarity_blocks_high_clarity_query() {
+    auto idx = build_idx();
+    QueryRouter probe(idx, RouterConfig{});
+    auto f = probe.features("apoptosis");
+    RouterConfig cfg;
+    cfg.high_idf_threshold = 1.5f;
+    cfg.atire_max_clarity = f.simplified_clarity * 0.5f;  // ceiling below query's clarity
+    QueryRouter r(idx, cfg);
+    assert(r.choose("apoptosis") != Recipe::Bm25Atire);
+}
+
+void test_default_router_unchanged_by_step1k_gates() {
+    auto idx = build_idx();
+    RouterConfig cfg;  // defaults: atire_min_scq=0, atire_max_clarity=inf
+    cfg.high_idf_threshold = 1.5f;
+    QueryRouter r(idx, cfg);
+    // With default zero SCQ floor and infinite clarity ceiling, Step 1k B2
+    // gates are no-ops — "apoptosis" still routes to Atire.
+    assert(r.choose("apoptosis") == Recipe::Bm25Atire);
+}
+
 void test_recipe_name_round_trip() {
     using simeon::recipe_name;
     assert(std::string(recipe_name(Recipe::Bm25Atire)) == "Bm25Atire");
@@ -213,6 +274,12 @@ int main() {
     test_atire_min_terms_blocks_short_high_idf();
     test_atire_min_idf_floor_blocks_uneven_query();
     test_default_router_unchanged_by_step1f_gates();
+    test_features_scq_and_clarity_present_for_in_vocab();
+    test_features_scq_zero_on_all_oov();
+    test_features_scq_monotone_with_duplicate_query_terms();
+    test_atire_min_scq_blocks_low_scq_query();
+    test_atire_max_clarity_blocks_high_clarity_query();
+    test_default_router_unchanged_by_step1k_gates();
     test_recipe_name_round_trip();
     return 0;
 }

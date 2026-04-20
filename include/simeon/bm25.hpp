@@ -27,6 +27,16 @@ enum class Bm25Variant : std::uint8_t {
     // Amati DFR DLH13 (Terrier reference). Parameter-free divergence-from-
     // randomness scorer; uses corpus-wide term frequency, no k1/b/δ.
     DLH13,
+    // Amati & van Rijsbergen 2002 DFR PL2 (Poisson with Laplace after-effect
+    // and L2 length normalization, Terrier reference). Score uses
+    // tfn = tf * log2(1 + c * avg_dl / dl), then the Stirling-Poisson form
+    // (1/(tfn+1)) * (tfn*log2(tfn/λ) + (λ-tfn)*log2(e) + 0.5*log2(2π·tfn))
+    // with λ = ttf / N. Free parameter c defaults to 1.0 per Terrier.
+    PL2,
+    // Amati 2007 DFR DPH (hypergeometric, Terrier reference). Parameter-free:
+    // norm = (1 - tf/dl)² / (tf + 1) gates the Stirling log-argument
+    // tf * avg_dl / dl * N / ttf. No free parameter.
+    DPH,
     // Dirichlet-smoothed LM / DCM (Madsen-Kauchak-Elkan 2005, ICML, "Modeling
     // Word Burstiness"; related to Zhai-Lafferty 2001 Dirichlet smoothing).
     // Per-term contribution log(1 + tf * total_tokens / (α_sum * ttf)), where
@@ -63,6 +73,9 @@ struct Bm25Config {
     // (uses avg_dl at finalize() time, matching Zhai-Lafferty μ=avg_dl).
     // Ignored by other variants.
     float dcm_alpha_sum = 0.0f;
+    // Free parameter c for PL2. Terrier default is 1.0. Ignored by other
+    // variants.
+    float pl2_c = 1.0f;
 };
 
 // Streaming BM25 index over word tokens. Tokenization reuses the simeon
@@ -90,6 +103,46 @@ public:
     // + one hash + one map lookup. Requires finalize() to have been called.
     std::uint32_t df(std::string_view term) const noexcept;
     float idf(std::string_view term) const noexcept;
+    // Corpus-wide term frequency (Σ_d tf(term, d)). 0 for OOV terms. Used by
+    // Step 1k Pass E predictors (SCQ, simplified clarity) which need
+    // collection statistics beyond df/idf.
+    std::uint64_t total_tf(std::string_view term) const noexcept;
+    // Total token count across all docs = Σ_d doc_length(d). Cheap; cached
+    // at finalize(). Used by simplified clarity to normalize collection LM.
+    std::uint64_t total_tokens() const noexcept { return total_tokens_; }
+
+    // Hash `term` using the same scheme score() / df() / idf() use. Returns
+    // the raw uint64 hash (not the IDF). Cheap: one tokenize of the single
+    // term plus one hash call; exposes no corpus state. Used by PRF to build
+    // weighted-term queries without re-tokenizing through the full pipeline.
+    std::uint64_t hash_term(std::string_view term) const noexcept;
+
+    // Per-doc length in word tokens (the same dl used in BM25 scoring).
+    // Returns 0 for out-of-range doc_id.
+    std::uint32_t doc_length(std::uint32_t doc_id) const noexcept {
+        return doc_id < doc_lengths_.size() ? doc_lengths_[doc_id] : 0u;
+    }
+
+    // Build an RM1-style relevance model from the top-K feedback docs.
+    // For each term w present in any feedback doc, writes
+    //   weight(w) = Σ_{d ∈ top_k_docs} (tf(w, d) / dl(d)) * doc_weights[d_idx]
+    // into `out_terms` as (term_hash, weight). Caller normalizes / trims.
+    // top_k_docs and doc_weights must have the same size; doc_weights are
+    // typically normalized first-pass BM25 scores.
+    void build_relevance_model(
+        std::span<const std::uint32_t> top_k_docs, std::span<const float> doc_weights,
+        std::vector<std::pair<std::uint64_t, float>>& out_terms) const;
+
+    // Score each doc by Σ_w weight(w) * per-term-contribution(w, d), using
+    // the same Bm25Variant-dispatched scoring inner loop score() uses.
+    // `weighted_terms` is (term_hash, weight) — hashes must be produced via
+    // this index's hash_term() or df()/idf() will mis-match. Unlike score(),
+    // this path never invokes the SubwordAwareBackoff n-gram fallback (no
+    // per-term strings available); for SAB indexes the expansion is scored
+    // on the exact word-posting path only.
+    void score_weighted_hashes(
+        std::span<const std::pair<std::uint64_t, float>> weighted_terms,
+        std::span<float> out_scores) const;
 
 private:
     // After finalize(), each posting list carries the term's IDF inline, so

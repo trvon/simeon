@@ -86,6 +86,58 @@ inline float score_dcm(float tf, std::uint64_t total_tokens, float ttf, float al
     return std::log1p(ratio);
 }
 
+// PL2 (Amati & van Rijsbergen 2002, Terrier reference): Poisson with Laplace
+// after-effect and L2 length normalization. Returns 0 for degenerate inputs
+// so a pathological term never poisons a doc score.
+inline float score_pl2(float tf, float dl, float avg_dl, float n_docs, float ttf, float c) noexcept {
+    if (dl <= 0.0f || tf <= 0.0f || ttf <= 0.0f || n_docs <= 0.0f || c <= 0.0f)
+        return 0.0f;
+    constexpr float kInvLog2 = 1.4426950408889634f; // 1/ln(2)
+    const float norm_arg = 1.0f + c * avg_dl / dl;
+    if (norm_arg <= 0.0f)
+        return 0.0f;
+    const float tfn = tf * std::log(norm_arg) * kInvLog2;
+    if (tfn <= 0.0f)
+        return 0.0f;
+    const float lambda = ttf / n_docs;
+    if (lambda <= 0.0f)
+        return 0.0f;
+    const float ratio = tfn / lambda;
+    if (ratio <= 0.0f)
+        return 0.0f;
+    constexpr float kLog2E = 1.4426950408889634f; // log2(e) = 1/ln(2)
+    const float term1 = tfn * std::log(ratio) * kInvLog2;
+    const float term2 = (lambda - tfn) * kLog2E;
+    const float two_pi_tfn = 2.0f * 3.14159265358979323846f * tfn;
+    if (two_pi_tfn <= 0.0f)
+        return 0.0f;
+    const float term3 = 0.5f * std::log(two_pi_tfn) * kInvLog2;
+    return (term1 + term2 + term3) / (tfn + 1.0f);
+}
+
+// DPH (Amati 2007 hypergeometric, Terrier reference): parameter-free DFR.
+// norm = (1 - tf/dl)^2 / (tf + 1) gates the Stirling log-argument
+// tf * avg_dl / dl * N / ttf. Returns 0 for degenerate inputs.
+inline float score_dph(float tf, float dl, float avg_dl, float n_docs, float ttf) noexcept {
+    if (dl <= 0.0f || tf <= 0.0f || ttf <= 0.0f || n_docs <= 0.0f)
+        return 0.0f;
+    const float f = tf / dl;
+    const float one_minus_f = 1.0f - f;
+    if (one_minus_f <= 0.0f)
+        return 0.0f;
+    const float norm = (one_minus_f * one_minus_f) / (tf + 1.0f);
+    const float arg1 = (tf * avg_dl / dl) * (n_docs / ttf);
+    if (arg1 <= 0.0f)
+        return 0.0f;
+    constexpr float kInvLog2 = 1.4426950408889634f; // 1/ln(2)
+    const float term1 = tf * std::log(arg1) * kInvLog2;
+    const float two_pi_tf_oneminusf = 2.0f * 3.14159265358979323846f * tf * one_minus_f;
+    if (two_pi_tf_oneminusf <= 0.0f)
+        return 0.0f;
+    const float term2 = 0.5f * std::log(two_pi_tf_oneminusf) * kInvLog2;
+    return norm * (term1 + term2);
+}
+
 // DLH13 (Amati DFR, Terrier reference impl): parameter-free divergence-from-
 // randomness. Returns 0 for degenerate inputs (tf>=dl, ttf=0, dl=0) so a
 // pathological term never poisons a doc score.
@@ -130,6 +182,109 @@ float Bm25Index::idf(std::string_view term) const noexcept {
     if (it == postings_.end())
         return 0.0f;
     return it->second.idf;
+}
+
+std::uint64_t Bm25Index::hash_term(std::string_view term) const noexcept {
+    return hash64(term, cfg_.hash_seed, cfg_.hash);
+}
+
+std::uint64_t Bm25Index::total_tf(std::string_view term) const noexcept {
+    if (!finalized_ || term.empty())
+        return 0;
+    const std::uint64_t h = hash64(term, cfg_.hash_seed, cfg_.hash);
+    auto it = postings_.find(h);
+    if (it == postings_.end())
+        return 0;
+    return it->second.total_tf;
+}
+
+void Bm25Index::build_relevance_model(
+    std::span<const std::uint32_t> top_k_docs, std::span<const float> doc_weights,
+    std::vector<std::pair<std::uint64_t, float>>& out_terms) const {
+    out_terms.clear();
+    if (!finalized_ || top_k_docs.empty() || top_k_docs.size() != doc_weights.size())
+        return;
+
+    // Flat doc_id → weight map via small array (top_k_docs is typically small).
+    // For each term, walk its posting list and accumulate weight when doc is
+    // in the feedback set. Posting lists are in ascending doc-id order.
+    std::unordered_map<std::uint32_t, float> weight_by_doc;
+    weight_by_doc.reserve(top_k_docs.size() * 2);
+    for (std::size_t i = 0; i < top_k_docs.size(); ++i) {
+        weight_by_doc.emplace(top_k_docs[i], doc_weights[i]);
+    }
+
+    for (const auto& [h, tp] : postings_) {
+        float acc = 0.0f;
+        for (const auto& [did, tf] : tp.docs) {
+            auto wit = weight_by_doc.find(did);
+            if (wit == weight_by_doc.end())
+                continue;
+            const float dl = static_cast<float>(doc_lengths_[did]);
+            if (dl <= 0.0f)
+                continue;
+            acc += (static_cast<float>(tf) / dl) * wit->second;
+        }
+        if (acc > 0.0f)
+            out_terms.emplace_back(h, acc);
+    }
+}
+
+void Bm25Index::score_weighted_hashes(
+    std::span<const std::pair<std::uint64_t, float>> weighted_terms,
+    std::span<float> out_scores) const {
+    if (!finalized_)
+        throw std::runtime_error("Bm25Index::score_weighted_hashes before finalize()");
+    if (out_scores.size() != doc_lengths_.size()) {
+        throw std::runtime_error("Bm25Index::score_weighted_hashes out_scores size mismatch");
+    }
+    std::fill(out_scores.begin(), out_scores.end(), 0.0f);
+
+    const float k1 = cfg_.k1;
+    const float b = cfg_.b;
+    const float avg = avg_dl_ > 0.0f ? avg_dl_ : 1.0f;
+    const float delta = cfg_.delta;
+    const float n_docs = static_cast<float>(doc_lengths_.size());
+
+    for (const auto& [h, w] : weighted_terms) {
+        if (w <= 0.0f)
+            continue;
+        const auto pit = postings_.find(h);
+        if (pit == postings_.end())
+            continue;
+        const float idf = pit->second.idf;
+        const float ttf = static_cast<float>(pit->second.total_tf);
+        for (const auto& [did, tf] : pit->second.docs) {
+            const float tff = static_cast<float>(tf);
+            const float dl = static_cast<float>(doc_lengths_[did]);
+            float contribution = 0.0f;
+            switch (cfg_.variant) {
+                case Bm25Variant::Atire:
+                    contribution = score_atire(tff, dl, idf, k1, b, avg);
+                    break;
+                case Bm25Variant::BM25Plus:
+                case Bm25Variant::SubwordAwareBackoff:
+                    contribution = score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
+                    break;
+                case Bm25Variant::BM25L:
+                    contribution = score_bm25_l(tff, dl, idf, k1, b, avg, delta);
+                    break;
+                case Bm25Variant::DLH13:
+                    contribution = score_dlh13(tff, dl, avg, n_docs, ttf);
+                    break;
+                case Bm25Variant::PL2:
+                    contribution = score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
+                    break;
+                case Bm25Variant::DPH:
+                    contribution = score_dph(tff, dl, avg, n_docs, ttf);
+                    break;
+                case Bm25Variant::Dcm:
+                    contribution = score_dcm(tff, total_tokens_, ttf, alpha_sum_);
+                    break;
+            }
+            out_scores[did] += w * contribution;
+        }
+    }
 }
 
 void Bm25Index::add_doc(std::string_view text) {
@@ -343,6 +498,12 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
                     break;
                 case Bm25Variant::DLH13:
                     contribution = score_dlh13(tff, dl, avg, n_docs, ttf);
+                    break;
+                case Bm25Variant::PL2:
+                    contribution = score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
+                    break;
+                case Bm25Variant::DPH:
+                    contribution = score_dph(tff, dl, avg, n_docs, ttf);
                     break;
                 case Bm25Variant::Dcm:
                     contribution = score_dcm(tff, total_tokens_, ttf, alpha_sum_);

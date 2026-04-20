@@ -28,6 +28,7 @@
 #include "simeon/minhash.hpp"
 #include "simeon/pmi.hpp"
 #include "simeon/pq.hpp"
+#include "simeon/prf.hpp"
 #include "simeon/query_router.hpp"
 #include "simeon/simd.hpp"
 #include "simeon/simeon.hpp"
@@ -432,6 +433,28 @@ void run_bm25(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
     emit(name, fx, score_rankings(rankings, fx), 0, t);
 }
 
+// BM25 with RM3 pseudo-relevance feedback expansion. Same BM25 variant the
+// passed-in idx was built with (Atire / BM25+ / SAB etc.); PRF only changes
+// the query, not the scorer. See include/simeon/prf.hpp for algorithm.
+void run_bm25_prf(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                  double build_us, const simeon::PrfConfig& pc) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> s(nd, 0.0f);
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        simeon::score_with_prf(idx, fx.query_texts[qi], s, pc);
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di) {
+            rankings[qi].emplace_back(s[di], di);
+        }
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
 void run_simeon_bm25_rrf(const char* name, simeon::EncoderConfig cfg, const Fixture& fx,
                          const simeon::Bm25Index& idx) {
     Timing t;
@@ -724,7 +747,8 @@ struct RouterCounts {
 void run_router_cascade(const char* name, simeon::EncoderConfig sc, const Fixture& fx,
                         const simeon::Bm25Index& atire_idx, const simeon::Bm25Index& sab_idx,
                         double bm25_build_us, std::uint32_t pool_size = 500,
-                        float cascade_alpha = 0.75f, simeon::RouterConfig rc = {}) {
+                        float cascade_alpha = 0.75f, simeon::RouterConfig rc = {},
+                        const simeon::PrfConfig* prf = nullptr) {
     Timing t;
     t.index_build_us = bm25_build_us;
 
@@ -754,13 +778,19 @@ void run_router_cascade(const char* name, simeon::EncoderConfig sc, const Fixtur
         rankings[qi].reserve(nd);
         if (recipe == simeon::Recipe::Bm25Atire) {
             ++counts.atire;
-            atire_idx.score(fx.query_texts[qi], scores);
+            if (prf)
+                simeon::score_with_prf(atire_idx, fx.query_texts[qi], scores, *prf);
+            else
+                atire_idx.score(fx.query_texts[qi], scores);
             for (std::uint32_t di = 0; di < nd; ++di) {
                 rankings[qi].emplace_back(scores[di], di);
             }
         } else if (recipe == simeon::Recipe::Bm25SabSmooth) {
             ++counts.sab;
-            sab_idx.score(fx.query_texts[qi], scores);
+            if (prf)
+                simeon::score_with_prf(sab_idx, fx.query_texts[qi], scores, *prf);
+            else
+                sab_idx.score(fx.query_texts[qi], scores);
             for (std::uint32_t di = 0; di < nd; ++di) {
                 rankings[qi].emplace_back(scores[di], di);
             }
@@ -1301,6 +1331,8 @@ int main(int argc, char** argv) {
     bm25_variant("bm25_plus", simeon::Bm25Variant::BM25Plus);
     bm25_variant("bm25_l", simeon::Bm25Variant::BM25L);
     bm25_variant("bm25_dlh13", simeon::Bm25Variant::DLH13);
+    bm25_variant("bm25_pl2", simeon::Bm25Variant::PL2);
+    bm25_variant("bm25_dph", simeon::Bm25Variant::DPH);
     bm25_variant("bm25_dcm", simeon::Bm25Variant::Dcm);
     auto sab_strict =
         bm25_variant("bm25_sab_strict", simeon::Bm25Variant::SubwordAwareBackoff, 1.0f, 0.0f);
@@ -1313,6 +1345,19 @@ int main(int argc, char** argv) {
                                 500, RM::SimeonCosine);
     run_bm25_pool_simeon_rerank("bm25_sab_strict_pool500_simeon_cos_4096_768", cfg768, fx,
                                 sab_strict.idx, 500, RM::SimeonCosine);
+
+    // Step 1k A1 — RM3 pseudo-relevance feedback (Lavrenko & Croft 2001).
+    // Canonical TREC settings (K=10, N=20, α=0.5) applied on top of the two
+    // strongest BM25 pool sources. Attacks the FiQA-style short+paraphrase
+    // query failure mode; expected no-op to modest-lift on scifact's short
+    // abstracts.
+    simeon::PrfConfig prf_canonical;
+    prf_canonical.k = 10;
+    prf_canonical.n_terms = 20;
+    prf_canonical.alpha = 0.5f;
+    run_bm25_prf("bm25_atire_rm3_k10_a0.5", fx, bm25.idx, bm25.build_us, prf_canonical);
+    run_bm25_prf("bm25_sab_smooth_rm3_k10_a0.5", fx, sab_smooth.idx, sab_smooth.build_us,
+                 prf_canonical);
 
     // Step 1g.2 — training-free PMI / co-occurrence embeddings. Rows tagged
     // `_incorpus` use the evaluation corpus itself as the seed corpus; that is
@@ -1435,6 +1480,17 @@ int main(int argc, char** argv) {
         // inside the cascade route (replaces the Achlioptas reranker).
         run_router_cascade("router_default_with_pmi256_cascade_incorpus", pmi256_cfg, fx, bm25.idx,
                            sab_smooth.idx, bm25.build_us + sab_smooth.build_us);
+
+        // Step 1k A1 — router integration with RM3 expansion on the Atire and
+        // SAB routes (cascade route's first-pass left un-expanded to keep its
+        // pool membership comparable to router_default_4096_768).
+        simeon::PrfConfig prf_router;
+        prf_router.k = 10;
+        prf_router.n_terms = 20;
+        prf_router.alpha = 0.5f;
+        run_router_cascade("router_default_with_rm3_k10_a0.5", cfg768, fx, bm25.idx, sab_smooth.idx,
+                           bm25.build_us + sab_smooth.build_us, 500, 0.75f, simeon::RouterConfig{},
+                           &prf_router);
     }
 
     // Step 1e — router ablation expansion. Two sweeps share an encoded corpus
@@ -1511,6 +1567,27 @@ int main(int argc, char** argv) {
                 std::snprintf(tagbuf, sizeof(tagbuf), "passD_jac%.1f_dec%.1f", jac, dec);
                 specs.push_back({tagbuf, rc, 500u, 0.75f, true, 50u});
             }
+        // Pass E — Step 1k B2. Sum-SCQ (Zhao 2008) and simplified clarity
+        // (Cronen-Townsend 2002) AND-gates on the Atire route. Both are
+        // pre-retrieval (no pool needed), so use_post_retrieval=false.
+        const float atire_scq_floors[] = {0.0f, 5.0f, 10.0f, 20.0f};
+        const float atire_clarity_ceils[] = {
+            std::numeric_limits<float>::infinity(), 3.0f, 5.0f, 8.0f};
+        for (float scq : atire_scq_floors)
+            for (float clar : atire_clarity_ceils) {
+                simeon::RouterConfig rc;
+                rc.oov_threshold = 0.0f;
+                rc.high_idf_threshold = 3.0f;
+                rc.cascade_min_terms = 4u;
+                rc.cascade_max_idf = 5.0f;
+                rc.atire_min_scq = scq;
+                rc.atire_max_clarity = clar;
+                const double clar_d = std::isinf(clar) ? 99.0 : clar;
+                std::snprintf(tagbuf, sizeof(tagbuf), "passE_scq%.0f_clar%.1f", scq,
+                              clar_d);
+                specs.push_back({tagbuf, rc, 500u, 0.75f, false, 50u});
+            }
+
         run_router_grid("router_grid_4096_768", cfg768, fx, bm25.idx, sab_smooth.idx,
                         bm25.build_us + sab_smooth.build_us,
                         std::span<const RouterSweepSpec>(specs));

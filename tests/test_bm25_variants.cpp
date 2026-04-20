@@ -41,7 +41,8 @@ Bm25Index build(Bm25Variant v) {
 
 void test_each_variant_deterministic() {
     for (auto v : {Bm25Variant::Atire, Bm25Variant::BM25Plus, Bm25Variant::BM25L,
-                   Bm25Variant::DLH13, Bm25Variant::Dcm, Bm25Variant::SubwordAwareBackoff}) {
+                   Bm25Variant::DLH13, Bm25Variant::PL2, Bm25Variant::DPH, Bm25Variant::Dcm,
+                   Bm25Variant::SubwordAwareBackoff}) {
         auto a = build(v);
         auto b = build(v);
         const std::size_t n = a.doc_count();
@@ -188,6 +189,83 @@ void test_subword_aware_strict_collapses_to_bm25plus_on_known_query() {
     }
 }
 
+void test_pl2_finite_and_ranks_relevant_doc() {
+    // PL2 is Poisson-Laplace DFR; should produce finite scores, rank a
+    // directly-on-topic doc above unrelated ones, and reject the all-zero
+    // degenerate case.
+    Bm25Index idx = build(Bm25Variant::PL2);
+    const std::size_t n = idx.doc_count();
+    std::vector<float> s(n, 0.0f);
+    idx.score("infection", s);
+    for (auto v : s)
+        assert(std::isfinite(v));
+    assert(s[1] > s[0]);
+    assert(s[1] > s[4]);
+}
+
+void test_pl2_c_parameter_changes_score() {
+    // c scales the length-normalization exponent; two different c values on
+    // the same corpus/query must diverge for at least one doc.
+    Bm25Config cfg_a;
+    cfg_a.variant = Bm25Variant::PL2;
+    cfg_a.pl2_c = 1.0f;
+    Bm25Config cfg_b;
+    cfg_b.variant = Bm25Variant::PL2;
+    cfg_b.pl2_c = 5.0f;
+    Bm25Index a(cfg_a), b(cfg_b);
+    for (const auto& d : toy_corpus()) {
+        a.add_doc(d);
+        b.add_doc(d);
+    }
+    a.finalize();
+    b.finalize();
+    const std::size_t n = a.doc_count();
+    std::vector<float> sa(n, 0.0f), sb(n, 0.0f);
+    a.score("infection", sa);
+    b.score("infection", sb);
+    bool differs = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (std::fabs(sa[i] - sb[i]) > 1e-5f) {
+            differs = true;
+            break;
+        }
+    }
+    assert(differs);
+}
+
+void test_dph_finite_and_ranks_relevant_doc() {
+    // DPH is parameter-free hypergeometric DFR; finite and relevant-ranking
+    // sanity like DLH13. The normalization (1 - tf/dl)^2 / (tf + 1) forces
+    // single-token docs (tf==dl) to score 0, which the test exercises via
+    // doc 1 containing "infection" among many other tokens.
+    Bm25Index idx = build(Bm25Variant::DPH);
+    const std::size_t n = idx.doc_count();
+    std::vector<float> s(n, 0.0f);
+    idx.score("infection", s);
+    for (auto v : s)
+        assert(std::isfinite(v));
+    assert(s[1] > s[0]);
+    assert(s[1] > s[4]);
+}
+
+void test_dph_single_token_doc_scores_zero() {
+    // DPH norm (1 - tf/dl)^2 = 0 when tf==dl, which happens when a doc is
+    // the bare query term and nothing else. Verifies the degenerate guard.
+    Bm25Config cfg;
+    cfg.variant = Bm25Variant::DPH;
+    Bm25Index idx(cfg);
+    idx.add_doc("alpha");
+    idx.add_doc("alpha beta gamma delta");
+    idx.finalize();
+    std::vector<float> s(2, 0.0f);
+    idx.score("alpha", s);
+    assert(std::isfinite(s[0]));
+    assert(std::isfinite(s[1]));
+    // Single-token doc (tf==dl) triggers the degenerate-input guard.
+    assert(s[0] == 0.0f);
+    assert(s[1] > 0.0f);
+}
+
 void test_dcm_produces_finite_scores_and_ranks_relevant_doc() {
     // DCM uses a Zhai-Lafferty Dirichlet-smoothed LM contribution:
     // log(1 + tf * total_tokens / (α_sum * ttf)). Should be finite and
@@ -304,6 +382,10 @@ int main() {
     test_bm25_plus_floor_lifts_long_doc_score_above_atire();
     test_bm25l_finite_and_increasing_in_tf();
     test_dlh13_produces_finite_scores_and_ranks_relevant_doc();
+    test_pl2_finite_and_ranks_relevant_doc();
+    test_pl2_c_parameter_changes_score();
+    test_dph_finite_and_ranks_relevant_doc();
+    test_dph_single_token_doc_scores_zero();
     test_dcm_produces_finite_scores_and_ranks_relevant_doc();
     test_dcm_monotone_in_tf();
     test_dcm_alpha_sum_override_is_deterministic();

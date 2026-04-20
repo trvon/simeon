@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string_view>
 
@@ -37,6 +38,16 @@ struct RouterConfig {
     // shows up as a sharp drop-off). Default 0.0 = pass; only consulted when
     // QueryFeatures::score_decay_rate was filled by features_with_pool().
     float atire_min_score_decay = 0.0f;
+    // (>=) Step 1k B2 AND-gate on the Atire route. Route only when the sum-SCQ
+    // (Zhao 2008) exceeds the floor — high SCQ indicates the query terms are
+    // well-supported in the collection, favoring Atire's exact-term scoring.
+    // Default 0.0 = pass (no constraint).
+    float atire_min_scq = 0.0f;
+    // (<=) Step 1k B2 AND-gate on the Atire route. Route only when simplified
+    // clarity (Cronen-Townsend 2002) is low — low clarity = query terms close
+    // to collection background, which Atire handles well without expansion.
+    // Default infinity = pass.
+    float atire_max_clarity = std::numeric_limits<float>::infinity();
     // (>=) → CascadeLinearAlpha gate (combined with cascade_max_idf).
     std::uint32_t cascade_min_terms = 4;
     // (<=) → CascadeLinearAlpha gate. Multi-term low-IDF queries benefit
@@ -87,6 +98,21 @@ struct QueryFeatures {
     // = pools disagree (router should pick carefully). Default 1.0 keeps the
     // Atire pool-Jaccard gate a no-op when post-retrieval signals are absent.
     float pool_overlap_jaccard = 1.0f;
+
+    // Step 1k B2 pre-retrieval predictors. Computed in features() from
+    // collection statistics (total_tf, total_tokens) — no first-pass scoring
+    // required, keeping them cheap.
+    //
+    // Sum-SCQ (Zhao, Scholer, Tsegay 2008): Σ_t (1 + log(tf_C(t))) · idf(t)
+    // over present query terms. High SCQ = query terms well-supported in the
+    // collection. 0 when every term is OOV.
+    float scq_sum = 0.0f;
+    // Simplified clarity score (Cronen-Townsend & Croft 2002 simplified form):
+    //   Σ_t p(t|Q) · log(p(t|Q) / p(t|C))
+    // where p(t|Q) = count_Q(t) / |Q|, p(t|C) = tf_C(t) / total_tokens.
+    // High clarity = query is topically distinctive from the background LM.
+    // 0 when every term is OOV or |Q|=0.
+    float simplified_clarity = 0.0f;
 };
 
 // Selects a Recipe per query from cheap pre-retrieval predictors. Holds a

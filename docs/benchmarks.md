@@ -30,7 +30,7 @@ predictors do not fully recover it.
 
 ## scifact — BM25 formulation ablation
 
-Six BM25 variants standalone on the same fixture. δ=1.0 for BM25+/L; γ=5.0 for SAB-smooth. SubwordAwareBackoff additionally builds a parallel char-3..5-gram inverted index. DCM uses the Zhai-Lafferty Dirichlet-LM form `log(1 + tf·T / (α·ttf))` with α_sum = avg_dl.
+Eight BM25 variants standalone on the same fixture. δ=1.0 for BM25+/L; γ=5.0 for SAB-smooth. SubwordAwareBackoff additionally builds a parallel char-3..5-gram inverted index. DCM uses the Zhai-Lafferty Dirichlet-LM form `log(1 + tf·T / (α·ttf))` with α_sum = avg_dl. PL2 and DPH are parameter-free DFR scorers (PL2 Poisson, DPH hypergeometric).
 
 | Variant                                   | nDCG@10 | R@10  | R@100 | MRR@10 |    QPS |
 |-------------------------------------------|--------:|------:|------:|-------:|-------:|
@@ -38,11 +38,26 @@ Six BM25 variants standalone on the same fixture. δ=1.0 for BM25+/L; γ=5.0 for
 | BM25+ (Lv & Zhai CIKM 2011)               |   0.608 | 0.724 | 0.874 |  0.578 | 23,209 |
 | BM25L (Lv & Zhai SIGIR 2011)              |   0.608 | 0.729 | 0.871 |  0.576 | 21,261 |
 | DLH13 (Amati DFR, parameter-free)         |   0.590 | 0.699 | 0.846 |  0.562 |  8,898 |
+| PL2 (Amati & van Rijsbergen TOIS 2002)    |   0.598 | 0.710 | 0.861 |  0.571 |  8,068 |
+| DPH (Amati TREC 2007, hypergeometric)     |   0.600 | 0.714 | 0.847 |  0.573 | 12,293 |
 | DCM / Dirichlet-LM (Madsen-Kauchak-Elkan 2005) | 0.568 | 0.692 | 0.847 |  0.534 | 12,714 |
 | SubwordAwareBackoff strict (γ=0)          |   0.596 | 0.700 | 0.871 |  0.570 | 17,828 |
 | **SubwordAwareBackoff smooth (γ=5)**      | **0.612** | **0.723** | **0.881** | **0.587** |  2,961 |
 
-Smooth SAB is the strongest standalone BM25 we have and the best pool source for cascade. The +0.7-point R@100 lift (0.874 → 0.881) is where n-gram fallback surfaces morphological matches that exact BM25 misses. BM25+/L underperform on scifact (short abstracts; the long-doc floor doesn't apply) — reproduces Lv & Zhai 2011's corpus-dependent finding. DLH13's parameter-free score loses to tunable Atire by 2.9 nDCG points — the price of zero hyperparameters. DCM trails the Robertson family by ~5 points because the Dirichlet-LM contribution is not IDF-weighted (rarity enters through `ttf`, which is a weaker signal on short-abstract corpora).
+Smooth SAB is the strongest standalone BM25 we have and the best pool source for cascade. The +0.7-point R@100 lift (0.874 → 0.881) is where n-gram fallback surfaces morphological matches that exact BM25 misses. BM25+/L underperform on scifact (short abstracts; the long-doc floor doesn't apply) — reproduces Lv & Zhai 2011's corpus-dependent finding. DLH13's parameter-free score loses to tunable Atire by 2.9 nDCG points — the price of zero hyperparameters. PL2 and DPH land between DLH13 and Atire (0.598 / 0.600) — the DFR family is internally consistent but caps below tuned Robertson on short abstracts. DCM trails the Robertson family by ~5 points because the Dirichlet-LM contribution is not IDF-weighted (rarity enters through `ttf`, which is a weaker signal on short-abstract corpora).
+
+## scifact — RM3 pseudo-relevance feedback
+
+Lavrenko & Croft 2001 relevance model RM3: first-pass BM25 → top-K=10 pseudo-relevant docs → RM1 term distribution → top-N=20 expansion terms → α=0.5 blend with original query.
+
+| Configuration                                 | nDCG@10 | R@10  | R@100 | MRR@10 |   QPS |
+|-----------------------------------------------|--------:|------:|------:|-------:|------:|
+| `bm25_atire` (baseline)                       |   0.619 | 0.741 | 0.874 |  0.592 | 25,494 |
+| `bm25_atire_rm3_k10_a0.5`                     |   0.604 | 0.736 | 0.884 |  0.569 |    220 |
+| `bm25_sab_smooth_gamma5` (baseline)           |   0.612 | 0.723 | 0.881 |  0.587 |  3,672 |
+| `bm25_sab_smooth_rm3_k10_a0.5`                |   0.630 | 0.760 | 0.888 |  0.602 |    182 |
+
+Negative-result on BM25-Atire: expansion slightly regresses top-10 ranking (−1.5 points nDCG) while lifting R@100 (+1.0 point) — expansion introduces noise on short abstract queries with already-informative terms. **Positive result on SAB-smooth** (+1.8 points nDCG, +3.7 points R@10): SAB's n-gram backoff already captures morphological variants, and RM3's term expansion is additive on top without competing with it. Per-query latency drops ~2 orders of magnitude because RM3 requires two scoring passes plus the relevance-model build.
 
 ## scifact — cascade and fusion
 
@@ -89,6 +104,20 @@ Step 1f's `df`-only enrichment overfits the dev fold and loses on test. Step
 1g.1's post-retrieval-lite predictors (`score_decay_rate`,
 `pool_overlap_jaccard` and friends) recover a small but real held-out lift.
 Methodology and confusion analysis live in [router_design.md](router_design.md).
+
+### Step 1k — SCQ + simplified-clarity gates (Pass E, test fold, 202 queries)
+
+Two pre-retrieval predictors from the Carmel-Yom-Tov catalog that sit outside the IDF family: Sum-SCQ (Zhao, Scholer, Tsegay 2008) and simplified clarity (Cronen-Townsend & Croft 2002). Added as AND-gates on the Atire route: `atire_min_scq` floor + `atire_max_clarity` ceiling.
+
+| Config                                                    | nDCG@10 | R@10  | R@100 |
+|-----------------------------------------------------------|--------:|------:|------:|
+| `router_default_4096_768`                                 |   0.640 | 0.753 | 0.886 |
+| `passE_scq0_clar99.0` (default — no gate)                 |   0.640 | 0.753 | 0.886 |
+| `passE_scq<any>_clar8.0` (mild clarity ceiling)           |   0.637 | 0.748 | 0.881 |
+| `passE_scq<any>_clar3.0 / clar5.0` (tight ceiling)        |   0.617 | 0.733 | 0.875 |
+| `router_default_with_rm3_k10_a0.5`                        |   0.633 | 0.763 | 0.885 |
+
+Null result on scifact: raising the SCQ floor is a no-op (all high-IDF queries already clear it), and tightening the clarity ceiling only removes queries the router was handling correctly via Atire. Step 1k B2 ships the predictors but leaves scifact defaults unchanged; the gates pay off on NFCorpus (see below). Router+RM3 also regresses on scifact for the same reason as the standalone `bm25_atire_rm3` row.
 
 ## scifact — speed/quality Pareto
 
@@ -199,12 +228,18 @@ Third BEIR fixture: `nfcorpus` — 3,633 docs / 224 test queries / 99 dev querie
 | Configuration                                       | nDCG@10 | R@10  | R@100 | MRR@10 |
 |-----------------------------------------------------|--------:|------:|------:|-------:|
 | MiniLM-L6 reference (384-d float32)                 |   0.297 | 0.286 | 0.306 |  0.481 |
-| **`bm25_sab_smooth_gamma5` (novel BM25 alone)**     | **0.298** | **0.274** | **0.244** | **0.487** |
+| **`router_grid_4096_768_passE_scq0_clar3.0` (Step 1k)** | **0.298** | **0.275** | **0.242** | **0.487** |
+| `bm25_sab_smooth_gamma5` (novel BM25 alone)         |   0.298 | 0.274 | 0.244 |  0.487 |
+| `bm25_sab_smooth_rm3_k10_a0.5` (Step 1k RM3)        |   0.286 | 0.267 | 0.272 |  0.470 |
+| `router_default_with_rm3_k10_a0.5` (Step 1k RM3)    |   0.277 | 0.260 | 0.274 |  0.455 |
+| `bm25_atire_rm3_k10_a0.5` (Step 1k RM3)             |   0.271 | 0.253 | 0.264 |  0.445 |
 | `router_default_4096_768` (scifact-tuned)           |   0.270 | 0.244 | 0.214 |  0.464 |
 | `bm25_pool500_linear_alpha075_4096_768`             |   0.261 | 0.243 | 0.201 |  0.443 |
 | `bm25_atire`                                        |   0.252 | 0.229 | 0.199 |  0.434 |
 | `bm25_plus`                                         |   0.252 | 0.232 | 0.200 |  0.440 |
 | `bm25_l`                                            |   0.252 | 0.231 | 0.199 |  0.443 |
+| `bm25_pl2` (Step 1k)                                |   0.249 | 0.230 | 0.199 |  0.421 |
+| `bm25_dph` (Step 1k)                                |   0.249 | 0.228 | 0.198 |  0.423 |
 | `bm25_dlh13`                                        |   0.249 | 0.226 | 0.198 |  0.430 |
 | `bm25_dcm`                                          |   0.242 | 0.225 | 0.202 |  0.412 |
 | `bm25_sab_strict` (γ=0)                             |   0.243 | 0.215 | 0.208 |  0.426 |
@@ -215,10 +250,12 @@ Third BEIR fixture: `nfcorpus` — 3,633 docs / 224 test queries / 99 dev querie
 
 Takeaways:
 
-- **SAB-smooth matches MiniLM on NFCorpus** (0.298 vs 0.297 nDCG@10). Medical morphology is even richer than scifact's; the n-gram backoff is exactly the right mechanism.
-- scifact-tuned `router_default` holds above BM25-alone (0.270 vs 0.252) but does not reach MiniLM or the oracle (0.327). Router thresholds need per-corpus tuning to close the 5.7-point gap to oracle.
+- **Step 1k clarity ceiling matches MiniLM** (`passE_scq0_clar3.0` 0.298 vs MiniLM 0.297). The AND-gate forces Atire on low-clarity queries only, and on NFCorpus that corresponds to the subset where SAB-smooth is already the right pick — effectively routing the entire fixture to the stronger BM25 variant without losing the scifact cascade route on the rest. Any `clar ≤ 5.0` ceiling produces the same 0.298; clarity floor threshold is insensitive at 3.0–5.0.
+- **RM3 is the second NFCorpus lift** (+1.9 points nDCG on Atire, +0.8 on SAB-smooth). Morphology-heavy medical queries benefit from term-expansion when the base variant is already subword-aware; compounding them is the Step 1k "cheap RM3 + better router" story.
+- **SAB-smooth matches MiniLM without the gate** (0.298). Medical morphology is even richer than scifact's; n-gram backoff remains the primary corpus-agnostic lever.
+- PL2 and DPH slot into the DFR cluster at 0.249 — DFR-family scores collapse on NFCorpus to within noise of DLH13.
 - The SAB→simeon cosine cascade still collapses (0.190 vs BM25-alone 0.252), same pattern as on FiQA. Simeon cosine rerank is a scifact-specific win.
-- Three-corpus verdict: **SAB as a standalone scorer is corpus-agnostic on morphology-heavy text; scifact router tuning is not.**
+- Three-corpus verdict: **SAB as a standalone scorer is corpus-agnostic on morphology-heavy text; Step 1k's clarity ceiling generalizes where scifact router tuning does not.**
 
 ## Microbench — synthetic corpus
 

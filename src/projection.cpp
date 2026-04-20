@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "simeon/hasher.hpp"
+#include "simeon/simd.hpp"
 
 #if defined(SIMEON_HAS_NEON)
 #include <arm_neon.h>

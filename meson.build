@@ -88,6 +88,7 @@ common_srcs = [
   'src/matryoshka.cpp',
   'src/pmi.cpp',
   'src/query_router.cpp',
+  'src/prf.cpp',
   'src/arch/scalar.cpp',
 ]
 
@@ -148,6 +149,7 @@ install_headers(
     'include/simeon/matryoshka.hpp',
     'include/simeon/pmi.hpp',
     'include/simeon/query_router.hpp',
+    'include/simeon/prf.hpp',
   ],
   subdir: 'simeon',
 )
