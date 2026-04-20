@@ -1,0 +1,146 @@
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <stdexcept>
+#include <vector>
+
+#include "simeon/bm25.hpp"
+
+using simeon::Bm25Config;
+using simeon::Bm25Index;
+
+namespace {
+
+void test_empty_index_score_throws() {
+    Bm25Index idx;
+    bool threw = false;
+    try {
+        std::vector<float> s;
+        idx.score("anything", s);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    assert(threw);
+}
+
+void test_basic_ranking() {
+    Bm25Index idx;
+    idx.add_doc("the quick brown fox jumps");
+    idx.add_doc("a slow brown turtle walks");
+    idx.add_doc("the fox is quick and brown");
+    idx.finalize();
+    assert(idx.doc_count() == 3);
+
+    std::vector<float> s(3, 0.0f);
+    idx.score("quick fox", s);
+
+    // Doc 0 and 2 contain both query terms; doc 1 contains neither.
+    assert(s[0] > 0.0f);
+    assert(s[2] > 0.0f);
+    assert(s[1] == 0.0f);
+}
+
+void test_idf_rare_beats_common() {
+    Bm25Index idx;
+    // "the" appears in all three docs => low IDF.
+    // "rare" appears in only doc 1 => high IDF.
+    idx.add_doc("the cat sat on the mat");
+    idx.add_doc("the rare bird flew away");
+    idx.add_doc("the dog ran fast");
+    idx.finalize();
+
+    std::vector<float> s_the(3, 0.0f);
+    idx.score("the", s_the);
+    std::vector<float> s_rare(3, 0.0f);
+    idx.score("rare", s_rare);
+
+    // "rare" hit on doc 1 should outscore any "the" hit.
+    const float max_the = *std::max_element(s_the.begin(), s_the.end());
+    assert(s_rare[1] > max_the);
+}
+
+void test_tf_saturation() {
+    // BM25 with k1=1.2 saturates: doubling tf does NOT double the contribution.
+    Bm25Index idx;
+    idx.add_doc("alpha");                          // tf=1
+    idx.add_doc("alpha alpha alpha alpha alpha");  // tf=5
+    idx.finalize();
+
+    std::vector<float> s(2, 0.0f);
+    idx.score("alpha", s);
+
+    // tf=5 contributes more than tf=1, but less than 5x (saturation).
+    assert(s[1] > s[0]);
+    assert(s[1] < 5.0f * s[0]);
+}
+
+void test_determinism() {
+    Bm25Config cfg;
+    Bm25Index a(cfg), b(cfg);
+    const std::vector<std::string> docs = {
+        "alpha beta gamma",
+        "delta epsilon zeta",
+        "alpha epsilon iota",
+    };
+    for (const auto& d : docs) {
+        a.add_doc(d);
+        b.add_doc(d);
+    }
+    a.finalize();
+    b.finalize();
+
+    std::vector<float> sa(3, 0.0f), sb(3, 0.0f);
+    a.score("alpha epsilon", sa);
+    b.score("alpha epsilon", sb);
+    assert(sa == sb);
+}
+
+void test_unknown_term_zero() {
+    Bm25Index idx;
+    idx.add_doc("alpha beta gamma");
+    idx.finalize();
+    std::vector<float> s(1, 0.0f);
+    idx.score("zzz_not_in_index_zzz", s);
+    assert(s[0] == 0.0f);
+}
+
+void test_score_size_mismatch_throws() {
+    Bm25Index idx;
+    idx.add_doc("alpha");
+    idx.finalize();
+    bool threw = false;
+    try {
+        std::vector<float> s(99, 0.0f);
+        idx.score("alpha", s);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    assert(threw);
+}
+
+void test_add_after_finalize_throws() {
+    Bm25Index idx;
+    idx.add_doc("alpha");
+    idx.finalize();
+    bool threw = false;
+    try {
+        idx.add_doc("beta");
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    assert(threw);
+}
+
+}  // namespace
+
+int main() {
+    test_empty_index_score_throws();
+    test_basic_ranking();
+    test_idf_rare_beats_common();
+    test_tf_saturation();
+    test_determinism();
+    test_unknown_term_zero();
+    test_score_size_mismatch_throws();
+    test_add_after_finalize_throws();
+    return 0;
+}

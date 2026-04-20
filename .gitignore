@@ -1,0 +1,12 @@
+build/
+build-*/
+benchmarks/results/
+fixtures/
+.claude/
+*.jsonl
+*.profraw
+*.profdata
+benchmarks/speed_pareto.py
+scripts/build_reference_fixture.py
+scripts/coverage.sh
+scripts/measure_minilm_cpu.py

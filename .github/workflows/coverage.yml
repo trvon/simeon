@@ -1,0 +1,62 @@
+name: simeon-coverage
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install meson + ninja + clang + llvm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build clang llvm
+
+      - name: Configure
+        env:
+          CC: clang
+          CXX: clang++
+        run: meson setup build -Denable_coverage=true --buildtype=debug
+
+      - name: Compile
+        run: meson compile -C build
+
+      - name: Test (with profile collection)
+        env:
+          LLVM_PROFILE_FILE: build/meson-logs/profraw/test-%p-%m.profraw
+        run: meson test -C build --print-errorlogs
+
+      - name: Merge profiles + render lcov
+        run: |
+          mkdir -p build/coverage
+          llvm-profdata merge -sparse \
+            build/meson-logs/profraw/*.profraw \
+            -o build/coverage/merged.profdata
+          # All test binaries — llvm-cov needs each as -object.
+          objects=()
+          for t in build/tests/test_*; do
+            [ -x "$t" ] && objects+=("-object" "$t")
+          done
+          llvm-cov export "${objects[@]}" \
+            -instr-profile=build/coverage/merged.profdata \
+            -format=lcov \
+            -ignore-filename-regex='tests/.*|/usr/.*|.*/build/.*' \
+            > build/coverage/lcov.info
+          llvm-cov report "${objects[@]}" \
+            -instr-profile=build/coverage/merged.profdata \
+            -ignore-filename-regex='tests/.*|/usr/.*|.*/build/.*' \
+            | tee build/coverage/summary.txt
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: simeon-coverage
+          path: build/coverage/

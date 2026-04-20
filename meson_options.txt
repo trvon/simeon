@@ -1,0 +1,12 @@
+option('enable_tests', type: 'boolean', value: true,
+  description: 'Build simeon unit tests')
+option('enable_benchmarks', type: 'boolean', value: true,
+  description: 'Build simeon microbenchmarks (stdlib timing; no external dep)')
+option('enable_simd_avx2', type: 'boolean', value: true,
+  description: 'Enable x86 AVX2/FMA kernels on x86_64 hosts (default on; build is non-portable to pre-AVX2 CPUs — set false for distribution builds targeting older x86)')
+option('enable_simd_neon', type: 'boolean', value: true,
+  description: 'Enable AArch64 NEON kernels (baseline on aarch64)')
+option('enable_fuzz', type: 'boolean', value: false,
+  description: 'Build libFuzzer harnesses (clang only). Pair with -Db_sanitize=address.')
+option('enable_coverage', type: 'boolean', value: false,
+  description: 'Inject source-based coverage instrumentation (clang) or gcov (gcc).')

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# simeon pre-commit hook — enforces clang-format on staged C++ sources.
+#
+# Install: git config core.hooksPath .githooks
+# This hook keeps standalone simeon commits self-contained by formatting
+# staged C/C++ sources before commit.
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+FORMAT_SCRIPT="$REPO_ROOT/scripts/format-code.sh"
+
+files=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && files+=("$line")
+done < <(git diff --cached --name-only --diff-filter=ACM \
+         | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp)$' || true)
+
+if [[ ${#files[@]} -eq 0 ]]; then
+  exit 0
+fi
+
+if [[ ! -x "$FORMAT_SCRIPT" ]]; then
+  echo "simeon pre-commit: $FORMAT_SCRIPT not found or not executable" >&2
+  exit 1
+fi
+
+printf '%s\n' "${files[@]}" | "$FORMAT_SCRIPT" --serial --stdin-files
+git add -- "${files[@]}"
+
+if ! printf '%s\n' "${files[@]}" | "$FORMAT_SCRIPT" --check --serial --stdin-files; then
+  echo "clang-format check failed. Run scripts/format-code.sh --git to fix." >&2
+  exit 1
+fi

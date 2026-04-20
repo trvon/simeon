@@ -1,0 +1,67 @@
+name: simeon-tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-scalar
+            runner: ubuntu-24.04
+            meson_args: -Denable_simd_avx2=false -Denable_simd_neon=false
+          - name: linux-x86_64-avx2
+            runner: ubuntu-24.04
+            meson_args: -Denable_simd_avx2=true
+          - name: linux-arm64-neon
+            runner: ubuntu-24.04-arm
+            meson_args: -Denable_simd_neon=true
+          - name: macos-arm64-neon
+            runner: macos-15
+            meson_args: -Denable_simd_neon=true
+          - name: windows-x86_64-avx2
+            runner: windows-latest
+            meson_args: -Denable_simd_avx2=true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install meson + ninja (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build
+
+      - name: Install meson + ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install meson ninja
+
+      - name: Install meson + ninja (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pip install meson ninja
+
+      - name: Configure
+        run: meson setup build ${{ matrix.meson_args }}
+
+      - name: Compile
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs --timeout-multiplier 2
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testlog-${{ matrix.name }}
+          path: build/meson-logs/

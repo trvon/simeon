@@ -1,0 +1,53 @@
+name: simeon-sanitizers
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  sanitize:
+    name: ${{ matrix.sanitizer }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined, thread]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install meson + ninja + clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build clang
+
+      - name: Configure (${{ matrix.sanitizer }})
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          meson setup build \
+            -Db_sanitize=${{ matrix.sanitizer }} \
+            -Db_lundef=false \
+            --buildtype=debug
+
+      - name: Compile
+        run: meson compile -C build
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: halt_on_error=1:abort_on_error=1:detect_leaks=1:print_stacktrace=1
+          UBSAN_OPTIONS: halt_on_error=1:abort_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: meson test -C build --print-errorlogs --timeout-multiplier 4
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: san-${{ matrix.sanitizer }}-logs
+          path: build/meson-logs/
