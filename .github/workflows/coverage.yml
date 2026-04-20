@@ -45,8 +45,9 @@ jobs:
           # All test binaries — llvm-cov needs each as -object.
           objects=()
           for t in build/tests/test_*; do
-            [ -x "$t" ] && objects+=("-object" "$t")
+            [ -f "$t" ] && [ -x "$t" ] && objects+=("-object" "$t")
           done
+          [ ${#objects[@]} -gt 0 ]
           llvm-cov export "${objects[@]}" \
             -instr-profile=build/coverage/merged.profdata \
             -format=lcov \
