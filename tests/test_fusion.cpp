@@ -1,6 +1,7 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -66,9 +67,9 @@ void test_top_k_basic() {
     std::vector<float> scores = {0.1f, 0.9f, 0.5f, 0.3f, 0.8f};
     auto t = top_k(scores, 3);
     assert(t.size() == 3);
-    assert(t[0].first == 1);  // 0.9
-    assert(t[1].first == 4);  // 0.8
-    assert(t[2].first == 2);  // 0.5
+    assert(t[0].first == 1); // 0.9
+    assert(t[1].first == 4); // 0.8
+    assert(t[2].first == 2); // 0.5
 }
 
 void test_top_k_clamps_to_size() {
@@ -111,6 +112,85 @@ void test_cosine_topk_self_recovery() {
     }
 }
 
+void test_entropy_alpha_equal_when_top_k_identical() {
+    // Identical top-K slices ⇒ identical entropy ⇒ identical confidence ⇒ α = 0.5.
+    std::vector<float> tk = {5.0f, 3.0f, 2.5f, 1.0f, 0.5f, 0.1f, 0.0f, -0.1f};
+    simeon::EntropyAlphaConfig cfg{};
+    const float alpha = simeon::entropy_alpha(tk, tk, /*pool_jaccard=*/0.0f, cfg);
+    assert(approx(alpha, 0.5f, 1e-5f));
+}
+
+void test_entropy_alpha_collapses_when_jaccard_above_threshold() {
+    // Even with wildly different entropies, pool_jaccard above the agreement
+    // threshold forces α = 0.5 (legs already agree, no weighting needed).
+    std::vector<float> peaky = {10.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<float> flat = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    simeon::EntropyAlphaConfig cfg{};
+    const float alpha = simeon::entropy_alpha(peaky, flat, /*pool_jaccard=*/0.95f, cfg);
+    assert(approx(alpha, 0.5f, 1e-6f));
+}
+
+void test_entropy_alpha_weights_low_entropy_leg_higher() {
+    // Leg A concentrates mass on top-1 (low entropy, high confidence).
+    // Leg B is uniform (maximum entropy, zero confidence).
+    // α should skew toward A (> 0.5). With max entropy on B, confidence_B = 0
+    // and the formula returns α = 1 (all weight on A).
+    std::vector<float> peaky = {10.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<float> flat = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    simeon::EntropyAlphaConfig cfg{};
+    const float alpha = simeon::entropy_alpha(peaky, flat, /*pool_jaccard=*/0.0f, cfg);
+    assert(alpha > 0.5f);
+    assert(alpha <= 1.0f);
+}
+
+void test_entropy_alpha_deterministic() {
+    std::vector<float> a = {3.0f, 1.0f, 0.5f, 0.2f, -0.1f};
+    std::vector<float> b = {2.0f, 1.8f, 1.5f, 1.2f, 1.0f};
+    simeon::EntropyAlphaConfig cfg{};
+    const float first = simeon::entropy_alpha(a, b, 0.3f, cfg);
+    for (int i = 0; i < 10; ++i) {
+        const float again = simeon::entropy_alpha(a, b, 0.3f, cfg);
+        assert(std::memcmp(&first, &again, sizeof(float)) == 0);
+    }
+}
+
+void test_linear_alpha_entropy_fuse_recovers_equal_weight_at_tie() {
+    // Feed identical top-K slices ⇒ α = 0.5. Fuse two orthogonal per-doc
+    // score vectors and verify the output is the equal-weight z-score blend.
+    constexpr std::size_t n = 12;
+    std::vector<float> a_scores(n), b_scores(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        a_scores[i] = static_cast<float>(i) * 0.5f;
+        b_scores[i] = static_cast<float>(n - i) * 0.25f + 1.0f;
+    }
+    std::vector<float> tk = {3.0f, 2.0f, 1.0f, 0.5f, 0.2f};
+    std::vector<float> out(n, 0.0f);
+    simeon::EntropyAlphaConfig cfg{};
+    simeon::linear_alpha_entropy_fuse(a_scores, b_scores, tk, tk,
+                                      /*pool_jaccard=*/0.0f, cfg, out);
+    // Recompute equal-weight z-score blend by hand.
+    auto zscore = [](std::vector<float>& v) {
+        double mean = 0.0;
+        for (float x : v)
+            mean += x;
+        mean /= v.size();
+        double var = 0.0;
+        for (float x : v)
+            var += (x - mean) * (x - mean);
+        const float sd = static_cast<float>(std::sqrt(var / v.size()) + 1e-12);
+        for (float& x : v)
+            x = static_cast<float>((x - mean) / sd);
+    };
+    std::vector<float> za = a_scores;
+    std::vector<float> zb = b_scores;
+    zscore(za);
+    zscore(zb);
+    for (std::size_t i = 0; i < n; ++i) {
+        const float expected = 0.5f * za[i] + 0.5f * zb[i];
+        assert(approx(out[i], expected, 1e-4f));
+    }
+}
+
 void test_cosine_scores_matches_naive() {
     constexpr std::uint32_t dim = 32;
     constexpr std::uint32_t n = 9;
@@ -133,7 +213,7 @@ void test_cosine_scores_matches_naive() {
     }
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     test_rrf_two_lists_hand_computed();
@@ -146,5 +226,10 @@ int main() {
     test_top_k_zero_returns_empty();
     test_cosine_topk_self_recovery();
     test_cosine_scores_matches_naive();
+    test_entropy_alpha_equal_when_top_k_identical();
+    test_entropy_alpha_collapses_when_jaccard_above_threshold();
+    test_entropy_alpha_weights_low_entropy_leg_higher();
+    test_entropy_alpha_deterministic();
+    test_linear_alpha_entropy_fuse_recovers_equal_weight_at_tie();
     return 0;
 }

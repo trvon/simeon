@@ -61,6 +61,59 @@ measures the routing-relevant Atire-vs-SAB disagreement. Defaults
 so the matching `RouterConfig` AND-gates default to no-ops — backward-
 compatible with Step 1f when `features_with_pool()` is not called.
 
+### Step 1k pre-retrieval predictors (Pass E — SCQ and simplified clarity)
+
+Two more pre-retrieval features from the Carmel-Yom-Tov catalog, theoretically
+independent of the IDF family. Both are computed in `features()` from
+collection statistics (`Bm25Index::total_tf`, `Bm25Index::total_tokens`) with
+no first-pass scoring required.
+
+| Predictor            | Definition                                                      | Source                              |
+|----------------------|-----------------------------------------------------------------|-------------------------------------|
+| `scq_sum`            | `Σ_t (1 + log(tf_C(t))) · idf(t)` over present query terms      | Zhao, Scholer, Tsegay 2008 ECIR     |
+| `simplified_clarity` | `Σ_t p(t|Q) · log(p(t|Q) / p(t|C))` over distinct present terms | Cronen-Townsend & Croft 2002 SIGIR  |
+
+`scq_sum` rewards query terms that are both rare (high IDF) and
+well-supported in the collection (large `tf_C`); `simplified_clarity` is the
+KL divergence of the query unigram distribution from the background LM. Both
+feed Atire-route AND-gates — `atire_min_scq` floor and `atire_max_clarity`
+ceiling — that default to pass (0 and +∞ respectively) so Step 1k is a
+behavior-preserving addition on existing callers.
+
+#### Step 1k tuning result (Pass E, 2026-04-20, three-corpus)
+
+Pass E grid: `atire_min_scq ∈ {0, 5, 10, 20}` × `atire_max_clarity ∈ {∞, 3.0,
+5.0, 8.0}` = 16 rows, Step 1f Pass A winners held constant otherwise.
+
+- **scifact** (null result): every SCQ floor is a no-op (all Atire-route
+  queries already clear it) and every clarity ceiling either ties
+  `router_default` (clar=∞) or regresses (clar≤8.0 cuts off 0.3–2.4 nDCG
+  points). Defaults unchanged.
+- **NFCorpus** (win): `passE_scq0_clar3.0` hits 0.298 nDCG@10 — ties MiniLM
+  (0.297) and `bm25_sab_smooth_gamma5` alone (0.298), **+2.7 points over
+  scifact-tuned `router_default`** (0.270). Any `clar ≤ 5.0` ceiling
+  produces the same score; the SCQ floor is insensitive on NFCorpus too.
+  Mechanism: on NFCorpus the clarity ceiling demotes Atire on queries
+  whose unigram distribution is close to the background LM — exactly the
+  queries where SAB-smooth's n-gram blend wins. The gate behaves like an
+  implicit per-corpus switch that picks SAB-smooth for medical-morphology
+  queries without per-corpus tuning.
+- **FiQA** (modest lift): `passE_scq0_clar3.0` hits 0.208 nDCG@10 vs
+  `router_default_4096_768` 0.202 — **+0.006** on the 444-query test
+  fold. `clar ≤ 5.0` produces the same 0.208; `clar ≤ 8.0` is weaker
+  (0.204). SCQ floor is a no-op across all tested settings — every FiQA
+  high-IDF query clears the floor. The clarity lift is smaller than
+  NFCorpus (+0.028) because FiQA's paraphrase-heavy queries aren't as
+  neatly bimodal in clarity space, but the gate is still net-positive
+  and does not regress any test row.
+
+Takeaway: Step 1k B2's gates ship as opt-in (defaults are no-ops). On two
+of three test corpora (NFCorpus +0.028, FiQA +0.006) `atire_max_clarity=3.0`
+delivers a net-positive lift; on scifact the gate is a no-op but does not
+regress. Recommend callers set `atire_max_clarity=3.0` and leave
+`atire_min_scq=0.0` as a corpus-agnostic default — the optimal ceiling is
+narrow (3.0–5.0) where it helps, and inactive where it doesn't.
+
 ## Routing rules
 
 Decision tree, ordered first-match-wins. Thresholds are scifact-derived
@@ -79,6 +132,8 @@ defaults; callers override via `RouterConfig`.
         AND min_idf >= router.atire_min_idf_floor (default 0)
         AND pool_overlap_jaccard <= router.atire_max_pool_jaccard (default 1.0)
         AND score_decay_rate >= router.atire_min_score_decay (default 0.0)
+        AND scq_sum >= router.atire_min_scq (default 0.0)
+        AND simplified_clarity <= router.atire_max_clarity (default +inf)
         → Bm25Atire
         # Rare-term-heavy queries need exact match; the SAB n-gram blend
         # adds noise without lift when terms are already discriminative.
@@ -88,9 +143,12 @@ defaults; callers override via `RouterConfig`.
         # noisy. Step 1g.1 added the pool-Jaccard / score-decay AND-gates
         # so callers can demote Atire when the Atire/SAB pools agree (no
         # routing decision matters) or when the BM25 top is flat (Atire's
-        # rare-term advantage is absent). All four extra gates default to
-        # no-ops; see "Step 1f tuning result" / "Step 1g.1 tuning result"
-        # below for the scifact tuning data.
+        # rare-term advantage is absent). Step 1k added the SCQ-floor /
+        # clarity-ceiling AND-gates; on morphology-heavy corpora like
+        # NFCorpus, `atire_max_clarity=3.0` demotes Atire on
+        # background-close queries and lets SAB-smooth take them, lifting
+        # nDCG@10 to parity with MiniLM. All six extra gates default to
+        # no-ops; see "Step 1f/1g.1/1k tuning result" below.
 
 3.  if n_terms >= router.cascade_min_terms (default 4)
         AND avg_idf <= router.cascade_max_idf (default 5.0)
@@ -288,6 +346,16 @@ than further router-rule tuning.
   it.
 - **Not a reranker.** The router runs *before* retrieval, picks the recipe,
   and the chosen recipe runs end-to-end.
+- **Not a scorer.** Training-free re-scorers (`score_with_prf`, `score_sdm`)
+  compose *inside* the recipe the router picks — the router owns routing,
+  the scorers own per-document ranking. Step 1l's SDM is a drop-in for
+  `score()` in any `Bm25Variant`; the router is unchanged.
+- **Not a fusion-α picker.** Step 1m's `entropy_alpha` reuses the same
+  softmax-entropy estimator as the `top_k_score_entropy` predictor here, but
+  applies it to two legs' top-K to derive a per-query α. Documented null on
+  quality vs the matched static α=0.75 baseline; safety property only. See
+  `docs/fusion_entropy_alpha.md`. Router still picks the recipe; entropy-α
+  ships in `simeon::` namespace, not in `RouterConfig`.
 
 ## API surface
 
@@ -420,3 +488,6 @@ Four observations replacing the two-corpus story:
 - Aslam, J.A. & Pavlu, V. (2007). "Query Hardness Estimation Using
   Jensen-Shannon Divergence Among Multiple Scoring Functions." ECIR 2007
   (motivates the pool-disagreement form of `pool_overlap_jaccard`).
+- Metzler, D. & Croft, W.B. (2005). "A Markov Random Field Model for Term
+  Dependencies." SIGIR 2005 (Step 1l SDM — composes with routing as the
+  unigram-leg variant inside the recipe the router picks).

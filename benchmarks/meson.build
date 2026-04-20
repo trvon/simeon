@@ -19,6 +19,16 @@ vs_reference_exe = executable('simeon_bench_vs_reference',
   install: false,
 )
 
+# Isolated SAB-smooth profile harness. Builds one Bm25Index with
+# SubwordAwareBackoff/γ=5 and runs N repeats of the query loop, so
+# `xctrace record --launch` / `sample` see a single busy phase without
+# dilution from the 40+ other configs in simeon_bench_vs_reference.
+profile_sab_exe = executable('simeon_profile_sab_smooth',
+  'profile_sab_smooth.cpp',
+  dependencies: simeon_dep,
+  install: false,
+)
+
 # Smoke-mode target that runs a very small sweep during meson test so CI
 # can catch regressions without the full throughput run.
 test('simeon_microbench_smoke', microbench_exe,

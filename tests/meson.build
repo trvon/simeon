@@ -23,6 +23,8 @@ simeon_tests = {
   'test_query_router_post_retrieval': 'test_query_router_post_retrieval.cpp',
   'test_pmi': 'test_pmi.cpp',
   'test_prf': 'test_prf.cpp',
+  'test_sdm': 'test_sdm.cpp',
+  'test_concept_mining': 'test_concept_mining.cpp',
 }
 
 foreach name, src : simeon_tests

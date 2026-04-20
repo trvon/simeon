@@ -20,6 +20,8 @@
 | MiniLM-L6 reference (384-d float32)                 |   0.654 | 0.808 | 0.932 |  0.607 |       1536 |
 | **`router_default_4096_768` (idf=3.0, tuned)**      | **0.654** | **0.768** | **0.892** | **0.626** | 3072 |
 | `bm25_pool500_linear_alpha075_4096_768`             |   0.638 | 0.762 | 0.874 |  0.608 |       3072 |
+| `bm25_pool500_entropy_alpha_4096_768` (Step 1m)     |   0.619 | 0.741 | 0.874 |  0.592 |       3072 |
+| `bm25_sab_pool500_entropy_alpha_4096_768` (Step 1m) |   0.612 | 0.733 | 0.881 |  0.587 |       3072 |
 | `bm25_sab_smooth_gamma5` (novel BM25 alone)         |   0.636 | 0.759 | 0.893 |  0.607 |          — |
 | `bm25_only` (Atire baseline)                        |   0.633 | 0.756 | 0.865 |  0.605 |          — |
 | `router_oracle_4096_768` (per-query argmax, ceiling)|   0.713 | 0.834 | 0.931 |  0.684 |       3072 |
@@ -58,6 +60,34 @@ Lavrenko & Croft 2001 relevance model RM3: first-pass BM25 → top-K=10 pseudo-r
 | `bm25_sab_smooth_rm3_k10_a0.5`                |   0.630 | 0.760 | 0.888 |  0.602 |    182 |
 
 Negative-result on BM25-Atire: expansion slightly regresses top-10 ranking (−1.5 points nDCG) while lifting R@100 (+1.0 point) — expansion introduces noise on short abstract queries with already-informative terms. **Positive result on SAB-smooth** (+1.8 points nDCG, +3.7 points R@10): SAB's n-gram backoff already captures morphological variants, and RM3's term expansion is additive on top without competing with it. Per-query latency drops ~2 orders of magnitude because RM3 requires two scoring passes plus the relevance-model build.
+
+## scifact — SDM (Sequential Dependence Model)
+
+Metzler & Croft 2005: three-leg blend (λ_u · BM25 + λ_o · ordered-bigram BM25 + λ_uw · unordered-bigram BM25). Bigram postings built in-process when `Bm25Config::build_word_bigrams=true`. Default weights are Metzler's published (0.85, 0.10, 0.05); unordered window is 8 positions.
+
+| Configuration                                           | nDCG@10 | R@10  | R@100 | MRR@10 |
+|---------------------------------------------------------|--------:|------:|------:|-------:|
+| `bm25_atire` (baseline)                                 |   0.619 | 0.741 | 0.874 |  0.592 |
+| `bm25_atire_sdm_l0.85_0.10_0.05`                        |   0.612 | 0.736 | 0.883 |  0.584 |
+| `bm25_atire_sdm_l0.90_0.05_0.05` (unigram-heavier)      |   0.619 | 0.746 | 0.879 |  0.587 |
+| `bm25_sab_smooth_gamma5` (baseline)                     |   0.612 | 0.723 | 0.881 |  0.587 |
+| `bm25_sab_smooth_sdm_l0.85_0.10_0.05`                   |   0.612 | 0.718 | 0.881 |  0.587 |
+
+Near-no-op on scifact: Metzler defaults cost 0.7 nDCG points on Atire because short scientific abstracts have few adjacent-term signals that BM25 misses. Unigram-heavier weights (0.90/0.05/0.05) recover baseline exactly. SAB-smooth is tied either way.
+
+## scifact — concept mining (Step 1n)
+
+Bendersky 2008 latent concept model: corpus-PMI word-bigram mining + PMI-weighted concept BM25 linearly blended into the base variant. Training-free (closed-form PMI, no dev-fold tuner).
+
+| Configuration                                | nDCG@10 | R@10  | R@100 | MRR@10 |
+|----------------------------------------------|--------:|------:|------:|-------:|
+| `bm25_atire` (baseline)                      |   0.619 | 0.741 | 0.874 |  0.592 |
+| `bm25_atire_concepts_l0.50`                  |   0.510 | 0.649 | 0.841 |  0.474 |
+| `bm25_atire_concepts_l0.25`                  |   0.564 | 0.696 | 0.866 |  0.530 |
+| `bm25_sab_smooth_gamma5` (baseline)          |   0.612 | 0.723 | 0.881 |  0.587 |
+| `bm25_sab_smooth_concepts_l0.50`             |   0.614 | 0.733 | 0.871 |  0.587 |
+
+Null result: pre-declared regression gate (<0.005) violated on Atire at every weight. See [concept_mining.md](concept_mining.md) for scale-mismatch mechanism.
 
 ## scifact — cascade and fusion
 
@@ -200,22 +230,44 @@ acts as a transfer check rather than a headline claim.
 | Configuration                                       | nDCG@10 | R@10  | R@100 | MRR@10 |
 |-----------------------------------------------------|--------:|------:|------:|-------:|
 | MiniLM-L6 reference (384-d float32)                 |   0.359 | 0.429 | 0.702 |  0.436 |
+| `bm25_atire_sdm_l0.85_0.10_0.05` (Step 1l)          |   0.212 | 0.268 | 0.468 |  0.263 |
 | **`bm25_pool500_linear_alpha075_4096_768`**         | **0.211** | **0.269** | **0.478** | **0.263** |
 | `bm25_pool500_linear_alpha075_4096_384`             |   0.211 | 0.267 | 0.473 |  0.266 |
 | `router_grid_*_passB_pool500_a0.50` (FiQA favors α=0.50) | 0.210 | 0.265 | 0.460 |  0.261 |
+| `bm25_atire_sdm_l0.90_0.05_0.05` (Step 1l)          |   0.208 | 0.265 | 0.471 |  0.259 |
+| `router_grid_4096_768_passE_scq0_clar3.0` (Step 1k) |   0.208 | 0.260 | 0.478 |  0.263 |
+| `router_grid_4096_768_passE_scq0_clar5.0` (Step 1k) |   0.208 | 0.261 | 0.477 |  0.262 |
+| `bm25_sab_smooth_sdm_l0.85_0.10_0.05` (Step 1l)     |   0.206 | 0.252 | 0.478 |  0.262 |
 | `bm25_atire` (Robertson baseline)                   |   0.205 | 0.264 | 0.467 |  0.257 |
-| `bm25_sab_smooth_gamma5` (novel BM25 alone)         |   0.198 | 0.250 | 0.467 |  0.249 |
-| `bm25_dcm` (Dirichlet-LM, no IDF)                   |   0.085 | 0.119 | 0.299 |  0.114 |
+| `bm25_pool500_entropy_alpha_4096_768` (Step 1m)     |   0.205 | 0.264 | 0.467 |  0.256 |
+| `bm25_sab_smooth_concepts_l0.50` (Step 1n)          |   0.182 | 0.223 | 0.427 |  0.226 |
+| `bm25_atire_concepts_l0.25` (Step 1n)               |   0.167 | 0.206 | 0.400 |  0.207 |
+| `bm25_atire_concepts_l0.50` (Step 1n)               |   0.138 | 0.167 | 0.347 |  0.175 |
+| `router_grid_4096_768_passE_scq0_clar8.0` (Step 1k) |   0.204 | 0.259 | 0.468 |  0.255 |
+| `router_default_with_rm3_k10_a0.5` (Step 1k RM3)    |   0.202 | 0.255 | 0.466 |  0.255 |
 | `router_default_4096_768` (scifact-tuned)           |   0.202 | 0.256 | 0.463 |  0.253 |
+| `bm25_dph` (Step 1k)                                |   0.200 | 0.249 | 0.444 |  0.256 |
+| `bm25_sab_smooth_gamma5` (novel BM25 alone)         |   0.198 | 0.250 | 0.467 |  0.249 |
+| `bm25_sab_pool500_entropy_alpha_4096_768` (Step 1m) |   0.198 | 0.250 | 0.467 |  0.249 |
+| `bm25_sab_smooth_rm3_k10_a0.5` (Step 1k RM3)        |   0.196 | 0.240 | 0.460 |  0.249 |
+| `bm25_atire_rm3_k10_a0.5` (Step 1k RM3)             |   0.196 | 0.261 | 0.472 |  0.236 |
+| `bm25_pl2` (Step 1k)                                |   0.189 | 0.242 | 0.456 |  0.235 |
 | `bm25_sab_pool500_simeon_cos_4096_768`              |   0.117 | 0.151 | 0.371 |  0.151 |
-| `achlioptas_4096_768` (standalone simeon)           |   0.101 | 0.122 | 0.262 |  0.138 |
-| `minhash_256`                                       |   0.037 | 0.042 | 0.135 |  0.058 |
 | `simeon_pmi256_rrf_bm25_incorpus`                   |   0.116 | 0.170 | 0.445 |  0.139 |
+| `achlioptas_4096_768` (standalone simeon)           |   0.101 | 0.122 | 0.262 |  0.138 |
+| `bm25_dcm` (Dirichlet-LM, no IDF)                   |   0.085 | 0.119 | 0.299 |  0.114 |
+| `minhash_256`                                       |   0.037 | 0.042 | 0.135 |  0.058 |
 | `router_oracle_4096_768` (per-query argmax, ceiling) |  0.244 | 0.307 | 0.525 |  0.307 |
 
 Takeaways:
 
 - scifact-specific “near-parity to MiniLM” headlines do **not** transfer to FiQA
+- **Step 1l SDM lifts FiQA by +0.006 on Atire** (`bm25_atire_sdm_l0.85_0.10_0.05` 0.212 vs `bm25_atire` 0.205) — the adjacent-bigram signal is real on finance text but below the plan's +0.010 promote threshold. SDM on SAB-smooth (+0.008) similarly underdelivers; unigram-heavier weights (0.90/0.05/0.05, 0.208) confirm Metzler's defaults are the right fixed point. Infrastructure stays behind `build_word_bigrams=false` default at zero runtime cost.
+- **Step 1m entropy-α regresses by −0.006 vs matched static α=0.75** on FiQA (`bm25_pool500_entropy_alpha_4096_768` 0.205 vs `bm25_pool500_linear_alpha075_4096_768` 0.211). The cosine head's flatter top-K shifts per-query α toward 1.0 (BM25-only). Same pattern across scifact (−0.006) and NFCorpus (−0.010). Counterpoint: entropy-α rescues +0.081 on FiQA over `bm25_sab_pool500_simeon_cos_4096_768` 0.117 — a self-correcting safety floor when the dense leg would tank alone. Documented null-with-safety-property: see `docs/fusion_entropy_alpha.md`.
+- **Step 1n concept mining regresses across all three corpora** (FiQA: −0.068 Atire l=0.50, −0.039 Atire l=0.25, −0.016 SAB-smooth l=0.50). PMI × BM25-bigram score-scale dominates base BM25 on matched queries, reordering around exact-phrase hits — actively harmful on finance paraphrase. Null result; infrastructure ships opt-in in `simeon::` namespace (no `Bm25Config` coupling), not wired into the router. See [concept_mining.md](concept_mining.md).
+- **Step 1k clarity gate adds +0.006 nDCG on FiQA** (`passE_scq0_clar3.0` 0.208 vs `router_default` 0.202). Any `clar ≤ 5.0` ceiling produces the same 0.208; SCQ floor is a no-op since FiQA's high-IDF queries already clear it.
+- **RM3 is near-flat on FiQA** (−0.005 on Atire, −0.002 on SAB-smooth vs the base variants; router+RM3 0.202 matches plain router). FiQA's semantic-paraphrase queries don't lift from corpus-statistic query expansion — expansion amplifies lexical matches the BM25 base already finds.
+- PL2 (0.189) and DPH (0.200) slot *below* Atire (0.205) on FiQA; DFR family caps below tuned Robertson.
 - linear-α fusion is still the only consistent way simeon beats BM25 alone
 - router thresholds are corpus-sensitive and should be tuned per corpus
 
@@ -229,13 +281,21 @@ Third BEIR fixture: `nfcorpus` — 3,633 docs / 224 test queries / 99 dev querie
 |-----------------------------------------------------|--------:|------:|------:|-------:|
 | MiniLM-L6 reference (384-d float32)                 |   0.297 | 0.286 | 0.306 |  0.481 |
 | **`router_grid_4096_768_passE_scq0_clar3.0` (Step 1k)** | **0.298** | **0.275** | **0.242** | **0.487** |
+| `bm25_sab_smooth_sdm_l0.85_0.10_0.05` (Step 1l)     |   0.298 | 0.273 | 0.245 |  0.487 |
 | `bm25_sab_smooth_gamma5` (novel BM25 alone)         |   0.298 | 0.274 | 0.244 |  0.487 |
+| `bm25_sab_pool500_entropy_alpha_4096_768` (Step 1m) |   0.298 | 0.274 | 0.244 |  0.487 |
+| `bm25_sab_smooth_concepts_l0.50` (Step 1n)          |   0.295 | 0.272 | 0.244 |  0.482 |
 | `bm25_sab_smooth_rm3_k10_a0.5` (Step 1k RM3)        |   0.286 | 0.267 | 0.272 |  0.470 |
 | `router_default_with_rm3_k10_a0.5` (Step 1k RM3)    |   0.277 | 0.260 | 0.274 |  0.455 |
 | `bm25_atire_rm3_k10_a0.5` (Step 1k RM3)             |   0.271 | 0.253 | 0.264 |  0.445 |
 | `router_default_4096_768` (scifact-tuned)           |   0.270 | 0.244 | 0.214 |  0.464 |
 | `bm25_pool500_linear_alpha075_4096_768`             |   0.261 | 0.243 | 0.201 |  0.443 |
+| `bm25_atire_sdm_l0.90_0.05_0.05` (Step 1l)          |   0.254 | 0.230 | 0.199 |  0.440 |
+| `bm25_atire_sdm_l0.85_0.10_0.05` (Step 1l)          |   0.253 | 0.229 | 0.199 |  0.438 |
 | `bm25_atire`                                        |   0.252 | 0.229 | 0.199 |  0.434 |
+| `bm25_pool500_entropy_alpha_4096_768` (Step 1m)     |   0.252 | 0.229 | 0.201 |  0.433 |
+| `bm25_atire_concepts_l0.25` (Step 1n)               |   0.245 | 0.224 | 0.199 |  0.420 |
+| `bm25_atire_concepts_l0.50` (Step 1n)               |   0.242 | 0.220 | 0.199 |  0.415 |
 | `bm25_plus`                                         |   0.252 | 0.232 | 0.200 |  0.440 |
 | `bm25_l`                                            |   0.252 | 0.231 | 0.199 |  0.443 |
 | `bm25_pl2` (Step 1k)                                |   0.249 | 0.230 | 0.199 |  0.421 |
@@ -250,6 +310,8 @@ Third BEIR fixture: `nfcorpus` — 3,633 docs / 224 test queries / 99 dev querie
 
 Takeaways:
 
+- **Step 1l SDM is a no-op on NFCorpus** (`bm25_atire_sdm` 0.253 vs `bm25_atire` 0.252 = +0.001, noise; SAB-SDM 0.298 ties SAB-smooth exactly). Medical abstracts are terminology-heavy but not phrase-heavy — adjacent-bigram signal doesn't add beyond unigram IDF. Matches Step 1l's predicted 0–0.005 lift on scientific text.
+- **Step 1m entropy-α regresses by −0.010 vs matched static α=0.75 on Atire pool** (`bm25_pool500_entropy_alpha_4096_768` 0.252 vs `bm25_pool500_linear_alpha075_4096_768` 0.261) — largest undershoot of the three corpora. SAB-pool entropy-α ties `bm25_sab_smooth_gamma5` at 0.298 (cosine weight collapses to ~0 when BM25 already solves the query). Safety rescue holds: +0.074 vs pure cosine. Documented null-with-safety-property: see `docs/fusion_entropy_alpha.md`.
 - **Step 1k clarity ceiling matches MiniLM** (`passE_scq0_clar3.0` 0.298 vs MiniLM 0.297). The AND-gate forces Atire on low-clarity queries only, and on NFCorpus that corresponds to the subset where SAB-smooth is already the right pick — effectively routing the entire fixture to the stronger BM25 variant without losing the scifact cascade route on the rest. Any `clar ≤ 5.0` ceiling produces the same 0.298; clarity floor threshold is insensitive at 3.0–5.0.
 - **RM3 is the second NFCorpus lift** (+1.9 points nDCG on Atire, +0.8 on SAB-smooth). Morphology-heavy medical queries benefit from term-expansion when the base variant is already subword-aware; compounding them is the Step 1k "cheap RM3 + better router" story.
 - **SAB-smooth matches MiniLM without the gate** (0.298). Medical morphology is even richer than scifact's; n-gram backoff remains the primary corpus-agnostic lever.
@@ -326,6 +388,30 @@ All three are memory-bandwidth-bound; the three-way spread (<11%) confirms the d
 | 64           | 0.938 | 0.870 | 1/6 storage                            |
 
 Use this when downstream consumers want to pick a quality / cost point per query — store one 384-d vector, query at 64-d for a coarse first pass and re-rank survivors with the full vector. Quality on real text is dramatically lower with the analytic schedule; see scifact matryoshka rows above.
+
+## Microbench — SAB-smooth perf audit
+
+Isolated `simeon_profile_sab_smooth` harness on FiQA (57,638 docs, 444 queries × 5 iters). See [Appendix A](#appendix-a--sab-smooth-perf-audit-notes) for methodology, profile, and mechanism.
+
+| Phase            |  Baseline |      Post |      Δ |
+|------------------|----------:|----------:|-------:|
+| add_docs (ms)    |  11,667.6 |   5,886.8 | −49.5% |
+| finalize (ms)    |     167.1 |      63.6 | −61.9% |
+| build_total (ms) |  11,834.7 |   5,950.3 | −49.7% |
+| query mean (µs/q)|     992.4 |   1,009.4 |  +1.7% |
+| query p95 (µs/q) |   1,749.2 |   1,778.6 |  +1.7% |
+| wall clock (s)   |     14.63 |      8.56 | −41.5% |
+| cycles (B)       |      47.5 |      32.5 | −31.5% |
+| instructions (B) |     113.9 |     112.3 |  −1.4% |
+| peak RSS (MB)    |     1,234 |     1,514 | +22.7% |
+
+Quality gate — `bm25_sab_smooth_gamma5` nDCG@10, all within ±0.001:
+
+| Corpus   | Baseline | Post   |      Δ |
+|----------|---------:|-------:|-------:|
+| scifact  |    0.612 | 0.6120 |  0.000 |
+| NFCorpus |    0.298 | 0.2981 | +0.000 |
+| FiQA     |   0.1978 | 0.1978 |  0.000 |
 
 ## Out of scope
 

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "simeon/bm25.hpp"
+#include "simeon/concept_mining.hpp"
 #include "simeon/fusion.hpp"
 #include "simeon/matryoshka.hpp"
 #include "simeon/minhash.hpp"
@@ -455,6 +456,66 @@ void run_bm25_prf(const char* name, const Fixture& fx, const simeon::Bm25Index& 
     emit(name, fx, score_rankings(rankings, fx), 0, t);
 }
 
+// SDM (Metzler & Croft 2005): three-leg BM25 blend (unigram + ordered bigram
+// + unordered bigram). idx must have been built with
+// Bm25Config::build_word_bigrams = true. cfg.lambda_* default to Metzler's
+// published weights (0.85, 0.10, 0.05).
+void run_bm25_sdm(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                  double build_us, const simeon::SdmConfig& scfg) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> s(nd, 0.0f);
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        idx.score_sdm(fx.query_texts[qi], s, scfg);
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di) {
+            rankings[qi].emplace_back(s[di], di);
+        }
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+// Step 1n — Latent Concept Model (Bendersky 2008, revisited 2024).
+// Mines high-PMI word-bigram concepts from the corpus at fixture-setup time;
+// at query time fuses base BM25 (via idx's variant) with PMI-weighted concept
+// BM25 inside the same corpus. Training-free; concept_weight is fixed
+// corpus-insensitive (0.5 default, can be overridden via bench row name).
+void run_bm25_concepts(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                       double base_build_us, float concept_weight,
+                       const simeon::ConceptConfig& ccfg) {
+    Timing t;
+    // Concept mining cost is treated as additive to the BM25 index build
+    // (one-time, offline) — fold it into index_build_us so the reported
+    // build time matches the configuration the row actually evaluates.
+    std::vector<std::string_view> docs_view;
+    docs_view.reserve(fx.doc_texts.size());
+    for (const auto& s : fx.doc_texts)
+        docs_view.emplace_back(s);
+    auto tb = Clock::now();
+    auto concepts = simeon::mine_concepts(idx, std::span<const std::string_view>(docs_view), ccfg);
+    const double mine_us = elapsed_us(tb);
+    t.index_build_us = base_build_us + mine_us;
+
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> s(nd, 0.0f);
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        simeon::score_bm25_with_concepts(idx, concepts, fx.query_texts[qi], concept_weight,
+                                         std::span<float>{s});
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di) {
+            rankings[qi].emplace_back(s[di], di);
+        }
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
 void run_simeon_bm25_rrf(const char* name, simeon::EncoderConfig cfg, const Fixture& fx,
                          const simeon::Bm25Index& idx) {
     Timing t;
@@ -507,6 +568,7 @@ enum class RerankMode {
     SimeonCosine, // pure simeon cosine within pool
     LinearAlpha,  // alpha * bm25_z + (1-alpha) * simeon_z, both z-scored within pool
     PoolRrf,      // RRF restricted to the pool (avoids the global-RRF dilution)
+    EntropyAlpha, // per-query α from entropy_alpha(); Step 1m novel contribution
 };
 
 void run_bm25_pool_simeon_rerank(const char* name, simeon::EncoderConfig cfg, const Fixture& fx,
@@ -572,7 +634,7 @@ void run_bm25_pool_simeon_rerank(const char* name, simeon::EncoderConfig cfg, co
             for (std::size_t i = 0; i < pool.size(); ++i) {
                 rankings[qi][pool[i].first].first = alpha * bm[i] + (1.0f - alpha) * si[i];
             }
-        } else { // PoolRrf
+        } else if (mode == RerankMode::PoolRrf) {
             std::vector<std::pair<std::uint32_t, float>> r_bm, r_si;
             r_bm.reserve(pool.size());
             r_si.reserve(pool.size());
@@ -586,6 +648,56 @@ void run_bm25_pool_simeon_rerank(const char* name, simeon::EncoderConfig cfg, co
             auto fused = simeon::rrf_fuse(ins, 60.0f);
             for (const auto& [did, sc] : fused) {
                 rankings[qi][did].first = sc;
+            }
+        } else { // EntropyAlpha
+            // Per-query α from Shannon entropy of each leg's top-K softmax.
+            // The raw pool scores are the BM25 leg's top-K; for the simeon leg
+            // we compute cosine scores over the same pool, then reuse the
+            // top-K slice for the entropy estimate. Pool_jaccard is 1 here
+            // because both legs share the same pool — so the collapse branch
+            // is opt-in via the config threshold set below.
+            std::vector<float> bm_pool(pool.size()), si_pool(pool.size());
+            for (std::size_t i = 0; i < pool.size(); ++i) {
+                bm_pool[i] = pool[i].second;
+                si_pool[i] = dot(qembs.data() + qi * dim, dembs.data() + pool[i].first * dim, dim);
+            }
+            std::vector<std::pair<std::uint32_t, float>> si_ranked(pool.size());
+            for (std::size_t i = 0; i < pool.size(); ++i) {
+                si_ranked[i] = {pool[i].first, si_pool[i]};
+            }
+            std::sort(si_ranked.begin(), si_ranked.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            const std::size_t tk = std::min<std::size_t>(pool.size(), 50);
+            std::vector<float> bm_top(tk), si_top(tk);
+            for (std::size_t i = 0; i < tk; ++i) {
+                bm_top[i] = pool[i].second;
+                si_top[i] = si_ranked[i].second;
+            }
+            // pool_jaccard = 1.0 here (shared pool); set threshold > 1 so the
+            // collapse branch never fires for this bench — we want to measure
+            // the pure entropy-weighted regime.
+            simeon::EntropyAlphaConfig cfg_ea;
+            cfg_ea.top_k = 50;
+            cfg_ea.agreement_threshold = 2.0f;
+            const float a_q = simeon::entropy_alpha(bm_top, si_top, /*pool_jaccard=*/1.0f, cfg_ea);
+            auto zscore_local = [](std::vector<float>& v) {
+                if (v.empty())
+                    return;
+                double mean = 0.0;
+                for (float x : v)
+                    mean += x;
+                mean /= v.size();
+                double var = 0.0;
+                for (float x : v)
+                    var += (x - mean) * (x - mean);
+                const float sd = static_cast<float>(std::sqrt(var / v.size()) + 1e-12);
+                for (float& x : v)
+                    x = static_cast<float>((x - mean) / sd);
+            };
+            zscore_local(bm_pool);
+            zscore_local(si_pool);
+            for (std::size_t i = 0; i < pool.size(); ++i) {
+                rankings[qi][pool[i].first].first = a_q * bm_pool[i] + (1.0f - a_q) * si_pool[i];
             }
         }
     }
@@ -1314,6 +1426,11 @@ int main(int argc, char** argv) {
                                 RM::SimeonCosine);
     run_bm25_pool_simeon_rerank("bm25_pool500_linear_alpha075_4096_768", cfg768, fx, bm25.idx, 500,
                                 RM::LinearAlpha, 0.75f);
+    // Step 1m — entropy-weighted runtime α. Replaces the fixed α=0.75 with a
+    // per-query value derived from softmax-entropy of each leg's top-50.
+    // Strict generalization of the linear-α row at matched (cfg, pool).
+    run_bm25_pool_simeon_rerank("bm25_pool500_entropy_alpha_4096_768", cfg768, fx, bm25.idx, 500,
+                                RM::EntropyAlpha);
 
     // Step 1c — BM25 formulation ablation. Standalone variant rows + cascade
     // headline using the strongest pool source (SubwordAwareBackoff).
@@ -1345,6 +1462,10 @@ int main(int argc, char** argv) {
                                 500, RM::SimeonCosine);
     run_bm25_pool_simeon_rerank("bm25_sab_strict_pool500_simeon_cos_4096_768", cfg768, fx,
                                 sab_strict.idx, 500, RM::SimeonCosine);
+    // Step 1m — entropy-α on SAB-smooth pool (the strongest morphological
+    // source). Companion to bm25_pool500_entropy_alpha_4096_768.
+    run_bm25_pool_simeon_rerank("bm25_sab_pool500_entropy_alpha_4096_768", cfg768, fx,
+                                sab_smooth.idx, 500, RM::EntropyAlpha);
 
     // Step 1k A1 — RM3 pseudo-relevance feedback (Lavrenko & Croft 2001).
     // Canonical TREC settings (K=10, N=20, α=0.5) applied on top of the two
@@ -1358,6 +1479,49 @@ int main(int argc, char** argv) {
     run_bm25_prf("bm25_atire_rm3_k10_a0.5", fx, bm25.idx, bm25.build_us, prf_canonical);
     run_bm25_prf("bm25_sab_smooth_rm3_k10_a0.5", fx, sab_smooth.idx, sab_smooth.build_us,
                  prf_canonical);
+
+    // Step 1l — SDM (Sequential Dependence Model, Metzler & Croft 2005).
+    // Builds a separate Atire and SAB-smooth index with build_word_bigrams=true
+    // so the base bm25/sab_smooth indexes above stay byte-identical. Three
+    // rows: Metzler defaults on Atire, same on SAB-smooth, and a weight-
+    // sensitivity row (0.90/0.05/0.05) to check whether fixed weights are
+    // corpus-agnostic on the current fixture.
+    simeon::Bm25Config cfg_atire_sdm;
+    cfg_atire_sdm.variant = simeon::Bm25Variant::Atire;
+    cfg_atire_sdm.build_word_bigrams = true;
+    auto bm25_sdm_atire = build_bm25(fx, cfg_atire_sdm);
+    simeon::Bm25Config cfg_sab_sdm;
+    cfg_sab_sdm.variant = simeon::Bm25Variant::SubwordAwareBackoff;
+    cfg_sab_sdm.delta = 1.0f;
+    cfg_sab_sdm.subword_gamma = 5.0f;
+    cfg_sab_sdm.build_word_bigrams = true;
+    auto bm25_sdm_sab = build_bm25(fx, cfg_sab_sdm);
+
+    simeon::SdmConfig sdm_default; // 0.85 / 0.10 / 0.05
+    simeon::SdmConfig sdm_unigram_heavy;
+    sdm_unigram_heavy.lambda_unigram = 0.90f;
+    sdm_unigram_heavy.lambda_ordered = 0.05f;
+    sdm_unigram_heavy.lambda_unordered = 0.05f;
+
+    run_bm25_sdm("bm25_atire_sdm_l0.85_0.10_0.05", fx, bm25_sdm_atire.idx, bm25_sdm_atire.build_us,
+                 sdm_default);
+    run_bm25_sdm("bm25_sab_smooth_sdm_l0.85_0.10_0.05", fx, bm25_sdm_sab.idx, bm25_sdm_sab.build_us,
+                 sdm_default);
+    run_bm25_sdm("bm25_atire_sdm_l0.90_0.05_0.05", fx, bm25_sdm_atire.idx, bm25_sdm_atire.build_us,
+                 sdm_unigram_heavy);
+
+    // Step 1n — Latent Concept Model (Bendersky 2008). Corpus-PMI word-bigram
+    // concept mining + PMI-weighted concept BM25 fused with the base variant.
+    // Two base variants (Atire, SAB-smooth) × concept_weight 0.5; low-weight
+    // variant (0.25) at Atire to bound the blend sensitivity. FiQA promote
+    // threshold is +0.010 nDCG@10 over the base variant; see
+    // docs/concept_mining.md.
+    simeon::ConceptConfig ccfg_default; // min_ttf=5, pmi_floor=2.0, max=200k
+    run_bm25_concepts("bm25_atire_concepts_l0.50", fx, bm25.idx, bm25.build_us, 0.5f, ccfg_default);
+    run_bm25_concepts("bm25_atire_concepts_l0.25", fx, bm25.idx, bm25.build_us, 0.25f,
+                      ccfg_default);
+    run_bm25_concepts("bm25_sab_smooth_concepts_l0.50", fx, sab_smooth.idx, sab_smooth.build_us,
+                      0.5f, ccfg_default);
 
     // Step 1g.2 — training-free PMI / co-occurrence embeddings. Rows tagged
     // `_incorpus` use the evaluation corpus itself as the seed corpus; that is
@@ -1571,8 +1735,8 @@ int main(int argc, char** argv) {
         // (Cronen-Townsend 2002) AND-gates on the Atire route. Both are
         // pre-retrieval (no pool needed), so use_post_retrieval=false.
         const float atire_scq_floors[] = {0.0f, 5.0f, 10.0f, 20.0f};
-        const float atire_clarity_ceils[] = {
-            std::numeric_limits<float>::infinity(), 3.0f, 5.0f, 8.0f};
+        const float atire_clarity_ceils[] = {std::numeric_limits<float>::infinity(), 3.0f, 5.0f,
+                                             8.0f};
         for (float scq : atire_scq_floors)
             for (float clar : atire_clarity_ceils) {
                 simeon::RouterConfig rc;
@@ -1583,8 +1747,7 @@ int main(int argc, char** argv) {
                 rc.atire_min_scq = scq;
                 rc.atire_max_clarity = clar;
                 const double clar_d = std::isinf(clar) ? 99.0 : clar;
-                std::snprintf(tagbuf, sizeof(tagbuf), "passE_scq%.0f_clar%.1f", scq,
-                              clar_d);
+                std::snprintf(tagbuf, sizeof(tagbuf), "passE_scq%.0f_clar%.1f", scq, clar_d);
                 specs.push_back({tagbuf, rc, 500u, 0.75f, false, 50u});
             }
 

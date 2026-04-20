@@ -89,6 +89,7 @@ common_srcs = [
   'src/pmi.cpp',
   'src/query_router.cpp',
   'src/prf.cpp',
+  'src/concept_mining.cpp',
   'src/arch/scalar.cpp',
 ]
 
@@ -150,6 +151,7 @@ install_headers(
     'include/simeon/pmi.hpp',
     'include/simeon/query_router.hpp',
     'include/simeon/prf.hpp',
+    'include/simeon/concept_mining.hpp',
   ],
   subdir: 'simeon',
 )

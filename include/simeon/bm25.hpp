@@ -3,10 +3,10 @@
 #include <cstdint>
 #include <span>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "simeon/flat_hash_map_u64.hpp"
 #include "simeon/simeon.hpp"
 
 namespace simeon {
@@ -76,6 +76,29 @@ struct Bm25Config {
     // Free parameter c for PL2. Terrier default is 1.0. Ignored by other
     // variants.
     float pl2_c = 1.0f;
+    // Step 1l: opt-in parallel word-bigram postings for SDM (Metzler & Croft
+    // 2005). When true, finalize() builds ordered and unordered bigram
+    // indexes so score_sdm() can run. Cost is ~30% extra index size and
+    // ~30% longer finalize() (Metzler's published figure). Default false
+    // preserves byte-identical behavior for callers that never use SDM.
+    bool build_word_bigrams = false;
+    // Window size for the unordered-bigram index: pair (q_i, q_j) is counted
+    // when both appear within this many word positions of each other in the
+    // doc. Metzler's default is 8. Fixed at index-build time; score_sdm()
+    // reads it from the index, not from SdmConfig.
+    std::uint32_t bigram_unordered_window = 8u;
+};
+
+// Sequential Dependence Model (Metzler & Croft 2005, SIGIR). Adds ordered
+// and windowed-unordered bigram scoring on top of BM25. Full score is
+//   score = λ_u · Σ BM25(unigram) + λ_o · Σ BM25(ordered bigram)
+//                                 + λ_uw · Σ BM25(unordered bigram)
+// with Metzler's published defaults (0.85, 0.10, 0.05) that work without
+// per-corpus tuning. Training-free: all signals are corpus statistics.
+struct SdmConfig {
+    float lambda_unigram = 0.85f;
+    float lambda_ordered = 0.10f;
+    float lambda_unordered = 0.05f;
 };
 
 // Streaming BM25 index over word tokens. Tokenization reuses the simeon
@@ -107,6 +130,11 @@ public:
     // Step 1k Pass E predictors (SCQ, simplified clarity) which need
     // collection statistics beyond df/idf.
     std::uint64_t total_tf(std::string_view term) const noexcept;
+    // Direct hash lookup for total_tf. Returns 0 when hash is unknown.
+    // Used by concept mining (Step 1n) which operates on raw word hashes
+    // to compute PMI without re-materializing strings. Hash must be
+    // produced by this index's hash_term() or the result is meaningless.
+    std::uint64_t total_tf_by_hash(std::uint64_t term_hash) const noexcept;
     // Total token count across all docs = Σ_d doc_length(d). Cheap; cached
     // at finalize(). Used by simplified clarity to normalize collection LM.
     std::uint64_t total_tokens() const noexcept { return total_tokens_; }
@@ -129,9 +157,9 @@ public:
     // into `out_terms` as (term_hash, weight). Caller normalizes / trims.
     // top_k_docs and doc_weights must have the same size; doc_weights are
     // typically normalized first-pass BM25 scores.
-    void build_relevance_model(
-        std::span<const std::uint32_t> top_k_docs, std::span<const float> doc_weights,
-        std::vector<std::pair<std::uint64_t, float>>& out_terms) const;
+    void build_relevance_model(std::span<const std::uint32_t> top_k_docs,
+                               std::span<const float> doc_weights,
+                               std::vector<std::pair<std::uint64_t, float>>& out_terms) const;
 
     // Score each doc by Σ_w weight(w) * per-term-contribution(w, d), using
     // the same Bm25Variant-dispatched scoring inner loop score() uses.
@@ -140,9 +168,24 @@ public:
     // this path never invokes the SubwordAwareBackoff n-gram fallback (no
     // per-term strings available); for SAB indexes the expansion is scored
     // on the exact word-posting path only.
-    void score_weighted_hashes(
-        std::span<const std::pair<std::uint64_t, float>> weighted_terms,
-        std::span<float> out_scores) const;
+    void score_weighted_hashes(std::span<const std::pair<std::uint64_t, float>> weighted_terms,
+                               std::span<float> out_scores) const;
+
+    // SDM (Metzler & Croft 2005): three-leg blend of unigram BM25 (via the
+    // configured Bm25Variant), ordered-bigram BM25, and windowed-unordered-
+    // bigram BM25. Requires cfg_.build_word_bigrams == true at construction;
+    // if the index was built without bigrams, the bigram legs contribute
+    // zero and score_sdm() degenerates to λ_u · score(). Throws if the
+    // index is not finalized. Bigram legs always use Atire-style BM25
+    // (k1/b from cfg_); the unigram leg uses the configured variant.
+    void score_sdm(std::string_view query, std::span<float> out_scores,
+                   const SdmConfig& cfg = {}) const;
+
+    // Combine two 64-bit term hashes into a stable 64-bit bigram hash using
+    // splitmix64_mix. Ordered: pass (a, b) as-is. Unordered: canonicalize
+    // via (min(a,b), max(a,b)) so (a,b) and (b,a) collide. Public so tests
+    // and composing callers can verify determinism.
+    std::uint64_t hash_bigram(std::uint64_t a, std::uint64_t b) const noexcept;
 
 private:
     // After finalize(), each posting list carries the term's IDF inline, so
@@ -157,7 +200,7 @@ private:
 
     Bm25Config cfg_;
     std::vector<std::uint32_t> doc_lengths_;
-    std::unordered_map<std::uint64_t, TermPostings> postings_;
+    FlatHashMapU64<TermPostings> postings_;
     float avg_dl_ = 0.0f;
     // Cached at finalize(): Σ doc_lengths_ (used by Dcm, computed once).
     std::uint64_t total_tokens_ = 0;
@@ -168,8 +211,16 @@ private:
     // SubwordAwareBackoff secondary index: char n-gram postings over the
     // same docs. Only populated when cfg_.variant == SubwordAwareBackoff.
     std::vector<std::uint32_t> ngram_doc_lengths_;
-    std::unordered_map<std::uint64_t, TermPostings> ngram_postings_;
+    FlatHashMapU64<TermPostings> ngram_postings_;
     float ngram_avg_dl_ = 0.0f;
+
+    // Step 1l word-bigram secondary indexes. Only populated when
+    // cfg_.build_word_bigrams == true. Scored by Atire BM25 using the word
+    // doc_lengths_ (same avg_dl_) for length normalization; bigram tf values
+    // are intrinsically smaller than unigram tf so the BM25 saturation
+    // behaves as intended.
+    FlatHashMapU64<TermPostings> ordered_bigram_postings_;
+    FlatHashMapU64<TermPostings> unordered_bigram_postings_;
 };
 
 } // namespace simeon

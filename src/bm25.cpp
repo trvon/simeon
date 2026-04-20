@@ -89,7 +89,8 @@ inline float score_dcm(float tf, std::uint64_t total_tokens, float ttf, float al
 // PL2 (Amati & van Rijsbergen 2002, Terrier reference): Poisson with Laplace
 // after-effect and L2 length normalization. Returns 0 for degenerate inputs
 // so a pathological term never poisons a doc score.
-inline float score_pl2(float tf, float dl, float avg_dl, float n_docs, float ttf, float c) noexcept {
+inline float score_pl2(float tf, float dl, float avg_dl, float n_docs, float ttf,
+                       float c) noexcept {
     if (dl <= 0.0f || tf <= 0.0f || ttf <= 0.0f || n_docs <= 0.0f || c <= 0.0f)
         return 0.0f;
     constexpr float kInvLog2 = 1.4426950408889634f; // 1/ln(2)
@@ -164,6 +165,12 @@ inline float score_dlh13(float tf, float dl, float avg_dl, float n_docs, float t
 
 Bm25Index::Bm25Index(Bm25Config cfg) noexcept : cfg_(cfg) {}
 
+std::uint64_t Bm25Index::hash_bigram(std::uint64_t a, std::uint64_t b) const noexcept {
+    std::uint64_t h = splitmix64_mix(a ^ cfg_.hash_seed);
+    h = splitmix64_mix(h + b);
+    return h;
+}
+
 std::uint32_t Bm25Index::df(std::string_view term) const noexcept {
     if (!finalized_ || term.empty())
         return 0;
@@ -193,6 +200,15 @@ std::uint64_t Bm25Index::total_tf(std::string_view term) const noexcept {
         return 0;
     const std::uint64_t h = hash64(term, cfg_.hash_seed, cfg_.hash);
     auto it = postings_.find(h);
+    if (it == postings_.end())
+        return 0;
+    return it->second.total_tf;
+}
+
+std::uint64_t Bm25Index::total_tf_by_hash(std::uint64_t term_hash) const noexcept {
+    if (!finalized_)
+        return 0;
+    auto it = postings_.find(term_hash);
     if (it == postings_.end())
         return 0;
     return it->second.total_tf;
@@ -335,6 +351,52 @@ void Bm25Index::add_doc(std::string_view text) {
             ngram_postings_[h].docs.emplace_back(did, c);
         }
     }
+
+    if (cfg_.build_word_bigrams) {
+        // Re-tokenize into an ordered word-hash stream (TfSink above loses
+        // order). This doubles the word-tokenize cost for bigram-enabled
+        // indexes — one-time at add_doc time, not on the query path.
+        static thread_local std::vector<std::uint64_t> ordered_words;
+        ordered_words.clear();
+        TermSink ord_sink{};
+        ord_sink.terms = &ordered_words;
+        ord_sink.family = cfg_.hash;
+        ord_sink.seed = cfg_.hash_seed;
+        const auto tcfg = word_only_cfg();
+        tokenize(text, tcfg, ord_sink);
+
+        // Ordered bigrams: adjacent (w_i, w_{i+1}) pairs.
+        static thread_local std::unordered_map<std::uint64_t, std::uint32_t> ord_bgm_tf;
+        ord_bgm_tf.clear();
+        for (std::size_t i = 1; i < ordered_words.size(); ++i) {
+            ++ord_bgm_tf[hash_bigram(ordered_words[i - 1], ordered_words[i])];
+        }
+        for (const auto& [h, c] : ord_bgm_tf) {
+            ordered_bigram_postings_[h].docs.emplace_back(did, c);
+        }
+
+        // Unordered bigrams: every pair within `bigram_unordered_window`
+        // positions of each other, canonicalized via (min, max) so (a,b) and
+        // (b,a) hash identically. Skips self-pairs (i != j).
+        static thread_local std::unordered_map<std::uint64_t, std::uint32_t> unord_bgm_tf;
+        unord_bgm_tf.clear();
+        const std::uint32_t w = cfg_.bigram_unordered_window;
+        if (w > 0 && ordered_words.size() >= 2) {
+            for (std::size_t i = 0; i < ordered_words.size(); ++i) {
+                const std::size_t hi = std::min<std::size_t>(i + 1 + w, ordered_words.size());
+                for (std::size_t j = i + 1; j < hi; ++j) {
+                    const std::uint64_t a = ordered_words[i];
+                    const std::uint64_t b = ordered_words[j];
+                    const std::uint64_t lo_h = std::min(a, b);
+                    const std::uint64_t hi_h = std::max(a, b);
+                    ++unord_bgm_tf[hash_bigram(lo_h, hi_h)];
+                }
+            }
+        }
+        for (const auto& [h, c] : unord_bgm_tf) {
+            unordered_bigram_postings_[h].docs.emplace_back(did, c);
+        }
+    }
 }
 
 void Bm25Index::finalize() {
@@ -380,6 +442,19 @@ void Bm25Index::finalize() {
             for (const auto& [_did, dtf] : tp.docs)
                 ttf += dtf;
             tp.total_tf = ttf;
+        }
+    }
+
+    if (cfg_.build_word_bigrams) {
+        for (auto* table : {&ordered_bigram_postings_, &unordered_bigram_postings_}) {
+            for (auto& [h, tp] : *table) {
+                const float df = static_cast<float>(tp.docs.size());
+                tp.idf = std::log((nf - df + 0.5f) / (df + 0.5f) + 1.0f);
+                std::uint64_t ttf = 0;
+                for (const auto& [_did, dtf] : tp.docs)
+                    ttf += dtf;
+                tp.total_tf = ttf;
+            }
         }
     }
     finalized_ = true;
@@ -513,6 +588,165 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
                     break;
             }
             out_scores[did] += contribution;
+        }
+    }
+}
+
+void Bm25Index::score_sdm(std::string_view query, std::span<float> out_scores,
+                          const SdmConfig& cfg) const {
+    if (!finalized_)
+        throw std::runtime_error("Bm25Index::score_sdm before finalize()");
+    if (out_scores.size() != doc_lengths_.size()) {
+        throw std::runtime_error("Bm25Index::score_sdm out_scores size mismatch");
+    }
+    std::fill(out_scores.begin(), out_scores.end(), 0.0f);
+
+    const float k1 = cfg_.k1;
+    const float b = cfg_.b;
+    const float avg = avg_dl_ > 0.0f ? avg_dl_ : 1.0f;
+    const float delta = cfg_.delta;
+    const float n_docs = static_cast<float>(doc_lengths_.size());
+
+    // Ordered query tokenization (same path as score()). Keep the strings too
+    // so the SAB unigram leg can do its OOV n-gram fallback per term.
+    static thread_local std::vector<std::string> q_strs;
+    static thread_local std::vector<std::uint64_t> q_hashes;
+    q_strs.clear();
+    q_hashes.clear();
+    StringTermSink ssink{};
+    ssink.strs = &q_strs;
+    ssink.hashes = &q_hashes;
+    ssink.family = cfg_.hash;
+    ssink.seed = cfg_.hash_seed;
+    const auto tcfg = word_only_cfg();
+    tokenize(query, tcfg, ssink);
+
+    // --- Unigram leg: configured Bm25Variant, scaled by lambda_unigram. ---
+    if (cfg.lambda_unigram != 0.0f) {
+        if (cfg_.variant == Bm25Variant::SubwordAwareBackoff) {
+            const float gamma = cfg_.subword_gamma;
+            const float ngram_avg = ngram_avg_dl_ > 0.0f ? ngram_avg_dl_ : 1.0f;
+            static thread_local std::unordered_map<std::uint64_t, std::uint32_t> term_ngram_tf;
+            for (std::size_t qi = 0; qi < q_hashes.size(); ++qi) {
+                const std::uint64_t h = q_hashes[qi];
+                const auto pit = postings_.find(h);
+                const std::uint64_t df = (pit == postings_.end()) ? 0 : pit->second.docs.size();
+                const float alpha =
+                    (df > 0) ? static_cast<float>(df) / (static_cast<float>(df) + gamma) : 0.0f;
+                if (alpha > 0.0f) {
+                    const float idf = pit->second.idf;
+                    for (const auto& [did, tf] : pit->second.docs) {
+                        const float tff = static_cast<float>(tf);
+                        const float dl = static_cast<float>(doc_lengths_[did]);
+                        out_scores[did] += cfg.lambda_unigram * alpha *
+                                           score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
+                    }
+                }
+                if (alpha < 1.0f) {
+                    term_ngram_tf.clear();
+                    TfSink ng_sink{};
+                    ng_sink.tf = &term_ngram_tf;
+                    ng_sink.family = cfg_.hash;
+                    ng_sink.seed = cfg_.hash_seed;
+                    const auto ntcfg = ngram_only_cfg(cfg_.ngram_min, cfg_.ngram_max);
+                    tokenize(q_strs[qi], ntcfg, ng_sink);
+                    const float w = 1.0f - alpha;
+                    for (const auto& [gh, _qcount] : term_ngram_tf) {
+                        const auto git = ngram_postings_.find(gh);
+                        if (git == ngram_postings_.end())
+                            continue;
+                        const float idf_g = git->second.idf;
+                        for (const auto& [did, tf] : git->second.docs) {
+                            const float tff = static_cast<float>(tf);
+                            const float dl = static_cast<float>(ngram_doc_lengths_[did]);
+                            out_scores[did] +=
+                                cfg.lambda_unigram * w *
+                                score_bm25_plus(tff, dl, idf_g, k1, b, ngram_avg, delta);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (std::uint64_t h : q_hashes) {
+                const auto pit = postings_.find(h);
+                if (pit == postings_.end())
+                    continue;
+                const float idf = pit->second.idf;
+                const float ttf = static_cast<float>(pit->second.total_tf);
+                for (const auto& [did, tf] : pit->second.docs) {
+                    const float tff = static_cast<float>(tf);
+                    const float dl = static_cast<float>(doc_lengths_[did]);
+                    float contribution = 0.0f;
+                    switch (cfg_.variant) {
+                        case Bm25Variant::Atire:
+                            contribution = score_atire(tff, dl, idf, k1, b, avg);
+                            break;
+                        case Bm25Variant::BM25Plus:
+                            contribution = score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
+                            break;
+                        case Bm25Variant::BM25L:
+                            contribution = score_bm25_l(tff, dl, idf, k1, b, avg, delta);
+                            break;
+                        case Bm25Variant::DLH13:
+                            contribution = score_dlh13(tff, dl, avg, n_docs, ttf);
+                            break;
+                        case Bm25Variant::PL2:
+                            contribution = score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
+                            break;
+                        case Bm25Variant::DPH:
+                            contribution = score_dph(tff, dl, avg, n_docs, ttf);
+                            break;
+                        case Bm25Variant::Dcm:
+                            contribution = score_dcm(tff, total_tokens_, ttf, alpha_sum_);
+                            break;
+                        case Bm25Variant::SubwordAwareBackoff:
+                            // Unreachable: handled above.
+                            break;
+                    }
+                    out_scores[did] += cfg.lambda_unigram * contribution;
+                }
+            }
+        }
+    }
+
+    // --- Ordered bigram leg: adjacent (q_i, q_{i+1}) pairs, Atire BM25. ---
+    if (cfg.lambda_ordered != 0.0f && q_hashes.size() >= 2 && !ordered_bigram_postings_.empty()) {
+        for (std::size_t i = 1; i < q_hashes.size(); ++i) {
+            const std::uint64_t bh = hash_bigram(q_hashes[i - 1], q_hashes[i]);
+            const auto pit = ordered_bigram_postings_.find(bh);
+            if (pit == ordered_bigram_postings_.end())
+                continue;
+            const float idf = pit->second.idf;
+            for (const auto& [did, tf] : pit->second.docs) {
+                const float tff = static_cast<float>(tf);
+                const float dl = static_cast<float>(doc_lengths_[did]);
+                out_scores[did] += cfg.lambda_ordered * score_atire(tff, dl, idf, k1, b, avg);
+            }
+        }
+    }
+
+    // --- Unordered bigram leg: adjacent query pairs, canonicalized. ---
+    // Query-side pairs are still adjacent (Metzler §3): the *window* is the
+    // doc-side concept, captured when the index was built.
+    if (cfg.lambda_unordered != 0.0f && q_hashes.size() >= 2 &&
+        !unordered_bigram_postings_.empty()) {
+        for (std::size_t i = 1; i < q_hashes.size(); ++i) {
+            const std::uint64_t a = q_hashes[i - 1];
+            const std::uint64_t b2 = q_hashes[i];
+            if (a == b2)
+                continue;
+            const std::uint64_t lo_h = std::min(a, b2);
+            const std::uint64_t hi_h = std::max(a, b2);
+            const std::uint64_t bh = hash_bigram(lo_h, hi_h);
+            const auto pit = unordered_bigram_postings_.find(bh);
+            if (pit == unordered_bigram_postings_.end())
+                continue;
+            const float idf = pit->second.idf;
+            for (const auto& [did, tf] : pit->second.docs) {
+                const float tff = static_cast<float>(tf);
+                const float dl = static_cast<float>(doc_lengths_[did]);
+                out_scores[did] += cfg.lambda_unordered * score_atire(tff, dl, idf, k1, b, avg);
+            }
         }
     }
 }
