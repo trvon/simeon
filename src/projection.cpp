@@ -11,10 +11,6 @@
 #if defined(SIMEON_HAS_NEON)
 #include <arm_neon.h>
 #endif
-#if defined(SIMEON_HAS_AVX2)
-#include <immintrin.h>
-#endif
-
 namespace simeon {
 
 namespace {
@@ -406,9 +402,9 @@ void Projection::apply(const std::int32_t* sketch, float* out) const {
 #endif
     for (; row < output_dim_; ++row) {
         const float* row_ptr = dense_.data() + static_cast<std::size_t>(row) * sd;
+#if defined(SIMEON_HAS_NEON)
         float acc = 0.0f;
         std::uint32_t col = 0;
-#if defined(SIMEON_HAS_NEON)
         float32x4_t a0 = vdupq_n_f32(0.0f);
         float32x4_t a1 = vdupq_n_f32(0.0f);
         for (; col + 8 <= sd; col += 8) {
@@ -416,18 +412,11 @@ void Projection::apply(const std::int32_t* sketch, float* out) const {
             a1 = vfmaq_f32(a1, vld1q_f32(row_ptr + col + 4), vld1q_f32(sf + col + 4));
         }
         acc = vaddvq_f32(vaddq_f32(a0, a1));
-#elif defined(SIMEON_HAS_AVX2)
-        __m256 a0 = _mm256_setzero_ps();
-        for (; col + 8 <= sd; col += 8) {
-            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row_ptr + col), _mm256_loadu_ps(sf + col), a0);
-        }
-        float tmp[8];
-        _mm256_storeu_ps(tmp, a0);
-        for (int k = 0; k < 8; ++k)
-            acc += tmp[k];
-#endif
         for (; col < sd; ++col)
             acc += row_ptr[col] * sf[col];
+#else
+        const float acc = simd::dot(row_ptr, sf, sd);
+#endif
         out[row] = acc * inv_scale_;
     }
 }
