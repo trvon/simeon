@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -17,15 +19,12 @@ namespace {
 // router's term lookups match the index's keys exactly.
 struct WordSink final : NGramEmitter {
     std::vector<std::string>* words;
-    void on_token(std::string_view tok, float) override {
-        words->emplace_back(tok);
-    }
+    void on_token(std::string_view tok, float) override { words->emplace_back(tok); }
 };
 
-}  // namespace
+} // namespace
 
-QueryRouter::QueryRouter(const Bm25Index& idx, RouterConfig cfg) noexcept
-    : idx_(idx), cfg_(cfg) {}
+QueryRouter::QueryRouter(const Bm25Index& idx, RouterConfig cfg) noexcept : idx_(idx), cfg_(cfg) {}
 
 QueryFeatures QueryRouter::features(std::string_view query) const {
     std::vector<std::string> words;
@@ -36,7 +35,8 @@ QueryFeatures QueryRouter::features(std::string_view query) const {
 
     QueryFeatures f;
     f.n_terms = static_cast<std::uint32_t>(words.size());
-    if (f.n_terms == 0) return f;
+    if (f.n_terms == 0)
+        return f;
 
     std::uint32_t oov = 0;
     double idf_sum = 0.0;
@@ -60,16 +60,17 @@ QueryFeatures QueryRouter::features(std::string_view query) const {
         const float i = idx_.idf(w);
         idf_sum += static_cast<double>(i);
         idf_sq_sum += static_cast<double>(i) * static_cast<double>(i);
-        if (i > f.max_idf) f.max_idf = i;
-        if (i < min_idf_seen) min_idf_seen = i;
+        if (i > f.max_idf)
+            f.max_idf = i;
+        if (i < min_idf_seen)
+            min_idf_seen = i;
         ++present;
         // SCQ: (1 + log(tf_C(t))) * idf(t). Per-occurrence accumulation
         // matches Zhao 2008's sum-over-query-terms definition (duplicate
         // terms contribute twice).
         const std::uint64_t ttf = idx_.total_tf(w);
         if (ttf > 0) {
-            scq_sum_acc +=
-                (1.0 + std::log(static_cast<double>(ttf))) * static_cast<double>(i);
+            scq_sum_acc += (1.0 + std::log(static_cast<double>(ttf))) * static_cast<double>(i);
         }
         ++q_count[idx_.hash_term(w)];
     }
@@ -83,8 +84,8 @@ QueryFeatures QueryRouter::features(std::string_view query) const {
             f.idf_stddev = static_cast<float>(var > 0.0 ? std::sqrt(var) : 0.0);
         }
     }
-    f.avg_term_chars = static_cast<float>(static_cast<double>(char_sum) /
-                                          static_cast<double>(f.n_terms));
+    f.avg_term_chars =
+        static_cast<float>(static_cast<double>(char_sum) / static_cast<double>(f.n_terms));
     f.scq_sum = static_cast<float>(scq_sum_acc);
     // Simplified clarity: Σ_t p(t|Q) log(p(t|Q) / p(t|C)) over distinct
     // present query terms. q_count was filled above (only present terms).
@@ -97,12 +98,15 @@ QueryFeatures QueryRouter::features(std::string_view query) const {
         visited.reserve(q_count.size());
         for (const auto& w : words) {
             const std::uint64_t h = idx_.hash_term(w);
-            if (visited[h]) continue;
+            if (visited[h])
+                continue;
             visited[h] = true;
             const std::uint64_t ttf = idx_.total_tf(w);
-            if (ttf == 0) continue;
+            if (ttf == 0)
+                continue;
             const auto it = q_count.find(h);
-            if (it == q_count.end() || it->second == 0) continue;
+            if (it == q_count.end() || it->second == 0)
+                continue;
             const double p_q = static_cast<double>(it->second) / q_norm;
             const double p_c = static_cast<double>(ttf) / c_norm;
             clarity_acc += p_q * std::log(p_q / p_c);
@@ -112,17 +116,19 @@ QueryFeatures QueryRouter::features(std::string_view query) const {
     return f;
 }
 
-QueryFeatures QueryRouter::features_with_pool(
-    std::string_view query, std::span<const Bm25Index* const> pools,
-    std::uint32_t k) const {
+QueryFeatures QueryRouter::features_with_pool(std::string_view query,
+                                              std::span<const Bm25Index* const> pools,
+                                              std::uint32_t k) const {
     QueryFeatures f = features(query);
-    if (pools.empty() || k == 0 || f.n_terms == 0) return f;
+    if (pools.empty() || k == 0 || f.n_terms == 0)
+        return f;
 
     // Pool 0: decay/var/entropy from top-K BM25 scores. Pool 1 (if present):
     // top-K Jaccard against pool 0. Cost is one BM25 score() per pool plus a
     // partial sort — both bounded; on scifact (~5K docs, K=50) ≤ a few ms.
     const Bm25Index* idx0 = pools[0];
-    if (idx0 == nullptr || idx0->doc_count() == 0) return f;
+    if (idx0 == nullptr || idx0->doc_count() == 0)
+        return f;
     const std::uint32_t nd0 = idx0->doc_count();
     const std::uint32_t k0 = std::min(k, nd0);
     std::vector<float> scores0(nd0, 0.0f);
@@ -131,14 +137,14 @@ QueryFeatures QueryRouter::features_with_pool(
 
     if (!pool0.empty()) {
         const float s0 = pool0.front().second;
-        const std::size_t i9 =
-            pool0.size() >= 10 ? std::size_t{9} : pool0.size() - 1;
+        const std::size_t i9 = pool0.size() >= 10 ? std::size_t{9} : pool0.size() - 1;
         if (s0 > 0.0f) {
             const float decay = (s0 - pool0[i9].second) / s0;
             f.score_decay_rate = std::clamp(decay, 0.0f, 1.0f);
         }
         double mean = 0.0;
-        for (const auto& p : pool0) mean += p.second;
+        for (const auto& p : pool0)
+            mean += p.second;
         mean /= static_cast<double>(pool0.size());
         if (mean > 0.0) {
             double var = 0.0;
@@ -159,7 +165,8 @@ QueryFeatures QueryRouter::features_with_pool(
             double ent = 0.0;
             for (const auto& p : pool0) {
                 const double w = std::exp(static_cast<double>(p.second) - smax) / zsum;
-                if (w > 0.0) ent -= w * std::log(w);
+                if (w > 0.0)
+                    ent -= w * std::log(w);
             }
             f.top_k_score_entropy = static_cast<float>(ent);
         }
@@ -174,16 +181,16 @@ QueryFeatures QueryRouter::features_with_pool(
         auto pool1 = top_k(scores1, k1);
         std::unordered_set<std::uint32_t> set0;
         set0.reserve(pool0.size());
-        for (const auto& p : pool0) set0.insert(p.first);
+        for (const auto& p : pool0)
+            set0.insert(p.first);
         std::uint32_t inter = 0;
         for (const auto& p : pool1) {
-            if (set0.count(p.first)) ++inter;
+            if (set0.count(p.first))
+                ++inter;
         }
-        const std::uint32_t uni =
-            static_cast<std::uint32_t>(pool0.size() + pool1.size()) - inter;
+        const std::uint32_t uni = static_cast<std::uint32_t>(pool0.size() + pool1.size()) - inter;
         f.pool_overlap_jaccard =
-            uni == 0 ? 1.0f
-                     : static_cast<float>(inter) / static_cast<float>(uni);
+            uni == 0 ? 1.0f : static_cast<float>(inter) / static_cast<float>(uni);
     }
     return f;
 }
@@ -193,14 +200,14 @@ Recipe QueryRouter::choose(std::string_view query) const {
 }
 
 Recipe QueryRouter::choose(const QueryFeatures& f) const noexcept {
-    if (f.n_terms == 0) return Recipe::Bm25SabSmooth;
-    if (f.oov_rate > cfg_.oov_threshold) return Recipe::Bm25SabSmooth;
-    if (f.avg_idf > cfg_.high_idf_threshold &&
-        f.n_terms >= cfg_.atire_min_terms &&
+    if (f.n_terms == 0)
+        return Recipe::Bm25SabSmooth;
+    if (f.oov_rate > cfg_.oov_threshold)
+        return Recipe::Bm25SabSmooth;
+    if (f.avg_idf > cfg_.high_idf_threshold && f.n_terms >= cfg_.atire_min_terms &&
         f.min_idf >= cfg_.atire_min_idf_floor &&
         f.pool_overlap_jaccard <= cfg_.atire_max_pool_jaccard &&
-        f.score_decay_rate >= cfg_.atire_min_score_decay &&
-        f.scq_sum >= cfg_.atire_min_scq &&
+        f.score_decay_rate >= cfg_.atire_min_score_decay && f.scq_sum >= cfg_.atire_min_scq &&
         f.simplified_clarity <= cfg_.atire_max_clarity) {
         return Recipe::Bm25Atire;
     }
@@ -212,11 +219,14 @@ Recipe QueryRouter::choose(const QueryFeatures& f) const noexcept {
 
 const char* recipe_name(Recipe r) noexcept {
     switch (r) {
-        case Recipe::Bm25Atire: return "Bm25Atire";
-        case Recipe::Bm25SabSmooth: return "Bm25SabSmooth";
-        case Recipe::CascadeLinearAlpha: return "CascadeLinearAlpha";
+        case Recipe::Bm25Atire:
+            return "Bm25Atire";
+        case Recipe::Bm25SabSmooth:
+            return "Bm25SabSmooth";
+        case Recipe::CascadeLinearAlpha:
+            return "CascadeLinearAlpha";
     }
     return "unknown";
 }
 
-}  // namespace simeon
+} // namespace simeon

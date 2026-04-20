@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
 
 #include "simeon/hasher.hpp"
 #include "simeon/tokenizer.hpp"

@@ -391,7 +391,7 @@ Use this when downstream consumers want to pick a quality / cost point per query
 
 ## Microbench — SAB-smooth perf audit
 
-Isolated `simeon_profile_sab_smooth` harness on FiQA (57,638 docs, 444 queries × 5 iters). See [Appendix A](#appendix-a--sab-smooth-perf-audit-notes) for methodology, profile, and mechanism.
+FiQA, 57,638 docs × 444 queries × 5 iters; `simeon_profile_sab_smooth` harness; `SubwordAwareBackoff` γ=5.
 
 | Phase            |  Baseline |      Post |      Δ |
 |------------------|----------:|----------:|-------:|
