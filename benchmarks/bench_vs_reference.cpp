@@ -1301,6 +1301,7 @@ int main(int argc, char** argv) {
     bm25_variant("bm25_plus", simeon::Bm25Variant::BM25Plus);
     bm25_variant("bm25_l", simeon::Bm25Variant::BM25L);
     bm25_variant("bm25_dlh13", simeon::Bm25Variant::DLH13);
+    bm25_variant("bm25_dcm", simeon::Bm25Variant::Dcm);
     auto sab_strict =
         bm25_variant("bm25_sab_strict", simeon::Bm25Variant::SubwordAwareBackoff, 1.0f, 0.0f);
     auto sab_smooth = bm25_variant("bm25_sab_smooth_gamma5",

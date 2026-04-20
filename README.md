@@ -34,7 +34,7 @@ The whole pipeline is deterministic, seeded, and byte-identical across architect
 - **Densified MinHash head** (Shrivastava 2017) for Jaccard-space three-way fusion on duplicate-heavy corpora
 - **BPE-lite subword tokenizer** with caller-supplied merges (no built-in vocab; deterministic across runs)
 - **Three hash families** — SplitMix64, XXH64 (canonical), CRC32C (hardware on x86 SSE4.2 / aarch64 +crc, slice-by-1 fallback), plus Mixed Tabulation (Houen & Thorup 2023, sparse-JL with practical hashing)
-- **Runtime-dispatched kernels** — aarch64 NEON, x86 AVX2+FMA, portable scalar
+- **SIMD kernels** — aarch64 NEON, x86 AVX2+FMA, portable scalar
 - Standalone Meson build, zero runtime deps, GPLv3
 - Cross-arch byte-identity tests, SIMD-vs-scalar parity tests, determinism KATs
 
@@ -46,7 +46,7 @@ simeon captures **lexical and topical** structure, not paraphrase or semantic eq
 - BM25 ⊕ dense late-fusion (RRF), where lexical signal is what wins on hard / short queries.
 - Self-contained retrieval where shipping a 200MB model is impractical (CLI tools, embedded, on-device).
 
-The library reimplements the **NUMEN** method (Sharma, arXiv:2601.15205) in production C++ and extends it with random-projection heads, matryoshka nesting, and Product Quantization. simeon is an engineering + ablation contribution, not a new algorithm.
+simeon is best read as an engineering and evaluation layer over several lines of prior work: NUMEN-style training-free retrieval, ColBERT-era late-interaction framing, sparse random projection, matryoshka-style nested representations, Product Quantization, and classical query-difficulty routing. It is not a new retrieval algorithm. The shipped benchmark and router notes include negative findings, so this repository should not be read as blanket validation of any single upstream paper's headline claims.
 
 ## Documentation
 
@@ -54,6 +54,9 @@ The library reimplements the **NUMEN** method (Sharma, arXiv:2601.15205) in prod
 |--------------------|-------------------------------------------------------|
 | Build              | [docs/build.md](docs/build.md)                        |
 | Benchmarks         | [docs/benchmarks.md](docs/benchmarks.md)              |
+| Research notes     | [docs/research.md](docs/research.md)                  |
+| Research saturation | [docs/training_free_saturation.md](docs/training_free_saturation.md) |
+| Works cited        | [docs/works_cited.md](docs/works_cited.md)            |
 | Reference fixture  | [docs/reference_fixture.md](docs/reference_fixture.md)|
 | Headers            | [include/simeon/](include/simeon/)                    |
 | Source             | [src/](src/) and [src/arch/](src/arch/)               |
@@ -116,6 +119,13 @@ float score = q.inner_product(codes.data() + i * pcfg.m);  // O(m) per db code
 ## Status
 
 Stable: tokenizer, hasher, three projection heads, L2 normalization, NEON + AVX2 + scalar dispatch, matryoshka, Product Quantization + ADC. Defaults and the public surface may still change.
+
+## Citation
+
+If you use simeon in research or benchmarks, cite the software via
+[CITATION.cff](CITATION.cff), use [docs/research.md](docs/research.md) for
+claim-to-document mapping, and use [docs/works_cited.md](docs/works_cited.md)
+when you need the underlying prior-work list.
 
 ## License
 

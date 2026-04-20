@@ -110,7 +110,7 @@ endif
 simeon_lib = static_library('simeon',
   common_srcs + arch_srcs,
   include_directories: simeon_inc,
-  cpp_args: simd_defines + simd_flags_avx2 + extra_cpp_args,
+  cpp_args: simd_defines + extra_cpp_args,
   link_args: extra_link_args,
   link_whole: simeon_avx2_link_whole,
   install: true,
@@ -119,7 +119,7 @@ simeon_lib = static_library('simeon',
 simeon_dep = declare_dependency(
   link_with: simeon_lib,
   include_directories: simeon_inc,
-  compile_args: simd_defines + simd_flags_avx2 + extra_cpp_args,
+  compile_args: simd_defines + extra_cpp_args,
   link_args: extra_link_args,
 )
 

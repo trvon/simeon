@@ -1,0 +1,84 @@
+cff-version: 1.2.0
+message: "If you use simeon in research, cite the software and the in-tree benchmark/design notes that support the claim you are making."
+title: "simeon"
+abstract: "Training-free retrieval backend with deterministic SIMD kernels, lexical+dense experimentation, and shipped benchmark/design notes including negative findings."
+type: software
+license: GPL-3.0-or-later
+authors:
+  - family-names: Williams
+    given-names: Trevon
+repository-code: "https://github.com/trvon/simeon"
+url: "https://github.com/trvon/simeon"
+keywords:
+  - information retrieval
+  - embeddings
+  - SIMD
+  - BM25
+  - product quantization
+references:
+  - type: article
+    title: "NUMEN: Non-neural embeddings that match transformer embeddings on retrieval"
+    authors:
+      - name: Sharma
+    year: 2026
+    journal: arXiv
+  - type: paper-conference
+    title: "ColBERT"
+    authors:
+      - name: Khattab, Omar
+      - name: Zaharia, Matei
+    year: 2020
+    doi: 10.1145/3397271.3401075
+    journal: "Proceedings of the 43rd International ACM SIGIR Conference on Research and Development in Information Retrieval"
+  - type: article
+    title: "Product Quantization for Nearest Neighbor Search"
+    authors:
+      - name: Jégou, H
+      - name: Douze, M
+      - name: Schmid, C
+    year: 2011
+    doi: 10.1109/TPAMI.2010.57
+    journal: "IEEE Transactions on Pattern Analysis and Machine Intelligence"
+  - type: paper-conference
+    title: "Very sparse random projections"
+    authors:
+      - name: Li, Ping
+      - name: Hastie, Trevor J.
+      - name: Church, Kenneth W.
+    year: 2006
+    doi: 10.1145/1150402.1150436
+    journal: "Proceedings of the 12th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining"
+  - type: paper-conference
+    title: "Matryoshka Representation Learning"
+    authors:
+      - name: Bhatt, Gantavya
+      - name: Chen, Kaifeng
+      - name: Farhadi, Ali
+      - name: Howard-Snyder, William
+      - name: Jain, Prateek
+      - name: Kakade, Sham
+      - name: Kusupati, Aditya
+      - name: Ramanujan, Vivek
+      - name: Rege, Aniket
+      - name: Sinha, Aditya
+      - name: Wallingford, Matthew
+    year: 2022
+    doi: 10.52202/068431-2192
+    journal: "Advances in Neural Information Processing Systems 35"
+  - type: book
+    title: "Estimating the Query Difficulty for Information Retrieval"
+    authors:
+      - name: Carmel, David
+      - name: Yom-Tov, Elad
+    year: 2010
+    doi: 10.1007/978-3-031-02272-2
+    journal: "Synthesis Lectures on Information Concepts, Retrieval, and Services"
+  - type: paper-conference
+    title: "Predicting query performance"
+    authors:
+      - name: Cronen-Townsend, Steve
+      - name: Zhou, Yun
+      - name: Croft, W. Bruce
+    year: 2002
+    doi: 10.1145/564376.564429
+    journal: "Proceedings of the 25th Annual International ACM SIGIR Conference on Research and Development in Information Retrieval"

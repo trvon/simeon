@@ -31,8 +31,10 @@ jobs:
 
       - name: Test (with profile collection)
         env:
-          LLVM_PROFILE_FILE: build/meson-logs/profraw/test-%p-%m.profraw
-        run: meson test -C build --print-errorlogs
+          LLVM_PROFILE_FILE: meson-logs/profraw/test-%p-%m.profraw
+        run: |
+          mkdir -p build/meson-logs/profraw
+          meson test -C build --print-errorlogs
 
       - name: Merge profiles + render lcov
         run: |

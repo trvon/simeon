@@ -8,10 +8,10 @@
 
 #include "simeon/hasher.hpp"
 
-#if defined(__aarch64__)
+#if defined(SIMEON_HAS_NEON)
 #include <arm_neon.h>
 #endif
-#if defined(__AVX2__)
+#if defined(SIMEON_HAS_AVX2)
 #include <immintrin.h>
 #endif
 
@@ -25,11 +25,13 @@ float achlioptas_entry(std::uint32_t row, std::uint32_t col, std::uint64_t seed)
     const std::uint64_t key = (static_cast<std::uint64_t>(row) << 32) ^ col;
     const std::uint64_t h = splitmix64_mix(key ^ seed);
     // 0..2^64-1 mapped to {−1 (p=1/6), 0 (p=2/3), +1 (p=1/6)}.
-    constexpr std::uint64_t LOW = 0x2AAAAAAAAAAAAAABULL;   // ~(2^64 / 6)
-    constexpr std::uint64_t HIGH = 0xD555555555555555ULL;  // ~(5 * 2^64 / 6)
+    constexpr std::uint64_t LOW = 0x2AAAAAAAAAAAAAABULL;  // ~(2^64 / 6)
+    constexpr std::uint64_t HIGH = 0xD555555555555555ULL; // ~(5 * 2^64 / 6)
     static const float scale = std::sqrt(3.0f);
-    if (h < LOW) return -scale;
-    if (h >= HIGH) return +scale;
+    if (h < LOW)
+        return -scale;
+    if (h >= HIGH)
+        return +scale;
     return 0.0f;
 }
 
@@ -61,9 +63,11 @@ void fwht_inplace(float* data, std::uint32_t n) noexcept {
 }
 
 std::uint32_t next_pow2(std::uint32_t n) noexcept {
-    if (n <= 1) return 1;
+    if (n <= 1)
+        return 1;
     std::uint32_t p = 1;
-    while (p < n) p <<= 1;
+    while (p < n)
+        p <<= 1;
     return p;
 }
 
@@ -76,18 +80,21 @@ int hadamard_sign(std::uint32_t i, std::uint32_t j) noexcept {
 // Very sparse (Li 2006): entries scaled by sqrt(s), nonzero with probability 1/s.
 float very_sparse_entry(std::uint32_t row, std::uint32_t col, std::uint64_t seed,
                         std::uint32_t sketch_dim) noexcept {
-    if (sketch_dim == 0) return 0.0f;
+    if (sketch_dim == 0)
+        return 0.0f;
     const float s = std::max(1.0f, std::sqrt(static_cast<float>(sketch_dim)));
     const std::uint64_t key = (static_cast<std::uint64_t>(row) << 32) ^ col;
     const std::uint64_t h = splitmix64_mix(key ^ seed ^ 0xABCDEF0123456789ULL);
     const float u = static_cast<float>(h >> 11) / static_cast<float>(1ULL << 53);
     const float p_nonzero = 1.0f / s;
-    if (u < p_nonzero * 0.5f) return -std::sqrt(s);
-    if (u < p_nonzero) return +std::sqrt(s);
+    if (u < p_nonzero * 0.5f)
+        return -std::sqrt(s);
+    if (u < p_nonzero)
+        return +std::sqrt(s);
     return 0.0f;
 }
 
-}  // namespace
+} // namespace
 
 Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, ProjectionMode mode,
                        std::uint64_t seed, float sparse_jl_eps)
@@ -96,10 +103,10 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
         throw std::invalid_argument("simeon::Projection: output_dim must be > 0 when mode != None");
     }
     if (mode_ == ProjectionMode::SparseJL && !(sparse_jl_eps > 0.0f && sparse_jl_eps <= 1.0f)) {
-        throw std::invalid_argument(
-            "simeon::Projection: sparse_jl_eps must be in (0, 1]");
+        throw std::invalid_argument("simeon::Projection: sparse_jl_eps must be in (0, 1]");
     }
-    if (mode_ == ProjectionMode::None) return;
+    if (mode_ == ProjectionMode::None)
+        return;
 
     inv_scale_ = 1.0f / std::sqrt(static_cast<float>(output_dim_));
     achlioptas_scale_ = std::sqrt(3.0f) * inv_scale_;
@@ -121,9 +128,12 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
     // for tests and callers that probe the matrix. The hot path in apply()
     // uses the specialized per-mode cache below.
     dense_.assign(static_cast<std::size_t>(output_dim_) * sketch_dim_, 0.0f);
-    if (mode_ == ProjectionMode::AchlioptasSparse) achlioptas_.resize(output_dim_);
-    if (mode_ == ProjectionMode::VerySparse) sparse_.resize(output_dim_);
-    if (mode_ == ProjectionMode::SparseJL) sparse_.resize(output_dim_);
+    if (mode_ == ProjectionMode::AchlioptasSparse)
+        achlioptas_.resize(output_dim_);
+    if (mode_ == ProjectionMode::VerySparse)
+        sparse_.resize(output_dim_);
+    if (mode_ == ProjectionMode::SparseJL)
+        sparse_.resize(output_dim_);
 
     if (mode_ == ProjectionMode::Fwht) {
         // SRHT-style FJLT: zero-pad sketch to next power of 2, multiply by
@@ -149,12 +159,13 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
                 "simeon::Projection: Fwht requires output_dim <= next_pow2(sketch_dim)");
         }
         std::vector<std::uint32_t> idx(pad_n_);
-        for (std::uint32_t i = 0; i < pad_n_; ++i) idx[i] = i;
+        for (std::uint32_t i = 0; i < pad_n_; ++i)
+            idx[i] = i;
         std::uint64_t srng = splitmix64_mix(seed_ ^ 0xBF58476D1CE4E5B9ULL);
         for (std::uint32_t i = 0; i < output_dim_; ++i) {
             srng = splitmix64_mix(srng + i);
-            const std::uint32_t pick = i + static_cast<std::uint32_t>(
-                                               srng % static_cast<std::uint64_t>(pad_n_ - i));
+            const std::uint32_t pick =
+                i + static_cast<std::uint32_t>(srng % static_cast<std::uint64_t>(pad_n_ - i));
             std::swap(idx[i], idx[pick]);
         }
         sample_.assign(idx.begin(), idx.begin() + output_dim_);
@@ -183,14 +194,16 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
         // output_dim, so total nonzeros ≈ s * sketch_dim.
         std::vector<std::uint32_t> idx(output_dim_);
         for (std::uint32_t col = 0; col < sketch_dim_; ++col) {
-            for (std::uint32_t i = 0; i < output_dim_; ++i) idx[i] = i;
+            for (std::uint32_t i = 0; i < output_dim_; ++i)
+                idx[i] = i;
             const std::uint64_t col_seed =
                 splitmix64_mix(seed_ ^ (static_cast<std::uint64_t>(col) * 0x9E3779B97F4A7C15ULL));
             std::uint64_t rng = col_seed;
             for (std::uint32_t i = 0; i < s_jl; ++i) {
                 rng = splitmix64_mix(rng + i);
-                const std::uint32_t pick = i + static_cast<std::uint32_t>(
-                                                   rng % static_cast<std::uint64_t>(output_dim_ - i));
+                const std::uint32_t pick =
+                    i +
+                    static_cast<std::uint32_t>(rng % static_cast<std::uint64_t>(output_dim_ - i));
                 std::swap(idx[i], idx[pick]);
             }
             for (std::uint32_t i = 0; i < s_jl; ++i) {
@@ -209,7 +222,8 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
             auto& cols = sparse_[row].cols;
             auto& ws = sparse_[row].weights;
             std::vector<std::pair<std::uint32_t, float>> tmp(cols.size());
-            for (std::size_t i = 0; i < cols.size(); ++i) tmp[i] = {cols[i], ws[i]};
+            for (std::size_t i = 0; i < cols.size(); ++i)
+                tmp[i] = {cols[i], ws[i]};
             std::sort(tmp.begin(), tmp.end(),
                       [](const auto& a, const auto& b) { return a.first < b.first; });
             for (std::size_t i = 0; i < cols.size(); ++i) {
@@ -253,7 +267,8 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
 Projection::~Projection() = default;
 
 float Projection::entry(std::uint32_t row, std::uint32_t col) const {
-    if (mode_ == ProjectionMode::None) return (row == col) ? 1.0f : 0.0f;
+    if (mode_ == ProjectionMode::None)
+        return (row == col) ? 1.0f : 0.0f;
     return dense_[static_cast<std::size_t>(row) * sketch_dim_ + col];
 }
 
@@ -275,10 +290,12 @@ void Projection::apply(const std::int32_t* sketch, float* out) const {
             std::int64_t neg = 0;
             const auto* pc = ar.pos_cols.data();
             const std::size_t np = ar.pos_cols.size();
-            for (std::size_t i = 0; i < np; ++i) pos += sketch[pc[i]];
+            for (std::size_t i = 0; i < np; ++i)
+                pos += sketch[pc[i]];
             const auto* nc = ar.neg_cols.data();
             const std::size_t nn = ar.neg_cols.size();
-            for (std::size_t i = 0; i < nn; ++i) neg += sketch[nc[i]];
+            for (std::size_t i = 0; i < nn; ++i)
+                neg += sketch[nc[i]];
             out[row] = static_cast<float>(pos - neg) * achlioptas_scale_;
         }
         return;
@@ -348,7 +365,7 @@ void Projection::apply(const std::int32_t* sketch, float* out) const {
     const float* sf = sketch_f.data();
     const std::uint32_t sd = sketch_dim_;
     std::uint32_t row = 0;
-#if defined(__aarch64__)
+#if defined(SIMEON_HAS_NEON)
     for (; row + 4 <= output_dim_; row += 4) {
         const float* r0p = dense_.data() + static_cast<std::size_t>(row + 0) * sd;
         const float* r1p = dense_.data() + static_cast<std::size_t>(row + 1) * sd;
@@ -391,7 +408,7 @@ void Projection::apply(const std::int32_t* sketch, float* out) const {
         const float* row_ptr = dense_.data() + static_cast<std::size_t>(row) * sd;
         float acc = 0.0f;
         std::uint32_t col = 0;
-#if defined(__aarch64__)
+#if defined(SIMEON_HAS_NEON)
         float32x4_t a0 = vdupq_n_f32(0.0f);
         float32x4_t a1 = vdupq_n_f32(0.0f);
         for (; col + 8 <= sd; col += 8) {
@@ -399,19 +416,20 @@ void Projection::apply(const std::int32_t* sketch, float* out) const {
             a1 = vfmaq_f32(a1, vld1q_f32(row_ptr + col + 4), vld1q_f32(sf + col + 4));
         }
         acc = vaddvq_f32(vaddq_f32(a0, a1));
-#elif defined(__AVX2__)
+#elif defined(SIMEON_HAS_AVX2)
         __m256 a0 = _mm256_setzero_ps();
         for (; col + 8 <= sd; col += 8) {
-            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row_ptr + col),
-                                 _mm256_loadu_ps(sf + col), a0);
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row_ptr + col), _mm256_loadu_ps(sf + col), a0);
         }
         float tmp[8];
         _mm256_storeu_ps(tmp, a0);
-        for (int k = 0; k < 8; ++k) acc += tmp[k];
+        for (int k = 0; k < 8; ++k)
+            acc += tmp[k];
 #endif
-        for (; col < sd; ++col) acc += row_ptr[col] * sf[col];
+        for (; col < sd; ++col)
+            acc += row_ptr[col] * sf[col];
         out[row] = acc * inv_scale_;
     }
 }
 
-}  // namespace simeon
+} // namespace simeon

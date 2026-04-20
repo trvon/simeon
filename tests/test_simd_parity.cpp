@@ -34,13 +34,13 @@ void test_normalize_parity_dim(std::uint32_t n) {
     auto a = src;
     simeon::simd::l2_normalize_scalar(a.data(), n);
 
-#if defined(__aarch64__)
+#if defined(SIMEON_HAS_NEON)
     auto b = src;
     simeon::simd::l2_normalize_neon(b.data(), n);
     check_close(a, b, 1e-5f);
 #endif
 
-#if defined(__AVX2__)
+#if defined(SIMEON_HAS_AVX2)
     auto c = src;
     simeon::simd::l2_normalize_avx2(c.data(), n);
     check_close(a, c, 1e-5f);
@@ -76,14 +76,14 @@ void test_zero_vector_all_tiers() {
         for (float f : a)
             assert(f == 0.0f);
 
-#if defined(__aarch64__)
+#if defined(SIMEON_HAS_NEON)
         auto b = z;
         const float ib = simeon::simd::l2_normalize_neon(b.data(), n);
         assert(ib == 0.0f);
         for (float f : b)
             assert(f == 0.0f);
 #endif
-#if defined(__AVX2__)
+#if defined(SIMEON_HAS_AVX2)
         auto c = z;
         const float ic = simeon::simd::l2_normalize_avx2(c.data(), n);
         assert(ic == 0.0f);
@@ -126,7 +126,7 @@ void test_normalize_extreme_magnitudes() {
             acc += static_cast<double>(f) * static_cast<double>(f);
         assert(std::fabs(std::sqrt(acc) - 1.0) < 1e-4);
 
-#if defined(__aarch64__)
+#if defined(SIMEON_HAS_NEON)
         auto b = src;
         simeon::simd::l2_normalize_neon(b.data(), n);
         // Compare rescaled: each variant produces its own unit-norm vector,
@@ -137,7 +137,7 @@ void test_normalize_extreme_magnitudes() {
             assert(std::fabs(a[i] - b[i]) <= 1e-3f * scale);
         }
 #endif
-#if defined(__AVX2__)
+#if defined(SIMEON_HAS_AVX2)
         auto c = src;
         simeon::simd::l2_normalize_avx2(c.data(), n);
         for (std::uint32_t i = 0; i < n; ++i) {
@@ -152,12 +152,12 @@ void test_dot_parity_dim(std::uint32_t n) {
     auto a = make_random(n, 0xBADCAFEu ^ n);
     auto b = make_random(n, 0xFEEDFACEu ^ n);
     [[maybe_unused]] const float ref = simeon::simd::dot_scalar(a.data(), b.data(), n);
-#if defined(__aarch64__)
+#if defined(SIMEON_HAS_NEON)
     const float v = simeon::simd::dot_neon(a.data(), b.data(), n);
     const float scale = std::max(1.0f, std::fabs(ref));
     assert(std::fabs(v - ref) <= 1e-4f * scale);
 #endif
-#if defined(__AVX2__)
+#if defined(SIMEON_HAS_AVX2)
     const float v = simeon::simd::dot_avx2(a.data(), b.data(), n);
     const float scale = std::max(1.0f, std::fabs(ref));
     assert(std::fabs(v - ref) <= 1e-4f * scale);
@@ -200,12 +200,12 @@ void test_add_vec_parity_dim(std::uint32_t n) {
     auto a = init;
     simeon::simd::add_vec_scalar(a.data(), src.data(), n);
 
-#if defined(__aarch64__)
+#if defined(SIMEON_HAS_NEON)
     auto b = init;
     simeon::simd::add_vec_neon(b.data(), src.data(), n);
     check_close(a, b, 1e-6f);
 #endif
-#if defined(__AVX2__)
+#if defined(SIMEON_HAS_AVX2)
     auto c = init;
     simeon::simd::add_vec_avx2(c.data(), src.data(), n);
     check_close(a, c, 1e-6f);
@@ -219,12 +219,12 @@ void test_scale_vec_parity_dim(std::uint32_t n) {
     auto a = init;
     simeon::simd::scale_vec_scalar(a.data(), w.data(), n);
 
-#if defined(__aarch64__)
+#if defined(SIMEON_HAS_NEON)
     auto b = init;
     simeon::simd::scale_vec_neon(b.data(), w.data(), n);
     check_close(a, b, 1e-6f);
 #endif
-#if defined(__AVX2__)
+#if defined(SIMEON_HAS_AVX2)
     auto c = init;
     simeon::simd::scale_vec_avx2(c.data(), w.data(), n);
     check_close(a, c, 1e-6f);
@@ -239,7 +239,7 @@ void test_saxpy_parity_dim(std::uint32_t n) {
     auto a = init;
     simeon::simd::saxpy_scalar(a.data(), src.data(), alpha, n);
 
-#if defined(__aarch64__)
+#if defined(SIMEON_HAS_NEON)
     auto b = init;
     simeon::simd::saxpy_neon(b.data(), src.data(), alpha, n);
     // FMA rounds once; scalar rounds twice. Use a small relative tolerance.
@@ -248,7 +248,7 @@ void test_saxpy_parity_dim(std::uint32_t n) {
         assert(std::fabs(a[i] - b[i]) <= 1e-5f * scale);
     }
 #endif
-#if defined(__AVX2__)
+#if defined(SIMEON_HAS_AVX2)
     auto c = init;
     simeon::simd::saxpy_avx2(c.data(), src.data(), alpha, n);
     for (std::uint32_t i = 0; i < n; ++i) {
@@ -304,9 +304,17 @@ void test_dispatchers_round_trip() {
 // scalar path even on a SIMD-capable host.
 void test_active_tier_matches_host() {
     const auto tier = simeon::active_simd_tier();
-#if defined(__aarch64__)
+#if defined(SIMEON_HAS_NEON)
     assert(tier == simeon::SimdTier::Neon);
-#elif defined(__AVX2__)
+#elif defined(SIMEON_HAS_AVX2)
+    assert(tier == simeon::SimdTier::Avx2);
+#else
+    assert(tier == simeon::SimdTier::Scalar);
+#endif
+
+#if defined(SIMEON_HAS_NEON)
+    assert(tier == simeon::SimdTier::Neon);
+#elif defined(SIMEON_HAS_AVX2)
     assert(tier == simeon::SimdTier::Avx2);
 #else
     assert(tier == simeon::SimdTier::Scalar);
@@ -315,6 +323,20 @@ void test_active_tier_matches_host() {
     assert(std::string_view(simeon::simd_tier_name(simeon::SimdTier::Scalar)) == "scalar");
     assert(std::string_view(simeon::simd_tier_name(simeon::SimdTier::Neon)) == "neon");
     assert(std::string_view(simeon::simd_tier_name(simeon::SimdTier::Avx2)) == "avx2");
+}
+
+void test_dot_dispatch_matches_public_tier() {
+    auto a = make_random(384, 0xABCD1234u);
+    auto b = make_random(384, 0x1234ABCDu);
+    const float via_public = simeon::simd::dot(a.data(), b.data(), 384);
+#if defined(SIMEON_HAS_NEON)
+    const float via_tier = simeon::simd::dot_neon(a.data(), b.data(), 384);
+#elif defined(SIMEON_HAS_AVX2)
+    const float via_tier = simeon::simd::dot_avx2(a.data(), b.data(), 384);
+#else
+    const float via_tier = simeon::simd::dot_scalar(a.data(), b.data(), 384);
+#endif
+    assert(std::fabs(via_public - via_tier) <= 1e-5f * std::max(1.0f, std::fabs(via_tier)));
 }
 
 } // namespace
@@ -331,5 +353,6 @@ int main() {
     test_elementwise_dimensions();
     test_dispatchers_round_trip();
     test_active_tier_matches_host();
+    test_dot_dispatch_matches_public_tier();
     return 0;
 }

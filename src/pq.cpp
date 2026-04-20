@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "simeon/hasher.hpp"
+#include "simeon/simd.hpp"
 
 namespace simeon {
 
@@ -38,12 +39,15 @@ float l2_sq(const float* a, const float* b, std::uint32_t n) noexcept {
 }
 
 float dot(const float* a, const float* b, std::uint32_t n) noexcept {
+    if (n >= 16)
+        return simd::dot(a, b, n);
     float acc = 0.0f;
-    for (std::uint32_t i = 0; i < n; ++i) acc += a[i] * b[i];
+    for (std::uint32_t i = 0; i < n; ++i)
+        acc += a[i] * b[i];
     return acc;
 }
 
-}  // namespace
+} // namespace
 
 class ProductQuantizer::Impl {
 public:
@@ -64,10 +68,9 @@ public:
             for (std::uint32_t ki = 0; ki < k; ++ki) {
                 float* c = centroid_mut(mi, ki);
                 for (std::uint32_t d = 0; d < dsub_; ++d) {
-                    const std::uint64_t key =
-                        (static_cast<std::uint64_t>(mi) << 40) ^
-                        (static_cast<std::uint64_t>(ki) << 16) ^
-                        static_cast<std::uint64_t>(d);
+                    const std::uint64_t key = (static_cast<std::uint64_t>(mi) << 40) ^
+                                              (static_cast<std::uint64_t>(ki) << 16) ^
+                                              static_cast<std::uint64_t>(d);
                     c[d] = gaussian_from_key(key, cfg_.seed);
                 }
             }
@@ -105,7 +108,8 @@ public:
             std::memcpy(cb, sub.data(), dsub_ * sizeof(float));
 
             std::vector<float> d2(n_train, std::numeric_limits<float>::infinity());
-            std::uint64_t rng_state = splitmix64_mix(cfg_.seed ^ (static_cast<std::uint64_t>(mi) + 1));
+            std::uint64_t rng_state =
+                splitmix64_mix(cfg_.seed ^ (static_cast<std::uint64_t>(mi) + 1));
             for (std::uint32_t ki = 1; ki < k; ++ki) {
                 // Update d2 with the just-added centroid.
                 const float* last = cb + static_cast<std::size_t>(ki - 1) * dsub_;
@@ -113,14 +117,15 @@ public:
                 for (std::uint32_t i = 0; i < n_train; ++i) {
                     const float dist =
                         l2_sq(sub.data() + static_cast<std::size_t>(i) * dsub_, last, dsub_);
-                    if (dist < d2[i]) d2[i] = dist;
+                    if (dist < d2[i])
+                        d2[i] = dist;
                     total += d2[i];
                 }
                 rng_state = splitmix64_mix(rng_state);
                 std::uint32_t pick = 0;
                 if (total > 0.0) {
-                    const double u = static_cast<double>(rng_state >> 11) /
-                                     static_cast<double>(1ULL << 53);
+                    const double u =
+                        static_cast<double>(rng_state >> 11) / static_cast<double>(1ULL << 53);
                     double target = u * total;
                     double cum = 0.0;
                     for (std::uint32_t i = 0; i < n_train; ++i) {
@@ -149,14 +154,14 @@ public:
                     std::uint32_t best = 0;
                     float best_d = std::numeric_limits<float>::infinity();
                     for (std::uint32_t ki = 0; ki < k; ++ki) {
-                        const float d =
-                            l2_sq(x, cb + static_cast<std::size_t>(ki) * dsub_, dsub_);
+                        const float d = l2_sq(x, cb + static_cast<std::size_t>(ki) * dsub_, dsub_);
                         if (d < best_d) {
                             best_d = d;
                             best = ki;
                         }
                     }
-                    if (it == 0 || assign[i] != best) ++changes;
+                    if (it == 0 || assign[i] != best)
+                        ++changes;
                     assign[i] = best;
                 }
 
@@ -167,7 +172,8 @@ public:
                     const std::uint32_t ki = assign[i];
                     const float* x = sub.data() + static_cast<std::size_t>(i) * dsub_;
                     float* c = new_centroids.data() + static_cast<std::size_t>(ki) * dsub_;
-                    for (std::uint32_t d = 0; d < dsub_; ++d) c[d] += x[d];
+                    for (std::uint32_t d = 0; d < dsub_; ++d)
+                        c[d] += x[d];
                     ++counts[ki];
                 }
                 for (std::uint32_t ki = 0; ki < k; ++ki) {
@@ -182,11 +188,13 @@ public:
                         const float inv = 1.0f / static_cast<float>(counts[ki]);
                         float* c = new_centroids.data() + static_cast<std::size_t>(ki) * dsub_;
                         float* dst = cb + static_cast<std::size_t>(ki) * dsub_;
-                        for (std::uint32_t d = 0; d < dsub_; ++d) dst[d] = c[d] * inv;
+                        for (std::uint32_t d = 0; d < dsub_; ++d)
+                            dst[d] = c[d] * inv;
                     }
                 }
 
-                if (changes == 0) break;
+                if (changes == 0)
+                    break;
             }
         }
 
@@ -220,8 +228,7 @@ public:
     }
 
     const float* centroid(std::uint32_t mi, std::uint32_t ki) const noexcept {
-        return codebooks_.data() +
-               static_cast<std::size_t>(mi) * cfg_.k * dsub() +
+        return codebooks_.data() + static_cast<std::size_t>(mi) * cfg_.k * dsub() +
                static_cast<std::size_t>(ki) * dsub();
     }
 
@@ -230,8 +237,7 @@ public:
 
 private:
     float* centroid_mut(std::uint32_t mi, std::uint32_t ki) noexcept {
-        return codebooks_.data() +
-               static_cast<std::size_t>(mi) * cfg_.k * dsub() +
+        return codebooks_.data() + static_cast<std::size_t>(mi) * cfg_.k * dsub() +
                static_cast<std::size_t>(ki) * dsub();
     }
 
@@ -243,13 +249,12 @@ private:
             throw std::invalid_argument("simeon::ProductQuantizer: k must be <= 256");
         }
         if (cfg_.dim % cfg_.m != 0) {
-            throw std::invalid_argument(
-                "simeon::ProductQuantizer: dim must be divisible by m");
+            throw std::invalid_argument("simeon::ProductQuantizer: dim must be divisible by m");
         }
     }
 
     PQConfig cfg_;
-    std::vector<float> codebooks_;  // m * k * dsub
+    std::vector<float> codebooks_; // m * k * dsub
     bool trained_ = false;
 };
 
@@ -258,16 +263,29 @@ ProductQuantizer::~ProductQuantizer() = default;
 ProductQuantizer::ProductQuantizer(ProductQuantizer&&) noexcept = default;
 ProductQuantizer& ProductQuantizer::operator=(ProductQuantizer&&) noexcept = default;
 
-const PQConfig& ProductQuantizer::config() const noexcept { return impl_->config(); }
-std::uint32_t ProductQuantizer::dim() const noexcept { return impl_->dim(); }
-std::uint32_t ProductQuantizer::m() const noexcept { return impl_->m(); }
-std::uint32_t ProductQuantizer::k() const noexcept { return impl_->k(); }
-std::uint32_t ProductQuantizer::dsub() const noexcept { return impl_->dsub(); }
-bool ProductQuantizer::is_trained() const noexcept { return impl_->is_trained(); }
+const PQConfig& ProductQuantizer::config() const noexcept {
+    return impl_->config();
+}
+std::uint32_t ProductQuantizer::dim() const noexcept {
+    return impl_->dim();
+}
+std::uint32_t ProductQuantizer::m() const noexcept {
+    return impl_->m();
+}
+std::uint32_t ProductQuantizer::k() const noexcept {
+    return impl_->k();
+}
+std::uint32_t ProductQuantizer::dsub() const noexcept {
+    return impl_->dsub();
+}
+bool ProductQuantizer::is_trained() const noexcept {
+    return impl_->is_trained();
+}
 
-void ProductQuantizer::init_random_gaussian() { impl_->init_random_gaussian(); }
-void ProductQuantizer::train(const float* training, std::uint32_t n_train,
-                             std::uint32_t n_iters) {
+void ProductQuantizer::init_random_gaussian() {
+    impl_->init_random_gaussian();
+}
+void ProductQuantizer::train(const float* training, std::uint32_t n_train, std::uint32_t n_iters) {
     impl_->train(training, n_train, n_iters);
 }
 void ProductQuantizer::encode(const float* vec, std::uint8_t* code) const noexcept {
@@ -325,8 +343,8 @@ public:
 private:
     std::uint32_t m_;
     std::uint32_t k_;
-    std::vector<float> lut_l2_;  // m * k, squared L2 from query subspace to each centroid
-    std::vector<float> lut_ip_;  // m * k, inner product from query subspace to each centroid
+    std::vector<float> lut_l2_; // m * k, squared L2 from query subspace to each centroid
+    std::vector<float> lut_ip_; // m * k, inner product from query subspace to each centroid
 };
 
 PQQuery::PQQuery(const ProductQuantizer& pq, const float* query)
@@ -341,7 +359,11 @@ float PQQuery::distance_l2_sq(const std::uint8_t* code) const noexcept {
 float PQQuery::inner_product(const std::uint8_t* code) const noexcept {
     return impl_->inner_product(code);
 }
-std::span<const float> PQQuery::lut_l2_sq() const noexcept { return impl_->lut_l2_sq(); }
-std::span<const float> PQQuery::lut_ip() const noexcept { return impl_->lut_ip(); }
+std::span<const float> PQQuery::lut_l2_sq() const noexcept {
+    return impl_->lut_l2_sq();
+}
+std::span<const float> PQQuery::lut_ip() const noexcept {
+    return impl_->lut_ip();
+}
 
-}  // namespace simeon
+} // namespace simeon

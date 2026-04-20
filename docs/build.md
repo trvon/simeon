@@ -117,14 +117,14 @@ The bench supports honest router-threshold tuning when the fixture provides a he
 # Sweep on dev (router_grid_4096_768_passA_*, _passB_* rows, plus oracle):
 ./build/benchmarks/simeon_bench_vs_reference fixtures/scifact-minilm \
     --queries-from dev \
-    --router-per-query benchmarks/results/scifact_router_dev_per_query.jsonl \
-    > benchmarks/results/scifact_router_dev_grid.jsonl
+    --router-per-query scifact_router_dev_per_query.jsonl \
+    > scifact_router_dev_grid.jsonl
 
 # Confirm the top-N grid configs on test:
 ./build/benchmarks/simeon_bench_vs_reference fixtures/scifact-minilm \
     --queries-from test \
-    --router-per-query benchmarks/results/scifact_router_test_per_query.jsonl \
-    > benchmarks/results/scifact_router_test_grid.jsonl
+    --router-per-query scifact_router_test_per_query.jsonl \
+    > scifact_router_test_grid.jsonl
 ```
 
 The oracle row (`router_oracle_4096_768`) reports the per-query argmax over the three recipes — an upper bound on what any pre-retrieval router can achieve at `(pool_size, alpha) = (500, 0.75)`. The dev→test gap on the top-3 grid configs is the honest tuning generalization estimate.

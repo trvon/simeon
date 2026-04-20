@@ -33,14 +33,15 @@ Bm25Index build(Bm25Variant v) {
     cfg.variant = v;
     cfg.delta = 1.0f;
     Bm25Index idx(cfg);
-    for (const auto& d : toy_corpus()) idx.add_doc(d);
+    for (const auto& d : toy_corpus())
+        idx.add_doc(d);
     idx.finalize();
     return idx;
 }
 
 void test_each_variant_deterministic() {
     for (auto v : {Bm25Variant::Atire, Bm25Variant::BM25Plus, Bm25Variant::BM25L,
-                   Bm25Variant::DLH13, Bm25Variant::SubwordAwareBackoff}) {
+                   Bm25Variant::DLH13, Bm25Variant::Dcm, Bm25Variant::SubwordAwareBackoff}) {
         auto a = build(v);
         auto b = build(v);
         const std::size_t n = a.doc_count();
@@ -104,9 +105,9 @@ void test_bm25l_finite_and_increasing_in_tf() {
     Bm25Config cfg;
     cfg.variant = Bm25Variant::BM25L;
     Bm25Index idx(cfg);
-    idx.add_doc("alpha");                    // tf=1
-    idx.add_doc("alpha alpha alpha alpha");  // tf=4
-    idx.add_doc("beta");                     // tf=0 for "alpha"
+    idx.add_doc("alpha");                   // tf=1
+    idx.add_doc("alpha alpha alpha alpha"); // tf=4
+    idx.add_doc("beta");                    // tf=0 for "alpha"
     idx.finalize();
     std::vector<float> s(3, 0.0f);
     idx.score("alpha", s);
@@ -124,7 +125,8 @@ void test_dlh13_produces_finite_scores_and_ranks_relevant_doc() {
     const std::size_t n = idx.doc_count();
     std::vector<float> s(n, 0.0f);
     idx.score("infection", s);
-    for (auto v : s) assert(std::isfinite(v));
+    for (auto v : s)
+        assert(std::isfinite(v));
 
     // Doc 1 ("infection of the wound...") should outscore unrelated docs
     // 0 ("the quick brown fox") and 4 ("the cat sat on the mat").
@@ -139,9 +141,10 @@ void test_subword_aware_oov_query_term_gets_nonzero_score() {
     // morphological variants.
     Bm25Config cfg;
     cfg.variant = Bm25Variant::SubwordAwareBackoff;
-    cfg.subword_gamma = 0.0f;  // strict OOV fallback
+    cfg.subword_gamma = 0.0f; // strict OOV fallback
     Bm25Index idx(cfg);
-    for (const auto& d : toy_corpus()) idx.add_doc(d);
+    for (const auto& d : toy_corpus())
+        idx.add_doc(d);
     idx.finalize();
 
     const std::size_t n = idx.doc_count();
@@ -178,11 +181,85 @@ void test_subword_aware_strict_collapses_to_bm25plus_on_known_query() {
 
     const std::size_t n = sab.doc_count();
     std::vector<float> ss(n, 0.0f), sp(n, 0.0f);
-    sab.score("dog", ss);  // "dog" appears in docs 0, 7
+    sab.score("dog", ss); // "dog" appears in docs 0, 7
     plus.score("dog", sp);
     for (std::size_t i = 0; i < n; ++i) {
         assert(std::fabs(ss[i] - sp[i]) < 1e-4f);
     }
+}
+
+void test_dcm_produces_finite_scores_and_ranks_relevant_doc() {
+    // DCM uses a Zhai-Lafferty Dirichlet-smoothed LM contribution:
+    // log(1 + tf * total_tokens / (α_sum * ttf)). Should be finite and
+    // rank a relevant doc above unrelated docs, like DLH13.
+    Bm25Index idx = build(Bm25Variant::Dcm);
+    const std::size_t n = idx.doc_count();
+    std::vector<float> s(n, 0.0f);
+    idx.score("infection", s);
+    for (auto v : s)
+        assert(std::isfinite(v));
+
+    assert(s[1] > s[0]);
+    assert(s[1] > s[4]);
+}
+
+void test_dcm_monotone_in_tf() {
+    // Sanity: a doc with more occurrences of the query term outscores a
+    // doc with fewer, under DCM. log(1 + k*x) is strictly increasing in x.
+    Bm25Config cfg;
+    cfg.variant = Bm25Variant::Dcm;
+    Bm25Index idx(cfg);
+    idx.add_doc("alpha");                   // tf=1
+    idx.add_doc("alpha alpha alpha alpha"); // tf=4
+    idx.add_doc("beta");                    // tf=0 for "alpha"
+    idx.finalize();
+    std::vector<float> s(3, 0.0f);
+    idx.score("alpha", s);
+    assert(std::isfinite(s[0]));
+    assert(std::isfinite(s[1]));
+    assert(std::isfinite(s[2]));
+    assert(s[1] > s[0]);
+    assert(s[2] == 0.0f);
+}
+
+void test_dcm_alpha_sum_override_is_deterministic() {
+    // With dcm_alpha_sum > 0 the config-supplied value is used directly;
+    // two identical builds with the same override must produce identical
+    // scores, and a different override must change the score (α enters
+    // the denominator of the log argument).
+    Bm25Config cfg_default;
+    cfg_default.variant = Bm25Variant::Dcm;
+    cfg_default.dcm_alpha_sum = 0.0f; // derive from corpus (avg_dl)
+
+    Bm25Config cfg_override;
+    cfg_override.variant = Bm25Variant::Dcm;
+    cfg_override.dcm_alpha_sum = 50.0f;
+
+    Bm25Index a(cfg_override), b(cfg_override), c(cfg_default);
+    for (const auto& d : toy_corpus()) {
+        a.add_doc(d);
+        b.add_doc(d);
+        c.add_doc(d);
+    }
+    a.finalize();
+    b.finalize();
+    c.finalize();
+
+    const std::size_t n = a.doc_count();
+    std::vector<float> sa(n, 0.0f), sb(n, 0.0f), sc(n, 0.0f);
+    a.score("infection", sa);
+    b.score("infection", sb);
+    c.score("infection", sc);
+    assert(sa == sb);
+
+    bool differs = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (std::fabs(sa[i] - sc[i]) > 1e-5f) {
+            differs = true;
+            break;
+        }
+    }
+    assert(differs);
 }
 
 void test_subword_aware_smooth_blends_exact_and_ngram() {
@@ -219,7 +296,7 @@ void test_subword_aware_smooth_blends_exact_and_ngram() {
     assert(any_diff);
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     test_each_variant_deterministic();
@@ -227,6 +304,9 @@ int main() {
     test_bm25_plus_floor_lifts_long_doc_score_above_atire();
     test_bm25l_finite_and_increasing_in_tf();
     test_dlh13_produces_finite_scores_and_ranks_relevant_doc();
+    test_dcm_produces_finite_scores_and_ranks_relevant_doc();
+    test_dcm_monotone_in_tf();
+    test_dcm_alpha_sum_override_is_deterministic();
     test_subword_aware_oov_query_term_gets_nonzero_score();
     test_subword_aware_strict_collapses_to_bm25plus_on_known_query();
     test_subword_aware_smooth_blends_exact_and_ngram();

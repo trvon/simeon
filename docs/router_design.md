@@ -382,8 +382,26 @@ Three observations for future router work:
    requires either a multi-corpus tuner or the post-retrieval-lite predictors
    of Step 1g.1 — neither currently has a cross-corpus validation.
 
-Full FiQA headline rows in [benchmarks.md](benchmarks.md) "## FiQA — headline
-rows". Raw JSONL: `benchmarks/results/fiqa_full.jsonl`.
+Full FiQA headline rows are summarized in [benchmarks.md](benchmarks.md).
+
+## Corpus transfer 2026-04 — three-corpus (Step 1j, NFCorpus)
+
+Third fixture added: BEIR NFCorpus (3,633 docs / 224 test queries, medical abstracts). Same `router_default` config, no retuning.
+
+| Config                                              | scifact | FiQA  | NFCorpus |
+|-----------------------------------------------------|--------:|------:|---------:|
+| MiniLM-L6 reference                                 |   0.641 | 0.359 |    0.297 |
+| `bm25_atire` (baseline)                             |   0.619 | 0.205 |    0.252 |
+| `bm25_sab_smooth_gamma5` (novel BM25 alone)         |   0.612 | 0.198 |  **0.298** |
+| `router_default_4096_768` (scifact-tuned)           |   0.640 | 0.202 |    0.270 |
+| `router_oracle_4096_768`                            |   0.691 | 0.244 |    0.327 |
+
+Four observations replacing the two-corpus story:
+
+1. **SAB-smooth is corpus-agnostic on morphology-heavy science text.** On NFCorpus it ties MiniLM-L6 (0.298 vs 0.297). On scifact it sits 0.03 below MiniLM but still above Atire. On FiQA (paraphrase-heavy finance) it trails Atire by 0.01. The pattern is textual, not domain-based: **n-gram backoff wins where queries and docs share morphological roots.**
+2. **Scifact router tuning directionally transfers but does not saturate.** `router_default` beats BM25-alone on all three corpora but falls short of the per-corpus oracle by ~0.05–0.07 nDCG on all three. The gap-to-oracle is consistent, so the limit is a tuning problem, not a predictor problem.
+3. **Scifact cascade headline is corpus-specific.** `bm25_sab_pool500_simeon_cos_4096_768` beats BM25-alone only on scifact. It collapses below BM25-alone on both FiQA (−0.09) and NFCorpus (−0.06). **The SAB→simeon-cos cascade is not a generalizable recipe; it ships only for scifact.**
+4. **Per-corpus tuner is now a warranted follow-on.** Two data points made this ambiguous; three data points make it a concrete product step (tuning script over dev fold + per-fixture router config artifact). Captured as an open residual in [training_free_saturation.md](training_free_saturation.md).
 
 ## References
 

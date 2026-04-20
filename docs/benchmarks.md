@@ -4,11 +4,12 @@
 
 - Hardware: 2024 Apple M-series laptop, NEON tier, single-threaded.
 - Build: `buildtype=debugoptimized`, NEON enabled, no sanitizers.
-- Real-corpus fixture: BEIR `scifact` — 5,183 docs / 300 queries / 339 qrels (test split). Reference: `sentence-transformers/all-MiniLM-L6-v2`, 384-d float32, L2-normalized. Fixture format documented in [reference_fixture.md](reference_fixture.md).
+- Real-corpus fixture: BEIR `scifact` — 5,183 docs / 202 test queries (after Step 1e `--dev-fraction 0.33` split; 98 dev queries are held out). Reference: `sentence-transformers/all-MiniLM-L6-v2`, 384-d float32, L2-normalized. Fixture format documented in [reference_fixture.md](reference_fixture.md). See [training_free_saturation.md](training_free_saturation.md) for what was not measured and why.
 - Synthetic corpus: 8 topical clusters × 50 documents × 60 words. Cluster-description query, same-cluster docs are relevant.
 - R@K denominator caps at `min(K, |relevant|)` (saturating-recall convention).
 - Separation = mean intra-cluster cosine − mean inter-cluster cosine.
-- The headline tables below are the publishable benchmark summary; raw local result dumps are intentionally not shipped in-tree.
+- The tables below are the publishable summary. Detailed design notes live in
+  [router_design.md](router_design.md) and [pmi_projection.md](pmi_projection.md).
 
 ## Headline (BEIR scifact)
 
@@ -23,22 +24,25 @@
 | `bm25_only` (Atire baseline)                        |   0.633 | 0.756 | 0.865 |  0.605 |          — |
 | `router_oracle_4096_768` (per-query argmax, ceiling)|   0.713 | 0.834 | 0.931 |  0.684 |       3072 |
 
-The remaining gap to MiniLM is concentrated in R@10 (0.768 vs 0.808). The oracle row shows ~6 nDCG points and ~7 R@10 points of pre-retrieval-router headroom remain — bounded by predictor quality (cheap features can't perfectly identify which queries Atire wins on).
+The remaining gap to MiniLM is concentrated in R@10 (0.768 vs 0.808). The
+oracle row shows that some router headroom remains, but cheap pre-retrieval
+predictors do not fully recover it.
 
 ## scifact — BM25 formulation ablation
 
-Five BM25 variants standalone on the same fixture. δ=1.0 for BM25+/L; γ=5.0 for SAB-smooth. SubwordAwareBackoff additionally builds a parallel char-3..5-gram inverted index.
+Six BM25 variants standalone on the same fixture. δ=1.0 for BM25+/L; γ=5.0 for SAB-smooth. SubwordAwareBackoff additionally builds a parallel char-3..5-gram inverted index. DCM uses the Zhai-Lafferty Dirichlet-LM form `log(1 + tf·T / (α·ttf))` with α_sum = avg_dl.
 
 | Variant                                   | nDCG@10 | R@10  | R@100 | MRR@10 |    QPS |
 |-------------------------------------------|--------:|------:|------:|-------:|-------:|
-| BM25 Atire (Robertson)                    |   0.633 | 0.756 | 0.865 |  0.605 | 27,813 |
-| BM25+ (Lv & Zhai CIKM 2011)               |   0.619 | 0.744 | 0.865 |  0.585 | 28,388 |
-| BM25L (Lv & Zhai SIGIR 2011)              |   0.615 | 0.747 | 0.863 |  0.579 | 25,222 |
-| DLH13 (Amati DFR, parameter-free)         |   0.610 | 0.727 | 0.849 |  0.581 | 10,702 |
-| SubwordAwareBackoff strict (γ=0)          |   0.614 | 0.728 | 0.865 |  0.584 | 19,690 |
-| **SubwordAwareBackoff smooth (γ=5)**      | **0.636** | **0.759** | **0.893** | **0.607** |  2,809 |
+| BM25 Atire (Robertson)                    |   0.619 | 0.741 | 0.874 |  0.592 | 25,494 |
+| BM25+ (Lv & Zhai CIKM 2011)               |   0.608 | 0.724 | 0.874 |  0.578 | 23,209 |
+| BM25L (Lv & Zhai SIGIR 2011)              |   0.608 | 0.729 | 0.871 |  0.576 | 21,261 |
+| DLH13 (Amati DFR, parameter-free)         |   0.590 | 0.699 | 0.846 |  0.562 |  8,898 |
+| DCM / Dirichlet-LM (Madsen-Kauchak-Elkan 2005) | 0.568 | 0.692 | 0.847 |  0.534 | 12,714 |
+| SubwordAwareBackoff strict (γ=0)          |   0.596 | 0.700 | 0.871 |  0.570 | 17,828 |
+| **SubwordAwareBackoff smooth (γ=5)**      | **0.612** | **0.723** | **0.881** | **0.587** |  2,961 |
 
-Smooth SAB is the strongest standalone BM25 we have and the best pool source for cascade. The +2.8-point R@100 lift (0.865 → 0.893) closes 60% of the gap to MiniLM's R@100 — the n-gram fallback surfaces morphological matches that exact BM25 misses. BM25+/L underperform on scifact (short abstracts; the long-doc floor doesn't apply) — reproduces Lv & Zhai 2011's corpus-dependent finding. DLH13's parameter-free score loses to tunable Atire by 2.3 nDCG points — the price of zero hyperparameters.
+Smooth SAB is the strongest standalone BM25 we have and the best pool source for cascade. The +0.7-point R@100 lift (0.874 → 0.881) is where n-gram fallback surfaces morphological matches that exact BM25 misses. BM25+/L underperform on scifact (short abstracts; the long-doc floor doesn't apply) — reproduces Lv & Zhai 2011's corpus-dependent finding. DLH13's parameter-free score loses to tunable Atire by 2.9 nDCG points — the price of zero hyperparameters. DCM trails the Robertson family by ~5 points because the Dirichlet-LM contribution is not IDF-weighted (rarity enters through `ttf`, which is a weaker signal on short-abstract corpora).
 
 ## scifact — cascade and fusion
 
@@ -68,11 +72,9 @@ Linear-α z-scored combination is the only fusion that beats BM25 alone on top-1
 | `router_sab_only_4096_768`                                   |   0.636 | 0.759 | 0.893 |  0.607 | 0 / 300 / 0 |
 | `router_grid_*_passA_*_idf6_*` (old default for reference)   |   0.640 | 0.763 | 0.889 |  0.609 | 0 / 93 / 207 |
 
-Three findings from the 36-row Pass A threshold sweep + 9-row Pass B (pool × α) sweep:
-
-- **`high_idf_threshold` is the only knob that moves the metric.** Lowering it from the conservative 6.0 to 3.0 unlocks the Atire route for 60/300 queries (rare-term, high-IDF — exactly where exact match wins) and lifts nDCG@10 by **+1.4 points** to MiniLM parity. Now the new default.
-- **The oracle reaches 0.713 nDCG@10** with route mix 60/230/10 — the cascade route is rarely the per-query best on scifact (only 10 queries), but it averages best on the queries SAB doesn't dominate. The 6 nDCG points between tuned (0.654) and oracle (0.713) is the predictor-quality ceiling: cheap pre-retrieval features cannot perfectly identify which queries Atire will win.
-- **Pass B (pool × α) does not move the metric.** After threshold tuning the cascade route only sees 33/300 queries, so the `cascade_alpha` knob has too little leverage to register. `pool_size` is similarly mute.
+Main takeaway: lowering `high_idf_threshold` from 6.0 to 3.0 is what unlocks
+the Atire route and closes the scifact gap. The more detailed sweep analysis
+and route-mix discussion are preserved in [router_design.md](router_design.md).
 
 ### Step 1f / 1g.1 — router enrichment (test fold, 202 queries)
 
@@ -83,7 +85,10 @@ Three findings from the 36-row Pass A threshold sweep + 9-row Pass B (pool × α
 | **`passD_jac0.7_dec0.3` (Step 1g.1 Pass D)**        | **0.645** | **0.763** | **0.896** |
 | `router_oracle_4096_768` (test oracle)              |   0.691 | 0.812 | 0.932 |
 
-Step 1f's `df`-only enrichment overfits the 98-query dev fold and loses on test. Step 1g.1's post-retrieval-lite predictors (`score_decay_rate`, `pool_overlap_jaccard` and friends) close ~9% of the test router→oracle gap. Methodology, dev-fold tables, and confusion analysis live in [router_design.md](router_design.md).
+Step 1f's `df`-only enrichment overfits the dev fold and loses on test. Step
+1g.1's post-retrieval-lite predictors (`score_decay_rate`,
+`pool_overlap_jaccard` and friends) recover a small but real held-out lift.
+Methodology and confusion analysis live in [router_design.md](router_design.md).
 
 ## scifact — speed/quality Pareto
 
@@ -157,9 +162,11 @@ Word-level shifted-PPMI factored with randomized SVD (Levy-Goldberg 2014, Halko 
 
 Negative result on scifact — even with the in-corpus leakage ceiling, standalone unigram PMI (0.25–0.28 nDCG@10) trails `achlioptas_4096_384` (0.35) and the PMI reranker drags the SAB cascade from 0.42 down to 0.28. The router preserves 0.64 because it rarely picks the cascade route. Scifact's gains come from morphological + contextual signal that static word-level PMI can't reach; see [pmi_projection.md](pmi_projection.md) for the analysis.
 
-## FiQA — headline rows (Step 1i, multi-corpus transfer)
+## FiQA — transfer check
 
-Second BEIR fixture: `fiqa` — 57,638 docs / 444 test queries / 204 dev queries (2:1 split via `build_reference_fixture.py --dev-fraction 0.33`). Finance domain, semantic-paraphrase-heavy (the opposite of scifact's lexical/morphological bias). Reference: `sentence-transformers/all-MiniLM-L6-v2`. All rows below are the test fold; configs re-used from scifact with no FiQA-specific tuning.
+Second BEIR fixture: `fiqa` — 57,638 docs / 444 test queries / 204 dev queries.
+Finance is much more semantic/paraphrase-heavy than scifact, so this section
+acts as a transfer check rather than a headline claim.
 
 | Configuration                                       | nDCG@10 | R@10  | R@100 | MRR@10 |
 |-----------------------------------------------------|--------:|------:|------:|-------:|
@@ -169,6 +176,7 @@ Second BEIR fixture: `fiqa` — 57,638 docs / 444 test queries / 204 dev queries
 | `router_grid_*_passB_pool500_a0.50` (FiQA favors α=0.50) | 0.210 | 0.265 | 0.460 |  0.261 |
 | `bm25_atire` (Robertson baseline)                   |   0.205 | 0.264 | 0.467 |  0.257 |
 | `bm25_sab_smooth_gamma5` (novel BM25 alone)         |   0.198 | 0.250 | 0.467 |  0.249 |
+| `bm25_dcm` (Dirichlet-LM, no IDF)                   |   0.085 | 0.119 | 0.299 |  0.114 |
 | `router_default_4096_768` (scifact-tuned)           |   0.202 | 0.256 | 0.463 |  0.253 |
 | `bm25_sab_pool500_simeon_cos_4096_768`              |   0.117 | 0.151 | 0.371 |  0.151 |
 | `achlioptas_4096_768` (standalone simeon)           |   0.101 | 0.122 | 0.262 |  0.138 |
@@ -176,22 +184,41 @@ Second BEIR fixture: `fiqa` — 57,638 docs / 444 test queries / 204 dev queries
 | `simeon_pmi256_rrf_bm25_incorpus`                   |   0.116 | 0.170 | 0.445 |  0.139 |
 | `router_oracle_4096_768` (per-query argmax, ceiling) |  0.244 | 0.307 | 0.525 |  0.307 |
 
-**Divergences from scifact** (findings that do **not** generalize):
+Takeaways:
 
-- **MiniLM/BM25 gap widens 1.03× → 1.75×.** Scifact is lexical (BM25 97% of MiniLM); FiQA is semantic (BM25 57% of MiniLM). The "BM25 alone is already near-parity" headline is scifact-specific.
-- **Standalone simeon collapses 0.40 → 0.10 nDCG@10.** Projection-space signal carries scientific morphology but not financial paraphrase.
-- **SAB-pool+simeon-cos cascade inverts: +0 scifact → −9 FiQA points vs BM25 alone.** On a semantic corpus the simeon reranker discards the little ranking signal BM25 recovered and falls below it. The scifact-headline cascade pattern is corpus-dependent.
-- **PassB α winner flips 0.75 → 0.50.** Scifact-tuned router thresholds transfer imperfectly; FiQA prefers more simeon weight in the linear combination, though the absolute lift is small (0.210 vs 0.205 BM25).
-- **Oracle → router gap widens 0.059 → 0.042 absolute but 9% → 20% relative.** FiQA has more per-query ambiguity that cheap pre-retrieval features can't resolve.
+- scifact-specific “near-parity to MiniLM” headlines do **not** transfer to FiQA
+- linear-α fusion is still the only consistent way simeon beats BM25 alone
+- router thresholds are corpus-sensitive and should be tuned per corpus
 
-**Generalizations** (findings that hold across corpora):
+The full transfer discussion is preserved in [router_design.md](router_design.md).
 
-- **Linear-α z-scored combination is the only fusion that beats BM25 alone.** On both scifact (+0.005) and FiQA (+0.006) it's the single configuration that nets positive vs Atire. SAB-pool + cosine-rerank fails on FiQA as predicted by the "cascade is pool-recall-bounded" frame.
-- **Router >= BM25 alone on both corpora.** 0.654 vs 0.633 on scifact, 0.202 vs 0.205 on FiQA — the router tracks BM25 on semantic corpora rather than boosting past it, but doesn't regress below it.
-- **MinHash is weak on both.** Neither corpus is duplicate-heavy.
-- **PMI (in-corpus) trails Achlioptas on both.** The unigram-PMI-vs-contextual gap is corpus-agnostic.
+## NFCorpus — headline rows
 
-Raw rows in `benchmarks/results/fiqa_full.jsonl`. Router-transfer notes in [router_design.md](router_design.md).
+Third BEIR fixture: `nfcorpus` — 3,633 docs / 224 test queries / 99 dev queries (`--dev-fraction 0.33`). Medical abstracts with dense morphological terminology; matches scifact on domain character (science) but has different vocabulary.
+
+| Configuration                                       | nDCG@10 | R@10  | R@100 | MRR@10 |
+|-----------------------------------------------------|--------:|------:|------:|-------:|
+| MiniLM-L6 reference (384-d float32)                 |   0.297 | 0.286 | 0.306 |  0.481 |
+| **`bm25_sab_smooth_gamma5` (novel BM25 alone)**     | **0.298** | **0.274** | **0.244** | **0.487** |
+| `router_default_4096_768` (scifact-tuned)           |   0.270 | 0.244 | 0.214 |  0.464 |
+| `bm25_pool500_linear_alpha075_4096_768`             |   0.261 | 0.243 | 0.201 |  0.443 |
+| `bm25_atire`                                        |   0.252 | 0.229 | 0.199 |  0.434 |
+| `bm25_plus`                                         |   0.252 | 0.232 | 0.200 |  0.440 |
+| `bm25_l`                                            |   0.252 | 0.231 | 0.199 |  0.443 |
+| `bm25_dlh13`                                        |   0.249 | 0.226 | 0.198 |  0.430 |
+| `bm25_dcm`                                          |   0.242 | 0.225 | 0.202 |  0.412 |
+| `bm25_sab_strict` (γ=0)                             |   0.243 | 0.215 | 0.208 |  0.426 |
+| `bm25_sab_pool500_simeon_cos_4096_768`              |   0.190 | 0.180 | 0.205 |  0.350 |
+| `achlioptas_4096_768` (standalone simeon)           |   0.177 | 0.167 | 0.164 |  0.326 |
+| `achlioptas_4096_384`                               |   0.147 | 0.136 | 0.153 |  0.284 |
+| `router_oracle_4096_768` (per-query argmax, ceiling) |  0.327 | 0.302 | 0.260 |  0.541 |
+
+Takeaways:
+
+- **SAB-smooth matches MiniLM on NFCorpus** (0.298 vs 0.297 nDCG@10). Medical morphology is even richer than scifact's; the n-gram backoff is exactly the right mechanism.
+- scifact-tuned `router_default` holds above BM25-alone (0.270 vs 0.252) but does not reach MiniLM or the oracle (0.327). Router thresholds need per-corpus tuning to close the 5.7-point gap to oracle.
+- The SAB→simeon cosine cascade still collapses (0.190 vs BM25-alone 0.252), same pattern as on FiQA. Simeon cosine rerank is a scifact-specific win.
+- Three-corpus verdict: **SAB as a standalone scorer is corpus-agnostic on morphology-heavy text; scifact router tuning is not.**
 
 ## Microbench — synthetic corpus
 

@@ -27,6 +27,12 @@ enum class Bm25Variant : std::uint8_t {
     // Amati DFR DLH13 (Terrier reference). Parameter-free divergence-from-
     // randomness scorer; uses corpus-wide term frequency, no k1/b/δ.
     DLH13,
+    // Dirichlet-smoothed LM / DCM (Madsen-Kauchak-Elkan 2005, ICML, "Modeling
+    // Word Burstiness"; related to Zhai-Lafferty 2001 Dirichlet smoothing).
+    // Per-term contribution log(1 + tf * total_tokens / (α_sum * ttf)), where
+    // α_sum defaults to avg_dl. Captures burstiness via the Polya-urn-style
+    // log-tf growth without needing per-term α_t tuning.
+    Dcm,
     // Subword-aware BM25+ backoff (this codebase, training-free): for each
     // query term t, blend exact BM25+ with a score computed from the
     // character n-grams of t against a parallel n-gram inverted index of
@@ -53,6 +59,10 @@ struct Bm25Config {
     // Ignored by other variants.
     std::uint32_t ngram_min = 3;
     std::uint32_t ngram_max = 5;
+    // Dirichlet concentration for Dcm variant. 0 means "derive from corpus"
+    // (uses avg_dl at finalize() time, matching Zhai-Lafferty μ=avg_dl).
+    // Ignored by other variants.
+    float dcm_alpha_sum = 0.0f;
 };
 
 // Streaming BM25 index over word tokens. Tokenization reuses the simeon
@@ -69,7 +79,9 @@ public:
     void finalize();
     void score(std::string_view query, std::span<float> out_scores) const;
 
-    std::uint32_t doc_count() const noexcept { return static_cast<std::uint32_t>(doc_lengths_.size()); }
+    std::uint32_t doc_count() const noexcept {
+        return static_cast<std::uint32_t>(doc_lengths_.size());
+    }
     const Bm25Config& config() const noexcept { return cfg_; }
 
     // Per-term lookup for pre-retrieval predictors (QueryRouter). Tokenizes
@@ -94,6 +106,10 @@ private:
     std::vector<std::uint32_t> doc_lengths_;
     std::unordered_map<std::uint64_t, TermPostings> postings_;
     float avg_dl_ = 0.0f;
+    // Cached at finalize(): Σ doc_lengths_ (used by Dcm, computed once).
+    std::uint64_t total_tokens_ = 0;
+    // Cached at finalize() when variant == Dcm: α_sum override or avg_dl.
+    float alpha_sum_ = 0.0f;
     bool finalized_ = false;
 
     // SubwordAwareBackoff secondary index: char n-gram postings over the
@@ -103,4 +119,4 @@ private:
     float ngram_avg_dl_ = 0.0f;
 };
 
-}  // namespace simeon
+} // namespace simeon

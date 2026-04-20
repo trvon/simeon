@@ -14,9 +14,9 @@
 namespace simeon {
 
 SimdTier active_simd_tier() noexcept {
-#if defined(__aarch64__)
+#if defined(SIMEON_HAS_NEON)
     return SimdTier::Neon;
-#elif defined(__AVX2__)
+#elif defined(SIMEON_HAS_AVX2)
     return SimdTier::Avx2;
 #else
     return SimdTier::Scalar;

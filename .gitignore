@@ -6,7 +6,10 @@ fixtures/
 *.jsonl
 *.profraw
 *.profdata
-benchmarks/speed_pareto.py
-scripts/build_reference_fixture.py
-scripts/coverage.sh
-scripts/measure_minilm_cpu.py
+
+# Local research / engineering helpers are intentionally not part of the
+# open-source surface. Keep the one contributor-facing formatter script.
+benchmarks/*.py
+scripts/*.py
+scripts/*.sh
+!scripts/format-code.sh

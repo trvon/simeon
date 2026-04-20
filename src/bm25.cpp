@@ -15,9 +15,7 @@ struct TfSink final : NGramEmitter {
     std::unordered_map<std::uint64_t, std::uint32_t>* tf;
     HashFamily family;
     std::uint64_t seed;
-    void on_token(std::string_view tok, float) override {
-        ++(*tf)[hash64(tok, seed, family)];
-    }
+    void on_token(std::string_view tok, float) override { ++(*tf)[hash64(tok, seed, family)]; }
 };
 
 struct TermSink final : NGramEmitter {
@@ -52,69 +50,91 @@ inline TokenizerConfig ngram_only_cfg(std::uint32_t lo, std::uint32_t hi) noexce
 }
 
 // Per-(term, doc) Atire BM25 contribution.
-inline float score_atire(float tf, float dl, float idf, float k1, float b,
-                         float avg_dl) noexcept {
+inline float score_atire(float tf, float dl, float idf, float k1, float b, float avg_dl) noexcept {
     const float denom = tf + k1 * (1.0f - b + b * dl / avg_dl);
     return idf * tf * (k1 + 1.0f) / denom;
 }
 
 // BM25+ (Lv & Zhai, CIKM 2011): adds δ floor to fix long-doc lower-bound
 // violation. δ=0 recovers Atire.
-inline float score_bm25_plus(float tf, float dl, float idf, float k1, float b,
-                             float avg_dl, float delta) noexcept {
+inline float score_bm25_plus(float tf, float dl, float idf, float k1, float b, float avg_dl,
+                             float delta) noexcept {
     const float denom = tf + k1 * (1.0f - b + b * dl / avg_dl);
     return idf * (tf * (k1 + 1.0f) / denom + delta);
 }
 
 // BM25L (Lv & Zhai, SIGIR 2011): different functional form than BM25+. tf is
 // length-normalized first, then plugged into a saturating ratio with δ floor.
-inline float score_bm25_l(float tf, float dl, float idf, float k1, float b,
-                          float avg_dl, float delta) noexcept {
+inline float score_bm25_l(float tf, float dl, float idf, float k1, float b, float avg_dl,
+                          float delta) noexcept {
     const float c_prime = tf / (1.0f - b + b * dl / avg_dl);
     return idf * (k1 + 1.0f) * (c_prime + delta) / (k1 + c_prime + delta);
+}
+
+// DCM / Dirichlet-LM (Madsen-Kauchak-Elkan 2005; Zhai-Lafferty 2001):
+// per-(term, doc) contribution log(1 + tf * total_tokens / (α_sum * ttf)).
+// Natural log. Zero-safe: returns 0 for degenerate inputs so a pathological
+// term never poisons a doc score.
+inline float score_dcm(float tf, std::uint64_t total_tokens, float ttf, float alpha_sum) noexcept {
+    if (tf <= 0.0f || ttf <= 0.0f || alpha_sum <= 0.0f || total_tokens == 0) {
+        return 0.0f;
+    }
+    const float denom = alpha_sum * ttf;
+    if (denom <= 0.0f)
+        return 0.0f;
+    const float ratio = tf * static_cast<float>(total_tokens) / denom;
+    return std::log1p(ratio);
 }
 
 // DLH13 (Amati DFR, Terrier reference impl): parameter-free divergence-from-
 // randomness. Returns 0 for degenerate inputs (tf>=dl, ttf=0, dl=0) so a
 // pathological term never poisons a doc score.
-inline float score_dlh13(float tf, float dl, float avg_dl, float n_docs,
-                         float ttf) noexcept {
-    if (dl <= 0.0f || tf <= 0.0f || ttf <= 0.0f || n_docs <= 0.0f) return 0.0f;
+inline float score_dlh13(float tf, float dl, float avg_dl, float n_docs, float ttf) noexcept {
+    if (dl <= 0.0f || tf <= 0.0f || ttf <= 0.0f || n_docs <= 0.0f)
+        return 0.0f;
     const float f = tf / dl;
     const float one_minus_f = 1.0f - f;
-    if (one_minus_f <= 0.0f) return 0.0f;
+    if (one_minus_f <= 0.0f)
+        return 0.0f;
     const float arg1 = (tf * avg_dl / dl) * (n_docs / ttf);
-    if (arg1 <= 0.0f) return 0.0f;
-    constexpr float kInvLog2 = 1.4426950408889634f;  // 1/ln(2)
+    if (arg1 <= 0.0f)
+        return 0.0f;
+    constexpr float kInvLog2 = 1.4426950408889634f; // 1/ln(2)
     const float term1 = tf * std::log(arg1) * kInvLog2;
     const float two_pi_tf_oneminusf = 2.0f * 3.14159265358979323846f * tf * one_minus_f;
-    if (two_pi_tf_oneminusf <= 0.0f) return 0.0f;
+    if (two_pi_tf_oneminusf <= 0.0f)
+        return 0.0f;
     const float term2 = 0.5f * std::log(two_pi_tf_oneminusf) * kInvLog2;
     return (term1 + term2) / (tf + 0.5f);
 }
 
-}  // namespace
+} // namespace
 
 Bm25Index::Bm25Index(Bm25Config cfg) noexcept : cfg_(cfg) {}
 
 std::uint32_t Bm25Index::df(std::string_view term) const noexcept {
-    if (!finalized_ || term.empty()) return 0;
+    if (!finalized_ || term.empty())
+        return 0;
     const std::uint64_t h = hash64(term, cfg_.hash_seed, cfg_.hash);
     auto it = postings_.find(h);
-    if (it == postings_.end()) return 0;
+    if (it == postings_.end())
+        return 0;
     return static_cast<std::uint32_t>(it->second.docs.size());
 }
 
 float Bm25Index::idf(std::string_view term) const noexcept {
-    if (!finalized_ || term.empty()) return 0.0f;
+    if (!finalized_ || term.empty())
+        return 0.0f;
     const std::uint64_t h = hash64(term, cfg_.hash_seed, cfg_.hash);
     auto it = postings_.find(h);
-    if (it == postings_.end()) return 0.0f;
+    if (it == postings_.end())
+        return 0.0f;
     return it->second.idf;
 }
 
 void Bm25Index::add_doc(std::string_view text) {
-    if (finalized_) throw std::runtime_error("Bm25Index::add_doc after finalize()");
+    if (finalized_)
+        throw std::runtime_error("Bm25Index::add_doc after finalize()");
 
     // Reuse the per-doc tf scratch across calls. add_doc() is single-threaded
     // (the index is built sequentially before finalize), so no synchronization
@@ -130,7 +150,8 @@ void Bm25Index::add_doc(std::string_view text) {
     tokenize(text, tcfg, sink);
 
     std::uint32_t dl = 0;
-    for (const auto& [h, c] : tf) dl += c;
+    for (const auto& [h, c] : tf)
+        dl += c;
     const std::uint32_t did = static_cast<std::uint32_t>(doc_lengths_.size());
     doc_lengths_.push_back(dl);
     for (const auto& [h, c] : tf) {
@@ -152,7 +173,8 @@ void Bm25Index::add_doc(std::string_view text) {
         tokenize(text, ntcfg, ngram_sink);
 
         std::uint32_t ngram_dl = 0;
-        for (const auto& [h, c] : ngram_tf) ngram_dl += c;
+        for (const auto& [h, c] : ngram_tf)
+            ngram_dl += c;
         ngram_doc_lengths_.push_back(ngram_dl);
         for (const auto& [h, c] : ngram_tf) {
             ngram_postings_[h].docs.emplace_back(did, c);
@@ -161,21 +183,26 @@ void Bm25Index::add_doc(std::string_view text) {
 }
 
 void Bm25Index::finalize() {
-    if (finalized_) return;
+    if (finalized_)
+        return;
     const std::size_t n = doc_lengths_.size();
+    std::uint64_t total = 0;
     if (n == 0) {
         avg_dl_ = 0.0f;
     } else {
-        std::uint64_t total = 0;
-        for (auto l : doc_lengths_) total += l;
+        for (auto l : doc_lengths_)
+            total += l;
         avg_dl_ = static_cast<float>(static_cast<double>(total) / static_cast<double>(n));
     }
+    total_tokens_ = total;
+    alpha_sum_ = cfg_.dcm_alpha_sum > 0.0f ? cfg_.dcm_alpha_sum : avg_dl_;
     const float nf = static_cast<float>(n);
     for (auto& [h, tp] : postings_) {
         const float df = static_cast<float>(tp.docs.size());
         tp.idf = std::log((nf - df + 0.5f) / (df + 0.5f) + 1.0f);
         std::uint64_t ttf = 0;
-        for (const auto& [_did, dtf] : tp.docs) ttf += dtf;
+        for (const auto& [_did, dtf] : tp.docs)
+            ttf += dtf;
         tp.total_tf = ttf;
     }
 
@@ -185,7 +212,8 @@ void Bm25Index::finalize() {
             ngram_avg_dl_ = 0.0f;
         } else {
             std::uint64_t total_n = 0;
-            for (auto l : ngram_doc_lengths_) total_n += l;
+            for (auto l : ngram_doc_lengths_)
+                total_n += l;
             ngram_avg_dl_ =
                 static_cast<float>(static_cast<double>(total_n) / static_cast<double>(nn));
         }
@@ -194,7 +222,8 @@ void Bm25Index::finalize() {
             const float df = static_cast<float>(tp.docs.size());
             tp.idf = std::log((nfn - df + 0.5f) / (df + 0.5f) + 1.0f);
             std::uint64_t ttf = 0;
-            for (const auto& [_did, dtf] : tp.docs) ttf += dtf;
+            for (const auto& [_did, dtf] : tp.docs)
+                ttf += dtf;
             tp.total_tf = ttf;
         }
     }
@@ -202,7 +231,8 @@ void Bm25Index::finalize() {
 }
 
 void Bm25Index::score(std::string_view query, std::span<float> out_scores) const {
-    if (!finalized_) throw std::runtime_error("Bm25Index::score before finalize()");
+    if (!finalized_)
+        throw std::runtime_error("Bm25Index::score before finalize()");
     if (out_scores.size() != doc_lengths_.size()) {
         throw std::runtime_error("Bm25Index::score out_scores size mismatch");
     }
@@ -237,12 +267,9 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
         for (std::size_t qi = 0; qi < q_hashes.size(); ++qi) {
             const std::uint64_t h = q_hashes[qi];
             const auto pit = postings_.find(h);
-            const std::uint64_t df = (pit == postings_.end()) ? 0
-                                                              : pit->second.docs.size();
-            const float alpha = (df > 0)
-                                    ? static_cast<float>(df) /
-                                          (static_cast<float>(df) + gamma)
-                                    : 0.0f;
+            const std::uint64_t df = (pit == postings_.end()) ? 0 : pit->second.docs.size();
+            const float alpha =
+                (df > 0) ? static_cast<float>(df) / (static_cast<float>(df) + gamma) : 0.0f;
 
             // Exact contribution (BM25+) — only when the term is present.
             if (alpha > 0.0f) {
@@ -250,8 +277,7 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
                 for (const auto& [did, tf] : pit->second.docs) {
                     const float tff = static_cast<float>(tf);
                     const float dl = static_cast<float>(doc_lengths_[did]);
-                    out_scores[did] +=
-                        alpha * score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
+                    out_scores[did] += alpha * score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
                 }
             }
 
@@ -269,7 +295,8 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
                 const float w = 1.0f - alpha;
                 for (const auto& [gh, _qcount] : term_ngram_tf) {
                     const auto git = ngram_postings_.find(gh);
-                    if (git == ngram_postings_.end()) continue;
+                    if (git == ngram_postings_.end())
+                        continue;
                     const float idf_g = git->second.idf;
                     for (const auto& [did, tf] : git->second.docs) {
                         const float tff = static_cast<float>(tf);
@@ -296,7 +323,8 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
 
     for (std::uint64_t h : q_terms) {
         const auto pit = postings_.find(h);
-        if (pit == postings_.end()) continue;
+        if (pit == postings_.end())
+            continue;
         const float idf = pit->second.idf;
         const float ttf = static_cast<float>(pit->second.total_tf);
         for (const auto& [did, tf] : pit->second.docs) {
@@ -316,6 +344,9 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
                 case Bm25Variant::DLH13:
                     contribution = score_dlh13(tff, dl, avg, n_docs, ttf);
                     break;
+                case Bm25Variant::Dcm:
+                    contribution = score_dcm(tff, total_tokens_, ttf, alpha_sum_);
+                    break;
                 case Bm25Variant::SubwordAwareBackoff:
                     // Unreachable: handled by the early return above.
                     break;
@@ -325,4 +356,4 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
     }
 }
 
-}  // namespace simeon
+} // namespace simeon
