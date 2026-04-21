@@ -90,6 +90,8 @@ common_srcs = [
   'src/query_router.cpp',
   'src/prf.cpp',
   'src/concept_mining.cpp',
+  'src/aho_corasick.cpp',
+  'src/text_rank.cpp',
   'src/arch/scalar.cpp',
 ]
 
@@ -152,6 +154,8 @@ install_headers(
     'include/simeon/query_router.hpp',
     'include/simeon/prf.hpp',
     'include/simeon/concept_mining.hpp',
+    'include/simeon/aho_corasick.hpp',
+    'include/simeon/text_rank.hpp',
   ],
   subdir: 'simeon',
 )

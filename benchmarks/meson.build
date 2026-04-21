@@ -29,6 +29,18 @@ profile_sab_exe = executable('simeon_profile_sab_smooth',
   install: false,
 )
 
+aho_corasick_exe = executable('simeon_aho_corasick_bench',
+  'aho_corasick_bench.cpp',
+  dependencies: simeon_dep,
+  install: false,
+)
+
+text_rank_exe = executable('simeon_text_rank_bench',
+  'text_rank_bench.cpp',
+  dependencies: simeon_dep,
+  install: false,
+)
+
 # Smoke-mode target that runs a very small sweep during meson test so CI
 # can catch regressions without the full throughput run.
 test('simeon_microbench_smoke', microbench_exe,
@@ -43,4 +55,19 @@ test('simeon_accuracy_smoke', accuracy_exe,
   args: ['10', '40', '0.05'],
   suite: 'simeon',
   timeout: 120,
+)
+
+# AC smoke — 64 KiB input, small dictionaries only, catches regressions in
+# build or match kernels without the full 1 MiB sweep.
+test('simeon_aho_corasick_smoke', aho_corasick_exe,
+  args: ['65536'],
+  suite: 'simeon',
+  timeout: 60,
+)
+
+# TextRank smoke — 20 docs × {4, 8, 16} sentences. Runs under a second.
+test('simeon_text_rank_smoke', text_rank_exe,
+  args: ['20'],
+  suite: 'simeon',
+  timeout: 30,
 )
