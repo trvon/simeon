@@ -91,6 +91,7 @@ common_srcs = [
   'src/prf.cpp',
   'src/concept_mining.cpp',
   'src/aho_corasick.cpp',
+  'src/aho_corasick_da.cpp',
   'src/text_rank.cpp',
   'src/arch/scalar.cpp',
 ]

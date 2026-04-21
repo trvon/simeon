@@ -35,6 +35,13 @@ aho_corasick_exe = executable('simeon_aho_corasick_bench',
   install: false,
 )
 
+# Prototype double-array trie AC. Branch-only; not a meson test target.
+aho_corasick_da_exe = executable('simeon_aho_corasick_da_bench',
+  'aho_corasick_da_bench.cpp',
+  dependencies: simeon_dep,
+  install: false,
+)
+
 text_rank_exe = executable('simeon_text_rank_bench',
   'text_rank_bench.cpp',
   dependencies: simeon_dep,
