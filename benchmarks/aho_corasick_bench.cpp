@@ -119,6 +119,77 @@ void bench_row(std::size_t n_patterns, const std::string& hits_text,
     run("noise", noise_text);
 }
 
+// Sharded AC: split the pattern list into N disjoint automatons by
+// hash(pattern_id), match each against the full input sequentially,
+// and sum per-shard throughput as total wall time / input size. The
+// goal is to see whether shrinking the monolithic automaton recovers
+// throughput at UMLS-scale dictionaries.
+void bench_sharded(std::size_t n_patterns, std::size_t n_shards, const std::string& noise_text) {
+    std::mt19937 rng(static_cast<std::uint32_t>(0xC0DEC0DE ^ n_patterns));
+    std::uniform_int_distribution<int> len(5, 12);
+
+    std::vector<std::string> owned(n_patterns);
+    for (std::size_t i = 0; i < n_patterns; ++i)
+        owned[i] = random_pattern(rng, len);
+
+    // Partition by hash(pattern) % n_shards.
+    std::vector<std::vector<std::string_view>> views(n_shards);
+    std::vector<std::vector<std::uint16_t>> types(n_shards);
+    std::hash<std::string> h;
+    for (std::size_t i = 0; i < n_patterns; ++i) {
+        const auto s = h(owned[i]) % n_shards;
+        views[s].push_back(owned[i]);
+        types[s].push_back(1);
+    }
+
+    std::vector<simeon::AhoCorasick> shards(n_shards);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (std::size_t s = 0; s < n_shards; ++s) {
+        auto err = shards[s].build(views[s], types[s]);
+        if (err.has_value()) {
+            std::fprintf(stderr, "shard build failed: %s\n", err->message.c_str());
+            return;
+        }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    const double build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // Hits text: concatenation of sampled patterns.
+    const std::size_t target_bytes = noise_text.size();
+    std::string local_hits;
+    local_hits.reserve(target_bytes + 32);
+    std::mt19937 prng(0xAA55AA55);
+    std::uniform_int_distribution<std::size_t> pick(0, owned.size() - 1);
+    while (local_hits.size() < target_bytes) {
+        local_hits += owned[pick(prng)];
+        local_hits += ' ';
+    }
+    local_hits.resize(target_bytes);
+
+    auto run = [&](const char* label, const std::string& text) {
+        const auto m0 = std::chrono::steady_clock::now();
+        std::size_t total_hits = 0;
+        for (const auto& ac : shards) {
+            const auto hits = ac.match(text);
+            total_hits += hits.size();
+        }
+        const auto m1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(m1 - m0).count();
+        const double mbps =
+            (ms > 0.0) ? (static_cast<double>(text.size()) / (1024.0 * 1024.0)) / (ms / 1000.0)
+                       : 0.0;
+        std::printf("{\"bench\":\"aho_corasick_sharded\",\"pattern_count\":%zu,"
+                    "\"n_shards\":%zu,\"build_ms\":%.3f,"
+                    "\"input_type\":\"%s\",\"input_bytes\":%zu,"
+                    "\"match_ms\":%.3f,\"match_throughput_mb_s\":%.2f,"
+                    "\"match_count\":%zu}\n",
+                    n_patterns, n_shards, build_ms, label, text.size(), ms, mbps, total_hits);
+        std::fflush(stdout);
+    };
+    run("hits", local_hits);
+    run("noise", noise_text);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -138,6 +209,13 @@ int main(int argc, char** argv) {
         if (input_bytes < 256 * 1024 && n > 10'000)
             continue;
         bench_row(n, hits_placeholder, noise);
+    }
+
+    // Sharding sweep at 500k (only in full-size runs).
+    if (input_bytes >= 256 * 1024) {
+        for (std::size_t n_shards : {2u, 4u, 8u, 16u}) {
+            bench_sharded(500'000, n_shards, noise);
+        }
     }
     return 0;
 }

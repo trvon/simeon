@@ -413,6 +413,44 @@ Quality gate — `bm25_sab_smooth_gamma5` nDCG@10, all within ±0.001:
 | NFCorpus |    0.298 | 0.2981 | +0.000 |
 | FiQA     |   0.1978 | 0.1978 |  0.000 |
 
+## Aho-Corasick dictionary matcher
+
+1 MiB input, `whole_word=true, longest_match=true, case_insensitive=true`, random lowercase patterns of length 5..12; hit input = sampled patterns separated by spaces; noise input = random lowercase tokens.
+
+| Patterns |   Nodes | Build (ms) | Noise MB/s | Hits MB/s | Hits count |
+|---------:|--------:|-----------:|-----------:|----------:|-----------:|
+|    1,000 |   7,159 |        1.8 |      127.1 |     110.5 |    108,786 |
+|   10,000 |  63,421 |       23.7 |       88.8 |      44.7 |    110,171 |
+|  100,000 | 557,587 |      299.9 |       55.9 |      19.8 |    110,439 |
+|  500,000 | 2,562,568 |   1,800.8 |       27.5 |      16.3 |    110,403 |
+
+Dense-goto table memory ≈ nodes × 1,024 bytes (256 slots × 4 B). At 500k patterns, ≈2.5 GB of goto table dominates cache locality. Two alternatives tried and rejected:
+
+| Variant | 500k Noise MB/s | 500k Hits MB/s | vs. monolithic |
+|---|---:|---:|---:|
+| Monolithic dense (baseline) | 24.5 | 13.7 | — |
+| CSR sparse + dense root fast path | 12.5 | 14.5 | noise regresses 2× |
+| Sharded, 2 partitions | 16.8 | 7.9 | both regress |
+| Sharded, 4 partitions | 11.7 | 6.8 | both regress |
+| Sharded, 8 partitions | 6.8 | 4.8 | both regress |
+| Sharded, 16 partitions | 3.7 | 3.0 | both regress |
+
+CSR's `if (state == root)` dispatch introduces a data-dependency serialization on the hot load that the branchless `next_[state*256 + c]` avoids. Sharding scales throughput as ≈1/N since each shard rescans the full input; the per-shard automaton shrink doesn't compensate. For GLiNER-scale tech dictionaries (≤100k surface forms) the dense table fits in ≈550 MB and clears the ≥50 MB/s noise-input target. Scaling past 500k patterns needs a compressed representation with branchless lookup (double-array trie, compressed-sparse-fail) — prototyped on branch `ac-da-trie-wip`.
+
+## TextRank sentence ranker
+
+Synthetic doc-count=200 sweep, damping=0.85, max_iters=30, ε=1e-4, min_sentence_tokens=3, max_sentence_tokens=60; each doc samples sentences from one of 5 topic pools.
+
+| Sentences/doc | p50 ms | p99 ms | Lead-1 agreement |
+|--------------:|-------:|-------:|-----------------:|
+|             4 |  0.004 |  0.006 |            0.305 |
+|             8 |  0.010 |  0.013 |            0.095 |
+|            16 |  0.025 |  0.031 |            0.075 |
+|            32 |  0.081 |  0.096 |            0.050 |
+|            64 |  0.284 |  0.319 |            0.035 |
+
+Latency scales as O(n²) in sentence count (graph build dominates). p99 stays under 1 ms through 64 sentences; the yams title path caps at `max_sentences=256` (worst-case ≈5 ms). Lead-1 agreement dropping as n grows confirms TextRank diverges from lead bias as documents gain internal structure — the signal the yams title extractor will rely on for long-form plain text.
+
 ## Out of scope
 
 - **Semantic equivalence / paraphrase** standalone benchmarks — simeon is lexical; use a learned bi-encoder where paraphrase robustness is the only signal.
