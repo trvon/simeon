@@ -46,6 +46,8 @@ simeon captures **lexical and topical** structure, not paraphrase or semantic eq
 - BM25 ⊕ dense late-fusion (RRF), where lexical signal is what wins on hard / short queries.
 - Self-contained retrieval where shipping a 200MB model is impractical (CLI tools, embedded, on-device).
 
+In YAMS, simeon is used as the default retrieval embedding backend and lexical companion. ONNX remains reserved for opt-in plugin tasks such as GLiNER / ColBERT rather than the default embedding path.
+
 simeon is best read as an engineering and evaluation layer over several lines of prior work: NUMEN-style training-free retrieval, ColBERT-era late-interaction framing, sparse random projection, matryoshka-style nested representations, Product Quantization, and classical query-difficulty routing. It is not a new retrieval algorithm. The shipped benchmark and router notes include negative findings, so this repository should not be read as blanket validation of any single upstream paper's headline claims.
 
 ## Documentation
