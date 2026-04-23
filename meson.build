@@ -93,7 +93,9 @@ common_srcs = [
   'src/aho_corasick.cpp',
   'src/aho_corasick_da.cpp',
   'src/text_rank.cpp',
+  'src/fragment_geometry.cpp',
   'src/arch/scalar.cpp',
+  'src/persistent_homology.cpp',
 ]
 
 arch_srcs = []
@@ -157,6 +159,8 @@ install_headers(
     'include/simeon/concept_mining.hpp',
     'include/simeon/aho_corasick.hpp',
     'include/simeon/text_rank.hpp',
+    'include/simeon/fragment_geometry.hpp',
+    'include/simeon/persistent_homology.hpp',
   ],
   subdir: 'simeon',
 )

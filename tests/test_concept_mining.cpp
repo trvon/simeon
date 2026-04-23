@@ -67,6 +67,8 @@ void test_pmi_matches_hand_computed_reference() {
     assert(e != nullptr);
     assert(std::isfinite(e->pmi));
     assert(e->pmi > 0.0f);
+    assert(e->a_hash == h_time);
+    assert(e->b_hash == h_value);
     // "time value" appears 3 times total, in 3 docs.
     assert(e->total_tf == 3u);
     assert(e->docs.size() == 3u);
@@ -110,6 +112,8 @@ void test_concept_mining_is_deterministic() {
     assert(ea != nullptr && eb != nullptr);
     assert(approx(ea->pmi, eb->pmi));
     assert(ea->total_tf == eb->total_tf);
+    assert(ea->a_hash == eb->a_hash);
+    assert(ea->b_hash == eb->b_hash);
     assert(ea->docs == eb->docs);
 }
 

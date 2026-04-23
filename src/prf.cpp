@@ -16,9 +16,7 @@ namespace {
 struct HashingSink final : NGramEmitter {
     std::vector<std::uint64_t>* hashes;
     const Bm25Index* idx;
-    void on_token(std::string_view tok, float) override {
-        hashes->push_back(idx->hash_term(tok));
-    }
+    void on_token(std::string_view tok, float) override { hashes->push_back(idx->hash_term(tok)); }
 };
 
 // Mirrors Bm25Index's word-only tokenizer config so the query is tokenized
@@ -29,8 +27,8 @@ constexpr TokenizerConfig word_only_cfg() noexcept {
 
 // Partial sort the doc-id space by descending first_pass score; returns the
 // top-K doc ids and their corresponding first-pass scores.
-void top_k_docs(std::span<const float> scores, std::uint32_t k,
-                std::vector<std::uint32_t>& out_ids, std::vector<float>& out_scores) {
+void top_k_docs(std::span<const float> scores, std::uint32_t k, std::vector<std::uint32_t>& out_ids,
+                std::vector<float>& out_scores) {
     out_ids.clear();
     out_scores.clear();
     const std::size_t n = scores.size();
@@ -115,8 +113,7 @@ void score_with_prf(const Bm25Index& idx, std::string_view query, std::span<floa
     idx.build_relevance_model(top_ids, doc_weights, rm);
 
     // 6. Keep top-N expansion terms and renormalize to a probability dist.
-    const std::size_t keep =
-        std::min<std::size_t>(cfg.n_terms, rm.size());
+    const std::size_t keep = std::min<std::size_t>(cfg.n_terms, rm.size());
     if (keep == 0) {
         std::copy(first_pass.begin(), first_pass.end(), out_scores.begin());
         return;
@@ -167,6 +164,26 @@ void score_with_prf(const Bm25Index& idx, std::string_view query, std::span<floa
     std::sort(weighted.begin(), weighted.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
     idx.score_weighted_hashes(weighted, out_scores);
+}
+
+std::uint32_t n_terms_for_clarity(float clarity, std::uint32_t n_min, std::uint32_t n_max,
+                                  float clarity_lo, float clarity_hi) noexcept {
+    if (n_max <= n_min)
+        return n_min;
+    if (clarity_hi <= clarity_lo)
+        return n_min;
+    if (clarity <= clarity_lo)
+        return n_min;
+    if (clarity >= clarity_hi)
+        return n_max;
+    const float t = (clarity - clarity_lo) / (clarity_hi - clarity_lo);
+    const float k = static_cast<float>(n_min) + t * static_cast<float>(n_max - n_min);
+    const auto kr = static_cast<std::uint32_t>(k + 0.5f);
+    if (kr < n_min)
+        return n_min;
+    if (kr > n_max)
+        return n_max;
+    return kr;
 }
 
 } // namespace simeon

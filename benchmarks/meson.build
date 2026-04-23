@@ -19,6 +19,12 @@ vs_reference_exe = executable('simeon_bench_vs_reference',
   install: false,
 )
 
+vs_reference_research_exe = executable('simeon_bench_vs_reference_research',
+  'bench_vs_reference_research.cpp',
+  dependencies: simeon_dep,
+  install: false,
+)
+
 # Isolated SAB-smooth profile harness. Builds one Bm25Index with
 # SubwordAwareBackoff/γ=5 and runs N repeats of the query loop, so
 # `xctrace record --launch` / `sample` see a single busy phase without

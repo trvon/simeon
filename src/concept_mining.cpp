@@ -220,6 +220,8 @@ ConceptIndex mine_concepts(const Bm25Index& idx, std::span<const std::string_vie
         ConceptEntry entry;
         entry.pmi = pmi;
         entry.total_tf = rit->second.total_tf;
+        entry.a_hash = rit->second.a_hash;
+        entry.b_hash = rit->second.b_hash;
         entry.docs = rit->second.docs;
         std::sort(entry.docs.begin(), entry.docs.end(),
                   [](const auto& x, const auto& y) { return x.first < y.first; });

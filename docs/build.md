@@ -99,11 +99,11 @@ If your build system isn't Meson, copy `include/simeon/` and `src/` into your tr
 ./build/benchmarks/simeon_accuracy_bench 50 60 0.05 > accuracy.jsonl
 ```
 
-The accuracy bench takes `(docs_per_cluster, words_per_doc, leakage)` as positional args. See [benchmarks.md](benchmarks.md) for what to do with the JSONL.
+The accuracy bench takes `(docs_per_cluster, words_per_doc, leakage)` as positional args. See [research/benchmarks.md](research/benchmarks.md) for interpretation and published summary tables.
 
 ## Reference embedding comparison
 
-The `bench_vs_reference` binary compares simeon configurations against a frozen learned-embedding model on a real IR benchmark. It requires an external fixture (corpus, queries, qrels, pre-computed reference embeddings); the fixture format is documented in [reference_fixture.md](reference_fixture.md). Fixture provisioning is out of tree.
+The default `bench_vs_reference` binary is the stable comparison surface: it compares simeon configurations against a frozen learned-embedding model on a real IR benchmark and keeps the public router / production rows only. It requires an external fixture (corpus, queries, qrels, pre-computed reference embeddings); the fixture format is documented in [reference_fixture.md](reference_fixture.md). Fixture provisioning is out of tree.
 
 ```sh
 ./build/benchmarks/simeon_bench_vs_reference fixtures/scifact-minilm > vs_reference.jsonl
@@ -128,3 +128,85 @@ The bench supports honest router-threshold tuning when the fixture provides a he
 ```
 
 The oracle row (`router_oracle_4096_768`) reports the per-query argmax over the three recipes — an upper bound on what any pre-retrieval router can achieve at `(pool_size, alpha) = (500, 0.75)`. The dev→test gap on the top-3 grid configs is the honest tuning generalization estimate.
+
+## Research benchmark binary
+
+Archived probe-style ablations now live in a separate research binary:
+
+```sh
+./build/benchmarks/simeon_bench_vs_reference_research fixtures/scifact-minilm > research.jsonl
+```
+
+Use this binary when reproducing the experimental grids documented under [research/](research/).
+
+### Structural BM25F sweeps
+
+`--aux-from {textrank,ac}` emits `reference`, `bm25_only`, and the corresponding BM25F rows (`w_aux = 0.0, 0.2, 0.5, 1.0`) for the requested auxiliary field.
+
+```sh
+# TextRank synthetic-title field
+./build/benchmarks/simeon_bench_vs_reference_research \
+    --aux-from textrank \
+    fixtures/scifact-minilm > scifact_textrank_bm25f.jsonl
+
+# Aho-Corasick self-bootstrapped entity field
+./build/benchmarks/simeon_bench_vs_reference_research \
+    --aux-from ac \
+    fixtures/fiqa-minilm > fiqa_ac_bm25f.jsonl
+```
+
+### PMI soft-match sweeps
+
+`--softmatch-only` runs a corpus-derived, training-free semantic expansion slice: `reference`, `bm25_only`, and PMI-neighbor soft-match BM25 rows. The current harness learns PMI embeddings from the fixture corpus, expands each query term with its nearest lexical neighbors, and rescales them through `score_weighted_hashes()`.
+
+```sh
+./build/benchmarks/simeon_bench_vs_reference_research \
+    --softmatch-only \
+    fixtures/scifact-minilm > scifact_softmatch.jsonl
+```
+
+### Phrase/document transport sweeps
+
+`--transport-only` runs the transport-structure ablation slice: `reference`, `bm25_only`, then calibrated phrase/concept transport rows built from existing sparse retrieval primitives. The current implementation uses BM25 top-K pooling, SDM bigram legs as phrase transport, optional mined concepts, and z-scored fusion inside the pool.
+
+```sh
+./build/benchmarks/simeon_bench_vs_reference_research \
+    --transport-only \
+    fixtures/fiqa-minilm > fiqa_transport.jsonl
+```
+
+### Graph transport sweeps
+
+`--graph-only` runs the pool-restricted graph reranking slice: `reference`, `bm25_only`, then personalized-PageRank-style graph rows built over query, phrase, and BM25 top-K document nodes. The current implementation tests phrase-only vs phrase+doc-doc graphs, `K ∈ {100,300}`, and damping in `{0.70,0.85}`.
+
+```sh
+./build/benchmarks/simeon_bench_vs_reference_research \
+    --graph-only \
+    fixtures/fiqa-minilm > fiqa_graph.jsonl
+```
+
+### Cluster topology sweeps
+
+`--cluster-only` runs the document-anchored fragment/cluster slice: `reference`, `bm25_only`, then rows that extract top TextRank fragments per document, build sparse fragment signatures, cluster them by weighted overlap inside the BM25 pool, and rescore docs through query-cover plus fragment-containment mass.
+
+```sh
+./build/benchmarks/simeon_bench_vs_reference_research \
+    --cluster-only \
+    fixtures/fiqa-minilm > fiqa_cluster.jsonl
+```
+
+### Fragment graph sweeps
+
+`--fragment-only` runs the document-anchored semantic fragment graph slice: `reference`, `bm25_only`, then rows that learn in-corpus PMI embeddings, encode top TextRank fragments per document, build fragment-to-fragment semantic edges inside the BM25 pool, and diffuse query-seeded mass through `doc -> fragment -> fragment -> doc`.
+
+```sh
+./build/benchmarks/simeon_bench_vs_reference_research \
+    --fragment-only \
+    fixtures/fiqa-minilm > fiqa_fragment.jsonl
+```
+
+The current `--fragment-only` grid includes three families:
+
+- PMI-only fragment graph rows,
+- hybrid fragment rows with lexical bridge edges,
+- geometric fragment rows with query-centered soft neighborhoods over locally whitened fragment vectors.

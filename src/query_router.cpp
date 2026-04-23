@@ -155,6 +155,26 @@ QueryFeatures QueryRouter::features_with_pool(std::string_view query,
             var /= static_cast<double>(pool0.size());
             f.score_normalized_var = static_cast<float>(var / mean);
         }
+        // T1 NQC (Shtok-Kurland-Carmel 2012) + T2 full WIG (Zhou-Croft 2007).
+        // Both need corpus-level mean BM25 score. Reuse the dense scores0
+        // vector rather than re-scoring — O(nd) one pass, already hot.
+        double corpus_sum = 0.0;
+        for (float s : scores0)
+            corpus_sum += s;
+        const double corpus_mean = corpus_sum / static_cast<double>(nd0);
+        if (corpus_mean > 0.0) {
+            double pool_var = 0.0;
+            for (const auto& p : pool0) {
+                const double d = p.second - mean;
+                pool_var += d * d;
+            }
+            pool_var /= static_cast<double>(pool0.size());
+            f.nqc = static_cast<float>(std::sqrt(pool_var) / corpus_mean);
+        }
+        if (f.n_terms > 0) {
+            f.wig_full = static_cast<float>((mean - corpus_mean) /
+                                            std::sqrt(static_cast<double>(f.n_terms)));
+        }
         // Numerically-stable softmax entropy: subtract max before exp.
         double smax = pool0.front().second;
         double zsum = 0.0;

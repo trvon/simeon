@@ -59,6 +59,11 @@ public:
     std::uint32_t k() const noexcept { return cfg_.k; }
     std::uint32_t dsub() const noexcept { return cfg_.dim / cfg_.m; }
     bool is_trained() const noexcept { return trained_; }
+    const float* codebooks_data() const noexcept { return codebooks_.data(); }
+    void import_codebooks(std::span<const float> codebooks, bool trained) {
+        codebooks_.assign(codebooks.begin(), codebooks.end());
+        trained_ = trained;
+    }
 
     void init_random_gaussian() {
         const std::uint32_t dsub_ = dsub();
@@ -232,9 +237,6 @@ public:
                static_cast<std::size_t>(ki) * dsub();
     }
 
-    // Used internally by PQQuery; safe to expose to friend.
-    const float* codebooks_data() const noexcept { return codebooks_.data(); }
-
 private:
     float* centroid_mut(std::uint32_t mi, std::uint32_t ki) noexcept {
         return codebooks_.data() + static_cast<std::size_t>(mi) * cfg_.k * dsub() +
@@ -280,6 +282,17 @@ std::uint32_t ProductQuantizer::dsub() const noexcept {
 }
 bool ProductQuantizer::is_trained() const noexcept {
     return impl_->is_trained();
+}
+std::span<const float> ProductQuantizer::codebooks() const noexcept {
+    const std::size_t count = static_cast<std::size_t>(impl_->m()) * impl_->k() * impl_->dsub();
+    return {impl_->codebooks_data(), count};
+}
+void ProductQuantizer::import_codebooks(std::span<const float> codebooks, bool trained) {
+    const std::size_t expected = static_cast<std::size_t>(impl_->m()) * impl_->k() * impl_->dsub();
+    if (codebooks.size() != expected) {
+        throw std::invalid_argument("simeon::ProductQuantizer: invalid imported codebook size");
+    }
+    impl_->import_codebooks(codebooks, trained);
 }
 
 void ProductQuantizer::init_random_gaussian() {

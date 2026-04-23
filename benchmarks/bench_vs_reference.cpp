@@ -20,19 +20,25 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include "simeon/aho_corasick.hpp"
 #include "simeon/bm25.hpp"
 #include "simeon/concept_mining.hpp"
+#include "simeon/fragment_geometry.hpp"
 #include "simeon/fusion.hpp"
 #include "simeon/matryoshka.hpp"
 #include "simeon/minhash.hpp"
+#include "simeon/persistent_homology.hpp"
 #include "simeon/pmi.hpp"
 #include "simeon/pq.hpp"
 #include "simeon/prf.hpp"
 #include "simeon/query_router.hpp"
 #include "simeon/simd.hpp"
 #include "simeon/simeon.hpp"
+#include "simeon/text_rank.hpp"
+#include "simeon/tokenizer.hpp"
 
 namespace {
 
@@ -60,6 +66,981 @@ struct Fixture {
 // chosen recipe, query features, and per-query metrics. Lets post-hoc analysis
 // run without re-executing the bench.
 FILE* g_router_per_query_fp = nullptr;
+
+#ifdef SIMEON_RESEARCH_BENCH
+enum class AuxFieldMode : std::uint8_t {
+    None,
+    TextRankTitle,
+    AhoCorasickEntity,
+};
+
+struct SoftMatchConfig {
+    std::uint32_t target_rank = 128;
+    std::uint32_t min_token_count = 5;
+    std::uint32_t max_vocab_size = 20'000;
+    std::uint32_t nearest_k = 3;
+    float lambda = 0.2f;
+    float min_similarity = 0.35f;
+};
+
+struct SoftMatchTerm {
+    std::string token;
+    std::uint64_t hash = 0;
+    const float* row = nullptr;
+    float norm = 0.0f;
+};
+
+enum class TransportLegMode : std::uint8_t {
+    ConceptsOnly,
+    OrderedOnly,
+    OrderedUnordered,
+    OrderedUnorderedConcepts,
+};
+
+struct TransportConfig {
+    std::uint32_t pool_size = 100;
+    float alpha = 0.8f; // BM25 weight in the z-scored pool blend
+    bool normalize_by_query_phrase_count = true;
+    float max_positive_fraction = 2.0f; // >1 => disabled
+    TransportLegMode mode = TransportLegMode::OrderedUnordered;
+};
+
+struct PooledConceptHit {
+    const simeon::ConceptEntry* entry = nullptr;
+    std::uint32_t tf = 0;
+    float dl = 1.0f;
+};
+
+struct QueryPhraseNode {
+    std::uint64_t a_hash = 0;
+    std::uint64_t b_hash = 0;
+    float query_weight = 0.0f;
+};
+
+struct GraphConfig {
+    std::uint32_t pool_size = 100;
+    float alpha = 0.8f;
+    float damping = 0.85f;
+    bool include_docdoc = false;
+    std::uint32_t unordered_window = 8;
+};
+
+using WeightedHashTerm = simeon::WeightedHashTerm;
+using SparseSignature = simeon::SparseSignature;
+
+struct ClusterFragment {
+    SparseSignature signature;
+};
+
+struct ClusterConfig {
+    std::uint32_t pool_size = 100;
+    float alpha = 0.8f;
+    std::uint32_t top_fragments_per_doc = 3;
+    std::uint32_t fragment_signature_terms = 8;
+    std::uint32_t cluster_signature_terms = 24;
+    float min_cluster_overlap = 0.35f;
+    float min_query_cover = 0.35f;
+};
+
+using SemanticFragment = simeon::SemanticFragment;
+
+struct FragmentGraphConfig {
+    std::uint32_t pool_size = 100;
+    float alpha = 0.8f;
+    float damping = 0.85f;
+    std::uint32_t top_fragments_per_doc = 3;
+    float min_query_sim = 0.20f;
+    float min_fragment_sim = 0.35f;
+    float lexical_bridge_weight = 0.0f;
+    float min_bridge_overlap = 0.35f;
+    std::uint32_t fragment_signature_terms = 8;
+    std::uint32_t max_iters = 20;
+};
+
+using GeometryGraphConfig = simeon::FragmentGeometryConfig;
+
+struct StringTokenSink final : simeon::NGramEmitter {
+    std::vector<std::string>* out = nullptr;
+    void on_token(std::string_view tok, float) override { out->emplace_back(tok); }
+};
+
+constexpr simeon::TokenizerConfig word_only_cfg() noexcept {
+    return simeon::TokenizerConfig{0, 0, false, true};
+}
+
+void tokenize_words(std::string_view text, std::vector<std::string>& out) {
+    out.clear();
+    StringTokenSink sink{};
+    sink.out = &out;
+    simeon::tokenize(text, word_only_cfg(), sink);
+}
+
+bool is_stopword(std::string_view token);
+
+std::uint32_t query_bigram_count(std::string_view text) {
+    std::vector<std::string> toks;
+    tokenize_words(text, toks);
+    return toks.size() >= 2 ? static_cast<std::uint32_t>(toks.size() - 1) : 0u;
+}
+
+std::uint32_t query_concept_count(const simeon::Bm25Index& idx,
+                                  const simeon::ConceptIndex& concepts, std::string_view query) {
+    std::vector<std::string> toks;
+    tokenize_words(query, toks);
+    if (toks.size() < 2)
+        return 0u;
+    std::uint32_t count = 0u;
+    for (std::size_t i = 1; i < toks.size(); ++i) {
+        const auto a = idx.hash_term(toks[i - 1]);
+        const auto b = idx.hash_term(toks[i]);
+        if (concepts.find(simeon::ConceptIndex::hash_bigram(a, b)))
+            ++count;
+    }
+    return count;
+}
+
+void build_query_content_hashes(const simeon::Bm25Index& idx, std::string_view query,
+                                std::unordered_set<std::uint64_t>& out) {
+    out.clear();
+    std::vector<std::string> toks;
+    tokenize_words(query, toks);
+    for (const auto& tok : toks) {
+        if (is_stopword(tok) || tok.size() < 3)
+            continue;
+        out.insert(idx.hash_term(tok));
+    }
+}
+
+float bounded_pmi(float pmi) {
+    return pmi > 0.0f ? pmi / (1.0f + pmi) : 0.0f;
+}
+
+std::vector<QueryPhraseNode> build_query_phrase_nodes(const simeon::Bm25Index& idx,
+                                                      std::string_view query) {
+    std::vector<std::string> toks;
+    tokenize_words(query, toks);
+    std::vector<QueryPhraseNode> out;
+    if (toks.size() < 2)
+        return out;
+    out.reserve(toks.size() - 1);
+    std::unordered_set<std::uint64_t> seen;
+    for (std::size_t i = 1; i < toks.size(); ++i) {
+        const auto a = idx.hash_term(toks[i - 1]);
+        const auto b = idx.hash_term(toks[i]);
+        const auto key = simeon::ConceptIndex::hash_bigram(a, b);
+        if (seen.contains(key))
+            continue;
+        seen.insert(key);
+        const float q_weight = 0.5f * (idx.idf(toks[i - 1]) + idx.idf(toks[i]));
+        out.push_back(QueryPhraseNode{a, b, q_weight > 0.0f ? q_weight : 1.0f});
+    }
+    return out;
+}
+
+void build_doc_hash_tokens(const simeon::Bm25Index& idx, std::string_view text,
+                           std::vector<std::uint64_t>& out) {
+    std::vector<std::string> toks;
+    tokenize_words(text, toks);
+    out.clear();
+    out.reserve(toks.size());
+    for (const auto& tok : toks)
+        out.push_back(idx.hash_term(tok));
+}
+
+std::vector<float> compute_doc_phrase_weights(std::span<const std::uint64_t> doc_tokens,
+                                              std::span<const QueryPhraseNode> phrases,
+                                              std::uint32_t unordered_window) {
+    std::vector<float> out(phrases.size(), 0.0f);
+    if (doc_tokens.size() < 2 || phrases.empty())
+        return out;
+    const float dl = static_cast<float>(doc_tokens.size() - 1);
+    for (std::size_t pi = 0; pi < phrases.size(); ++pi) {
+        const auto& p = phrases[pi];
+        std::uint32_t ordered_tf = 0;
+        std::uint32_t unordered_hits = 0;
+        for (std::size_t i = 1; i < doc_tokens.size(); ++i) {
+            ordered_tf += (doc_tokens[i - 1] == p.a_hash && doc_tokens[i] == p.b_hash) ? 1u : 0u;
+        }
+        for (std::size_t i = 0; i < doc_tokens.size(); ++i) {
+            const auto j_hi = std::min<std::size_t>(doc_tokens.size(), i + unordered_window);
+            bool hit = false;
+            for (std::size_t j = i + 1; j < j_hi; ++j) {
+                const auto x = doc_tokens[i];
+                const auto y = doc_tokens[j];
+                if ((x == p.a_hash && y == p.b_hash) || (x == p.b_hash && y == p.a_hash)) {
+                    hit = true;
+                    break;
+                }
+            }
+            unordered_hits += hit ? 1u : 0u;
+        }
+        const float ordered = static_cast<float>(ordered_tf) / dl;
+        const float unordered = static_cast<float>(unordered_hits) / dl;
+        out[pi] = p.query_weight * (ordered + 0.5f * unordered);
+    }
+    return out;
+}
+
+void trim_signature(std::vector<WeightedHashTerm>& terms, std::uint32_t max_terms) {
+    if (terms.size() <= max_terms)
+        return;
+    std::sort(terms.begin(), terms.end(), [](const auto& a, const auto& b) {
+        if (a.weight != b.weight)
+            return a.weight > b.weight;
+        return a.hash < b.hash;
+    });
+    terms.resize(max_terms);
+    std::sort(terms.begin(), terms.end(),
+              [](const auto& a, const auto& b) { return a.hash < b.hash; });
+}
+
+SparseSignature build_sparse_signature(const simeon::Bm25Index& idx, std::string_view text,
+                                       std::uint32_t max_terms) {
+    std::vector<std::string> toks;
+    tokenize_words(text, toks);
+    std::unordered_map<std::uint64_t, float> weights;
+    weights.reserve(toks.size());
+    for (const auto& tok : toks) {
+        if (is_stopword(tok) || tok.size() < 3)
+            continue;
+        const auto h = idx.hash_term(tok);
+        const float w = std::max(0.25f, idx.idf(tok));
+        auto it = weights.find(h);
+        if (it == weights.end()) {
+            weights.emplace(h, w);
+        } else if (w > it->second) {
+            it->second = w;
+        }
+    }
+    SparseSignature sig;
+    sig.terms.reserve(weights.size());
+    for (const auto& [h, w] : weights)
+        sig.terms.push_back(WeightedHashTerm{h, w});
+    trim_signature(sig.terms, max_terms);
+    for (const auto& term : sig.terms)
+        sig.weight_sum += term.weight;
+    return sig;
+}
+
+float weighted_intersection(const SparseSignature& a, const SparseSignature& b) {
+    float out = 0.0f;
+    std::size_t ia = 0, ib = 0;
+    while (ia < a.terms.size() && ib < b.terms.size()) {
+        if (a.terms[ia].hash == b.terms[ib].hash) {
+            out += std::min(a.terms[ia].weight, b.terms[ib].weight);
+            ++ia;
+            ++ib;
+        } else if (a.terms[ia].hash < b.terms[ib].hash) {
+            ++ia;
+        } else {
+            ++ib;
+        }
+    }
+    return out;
+}
+
+float weighted_overlap_coeff(const SparseSignature& a, const SparseSignature& b) {
+    if (a.weight_sum <= 0.0f || b.weight_sum <= 0.0f)
+        return 0.0f;
+    const float inter = weighted_intersection(a, b);
+    return inter / std::max(1e-6f, std::min(a.weight_sum, b.weight_sum));
+}
+
+float weighted_containment(const SparseSignature& subset, const SparseSignature& superset) {
+    if (subset.weight_sum <= 0.0f)
+        return 0.0f;
+    const float inter = weighted_intersection(subset, superset);
+    return inter / std::max(1e-6f, subset.weight_sum);
+}
+
+void merge_signature_max(SparseSignature& dst, const SparseSignature& src,
+                         std::uint32_t max_terms) {
+    std::vector<WeightedHashTerm> merged;
+    merged.reserve(dst.terms.size() + src.terms.size());
+    std::size_t i = 0, j = 0;
+    while (i < dst.terms.size() || j < src.terms.size()) {
+        if (j == src.terms.size() ||
+            (i < dst.terms.size() && dst.terms[i].hash < src.terms[j].hash)) {
+            merged.push_back(dst.terms[i++]);
+        } else if (i == dst.terms.size() || src.terms[j].hash < dst.terms[i].hash) {
+            merged.push_back(src.terms[j++]);
+        } else {
+            merged.push_back(WeightedHashTerm{dst.terms[i].hash,
+                                              std::max(dst.terms[i].weight, src.terms[j].weight)});
+            ++i;
+            ++j;
+        }
+    }
+    trim_signature(merged, max_terms);
+    dst.terms.swap(merged);
+    dst.weight_sum = 0.0f;
+    for (const auto& term : dst.terms)
+        dst.weight_sum += term.weight;
+}
+
+std::vector<ClusterFragment> build_doc_fragments(const simeon::Bm25Index& idx, std::string_view doc,
+                                                 std::uint32_t top_fragments_per_doc,
+                                                 std::uint32_t fragment_signature_terms) {
+    simeon::TextRank ranker;
+    auto ranked = ranker.rank(doc, top_fragments_per_doc);
+    std::vector<ClusterFragment> out;
+    out.reserve(ranked.empty() ? 1 : ranked.size());
+    for (const auto& sent : ranked) {
+        auto sig = build_sparse_signature(idx, sent.text, fragment_signature_terms);
+        if (!sig.terms.empty())
+            out.push_back(ClusterFragment{std::move(sig)});
+    }
+    if (out.empty()) {
+        auto sig = build_sparse_signature(idx, doc, fragment_signature_terms);
+        if (!sig.terms.empty())
+            out.push_back(ClusterFragment{std::move(sig)});
+    }
+    return out;
+}
+
+float vector_l2_norm(const float* v, std::uint32_t dim) {
+    double sq = 0.0;
+    for (std::uint32_t i = 0; i < dim; ++i)
+        sq += static_cast<double>(v[i]) * v[i];
+    return static_cast<float>(std::sqrt(sq));
+}
+
+void l2_normalize_inplace(float* v, std::uint32_t dim) {
+    const float n = vector_l2_norm(v, dim);
+    if (n <= 0.0f)
+        return;
+    const float inv = 1.0f / n;
+    for (std::uint32_t i = 0; i < dim; ++i)
+        v[i] *= inv;
+}
+
+std::vector<SemanticFragment> legacy_build_doc_semantic_fragments(
+    const simeon::Encoder& enc, std::string_view doc, const simeon::Bm25Index& idx,
+    std::uint32_t top_fragments_per_doc, std::uint32_t fragment_signature_terms) {
+    simeon::TextRank ranker;
+    const auto dim = enc.output_dim();
+    auto ranked = ranker.rank(doc, top_fragments_per_doc);
+    std::vector<SemanticFragment> out;
+    out.reserve(ranked.empty() ? 1 : ranked.size());
+
+    auto try_encode = [&](std::string_view text) {
+        std::vector<float> vec(dim, 0.0f);
+        enc.encode(text, vec.data());
+        auto sig = build_sparse_signature(idx, text, fragment_signature_terms);
+        if (vector_l2_norm(vec.data(), dim) > 0.0f && !sig.terms.empty())
+            out.push_back(SemanticFragment{std::move(vec), std::move(sig)});
+    };
+
+    for (const auto& sent : ranked)
+        try_encode(sent.text);
+    if (out.empty())
+        try_encode(doc);
+    return out;
+}
+
+std::vector<SemanticFragment> legacy_build_doc_semantic_fragments_rich(
+    const simeon::Encoder& enc, std::string_view doc, const simeon::Bm25Index& idx,
+    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms) {
+    auto out = legacy_build_doc_semantic_fragments(enc, doc, idx, top_sentence_fragments,
+                                                   fragment_signature_terms);
+    const auto dim = enc.output_dim();
+    if (out.size() >= 2) {
+        std::vector<float> centroid(dim, 0.0f);
+        SparseSignature merged;
+        const std::uint32_t merged_terms =
+            std::max<std::uint32_t>(fragment_signature_terms * 2, fragment_signature_terms + 4);
+        for (const auto& frag : out) {
+            for (std::uint32_t d = 0; d < dim; ++d)
+                centroid[d] += frag.vec[d];
+            merge_signature_max(merged, frag.signature, merged_terms);
+        }
+        const float inv = 1.0f / static_cast<float>(out.size());
+        for (float& x : centroid)
+            x *= inv;
+        l2_normalize_inplace(centroid.data(), dim);
+        if (vector_l2_norm(centroid.data(), dim) > 0.0f && !merged.terms.empty())
+            out.push_back(SemanticFragment{std::move(centroid), std::move(merged)});
+    }
+
+    std::vector<float> doc_vec(dim, 0.0f);
+    enc.encode(doc, doc_vec.data());
+    auto doc_sig = build_sparse_signature(idx, doc, fragment_signature_terms * 2);
+    if (vector_l2_norm(doc_vec.data(), dim) > 0.0f && !doc_sig.terms.empty())
+        out.push_back(SemanticFragment{std::move(doc_vec), std::move(doc_sig)});
+    return out;
+}
+
+std::vector<SemanticFragment> legacy_build_doc_semantic_fragments_rich_covered(
+    const simeon::Encoder& enc, std::string_view doc, const simeon::Bm25Index& idx,
+    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
+    float sentence_overlap_cap, float anchor_overlap_cap) {
+    auto rich = legacy_build_doc_semantic_fragments_rich(enc, doc, idx, top_sentence_fragments,
+                                                         fragment_signature_terms);
+    if (rich.empty())
+        return rich;
+
+    std::vector<SemanticFragment> out;
+    out.reserve(rich.size());
+    const std::size_t base_count = rich.size() >= 2 ? rich.size() - 2 : rich.size();
+    auto append_if_novel = [&](SemanticFragment frag, float overlap_cap) {
+        float max_ov = 0.0f;
+        for (const auto& kept : out)
+            max_ov = std::max(max_ov, weighted_overlap_coeff(frag.signature, kept.signature));
+        if (max_ov <= overlap_cap || out.empty())
+            out.push_back(std::move(frag));
+    };
+
+    for (std::size_t i = 0; i < base_count; ++i)
+        append_if_novel(std::move(rich[i]), sentence_overlap_cap);
+    for (std::size_t i = base_count; i < rich.size(); ++i)
+        append_if_novel(std::move(rich[i]), anchor_overlap_cap);
+
+    if (out.empty()) {
+        if (base_count > 0)
+            out.push_back(std::move(rich[0]));
+        else
+            out.push_back(std::move(rich.back()));
+    }
+    return out;
+}
+
+std::vector<SemanticFragment> legacy_build_doc_semantic_fragments_rich_mmr(
+    const simeon::Encoder& enc, std::string_view doc, const simeon::Bm25Index& idx,
+    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
+    float sentence_overlap_cap, float anchor_overlap_cap, float redundancy_lambda,
+    float sentence_min_score, float anchor_min_score) {
+    struct Candidate {
+        SemanticFragment frag;
+        float salience = 0.0f;
+        float overlap_cap = 1.0f;
+        float min_score = 0.0f;
+    };
+
+    auto rich = legacy_build_doc_semantic_fragments_rich(enc, doc, idx, top_sentence_fragments,
+                                                         fragment_signature_terms);
+    if (rich.empty())
+        return rich;
+
+    std::vector<Candidate> candidates;
+    candidates.reserve(rich.size());
+    const std::size_t base_count = rich.size() >= 2 ? rich.size() - 2 : rich.size();
+    const float sent_step = base_count > 1 ? 0.35f / static_cast<float>(base_count - 1) : 0.0f;
+    for (std::size_t i = 0; i < base_count; ++i) {
+        candidates.push_back(Candidate{.frag = std::move(rich[i]),
+                                       .salience = 1.0f - sent_step * static_cast<float>(i),
+                                       .overlap_cap = sentence_overlap_cap,
+                                       .min_score = sentence_min_score});
+    }
+    if (base_count < rich.size()) {
+        candidates.push_back(Candidate{.frag = std::move(rich[base_count]),
+                                       .salience = 0.72f,
+                                       .overlap_cap = anchor_overlap_cap,
+                                       .min_score = anchor_min_score});
+    }
+    if (base_count + 1 < rich.size()) {
+        candidates.push_back(Candidate{.frag = std::move(rich[base_count + 1]),
+                                       .salience = 0.60f,
+                                       .overlap_cap = anchor_overlap_cap,
+                                       .min_score = anchor_min_score});
+    }
+
+    std::vector<SemanticFragment> out;
+    out.reserve(candidates.size());
+    while (!candidates.empty()) {
+        std::size_t best_idx = candidates.size();
+        float best_score = -std::numeric_limits<float>::infinity();
+        for (std::size_t ci = 0; ci < candidates.size(); ++ci) {
+            float max_ov = 0.0f;
+            for (const auto& kept : out)
+                max_ov = std::max(
+                    max_ov, weighted_overlap_coeff(candidates[ci].frag.signature, kept.signature));
+            float score = candidates[ci].salience - redundancy_lambda * max_ov;
+            if (max_ov > candidates[ci].overlap_cap)
+                score -= (max_ov - candidates[ci].overlap_cap);
+            if (score > best_score) {
+                best_score = score;
+                best_idx = ci;
+            }
+        }
+        if (best_idx == candidates.size() || best_score < candidates[best_idx].min_score)
+            break;
+        out.push_back(std::move(candidates[best_idx].frag));
+        candidates.erase(candidates.begin() + static_cast<std::ptrdiff_t>(best_idx));
+    }
+
+    if (out.empty() && !candidates.empty()) {
+        auto best =
+            std::max_element(candidates.begin(), candidates.end(),
+                             [](const auto& a, const auto& b) { return a.salience < b.salience; });
+        out.push_back(std::move(best->frag));
+    }
+    return out;
+}
+
+// Asymmetric two-stage fragment selection:
+//   Stage 1: hard overlap caps for sentence fragments (richcov-style safety)
+//   Stage 2: MMR selection for anchor fragments (richmmr-style upside)
+//
+// The intuition is that scifact needs strict sentence dedup (hard caps prevent
+// redundant anchor amplification), while NFCorpus/FiQA benefit from smarter
+// anchor selection via MMR.  Splitting the control surface lets each corpus
+// get the regime it needs.
+std::vector<SemanticFragment> legacy_build_doc_semantic_fragments_rich_asymmetric(
+    const simeon::Encoder& enc, std::string_view doc, const simeon::Bm25Index& idx,
+    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
+    float sentence_overlap_cap, float anchor_overlap_cap, float anchor_redundancy_lambda,
+    float anchor_min_score) {
+    auto rich = legacy_build_doc_semantic_fragments_rich(enc, doc, idx, top_sentence_fragments,
+                                                         fragment_signature_terms);
+    if (rich.empty())
+        return rich;
+
+    std::vector<SemanticFragment> out;
+    out.reserve(rich.size());
+    const std::size_t base_count = rich.size() >= 2 ? rich.size() - 2 : rich.size();
+
+    // Stage 1: hard overlap caps for sentence fragments (richcov safety)
+    auto append_if_novel = [&](SemanticFragment frag, float overlap_cap) {
+        float max_ov = 0.0f;
+        for (const auto& kept : out)
+            max_ov = std::max(max_ov, weighted_overlap_coeff(frag.signature, kept.signature));
+        if (max_ov <= overlap_cap || out.empty())
+            out.push_back(std::move(frag));
+    };
+
+    for (std::size_t i = 0; i < base_count; ++i)
+        append_if_novel(std::move(rich[i]), sentence_overlap_cap);
+
+    // Stage 2: MMR selection for anchor fragments (richmmr upside)
+    struct AnchorCandidate {
+        SemanticFragment frag;
+        float salience = 0.0f;
+    };
+    std::vector<AnchorCandidate> anchors;
+    anchors.reserve(rich.size() - base_count);
+    if (base_count < rich.size()) {
+        anchors.push_back(AnchorCandidate{std::move(rich[base_count]), 0.72f});
+    }
+    if (base_count + 1 < rich.size()) {
+        anchors.push_back(AnchorCandidate{std::move(rich[base_count + 1]), 0.60f});
+    }
+
+    while (!anchors.empty()) {
+        std::size_t best_idx = anchors.size();
+        float best_score = -std::numeric_limits<float>::infinity();
+        for (std::size_t ci = 0; ci < anchors.size(); ++ci) {
+            float max_ov = 0.0f;
+            for (const auto& kept : out)
+                max_ov = std::max(
+                    max_ov, weighted_overlap_coeff(anchors[ci].frag.signature, kept.signature));
+            float score = anchors[ci].salience - anchor_redundancy_lambda * max_ov;
+            if (max_ov > anchor_overlap_cap)
+                score -= (max_ov - anchor_overlap_cap);
+            if (score > best_score) {
+                best_score = score;
+                best_idx = ci;
+            }
+        }
+        if (best_idx == anchors.size() || best_score < anchor_min_score)
+            break;
+        out.push_back(std::move(anchors[best_idx].frag));
+        anchors.erase(anchors.begin() + static_cast<std::ptrdiff_t>(best_idx));
+    }
+
+    if (out.empty()) {
+        if (base_count > 0)
+            out.push_back(std::move(rich[0]));
+        else
+            out.push_back(std::move(rich.back()));
+    }
+    return out;
+}
+
+std::vector<SemanticFragment> legacy_build_doc_semantic_fragments_rich_budgeted(
+    const simeon::Encoder& enc, std::string_view doc, const simeon::Bm25Index& idx,
+    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
+    float sentence_overlap_cap, std::uint32_t max_sentence_keep, float anchor_overlap_cap,
+    float anchor_novelty_floor, std::uint32_t max_anchor_keep) {
+    auto rich = legacy_build_doc_semantic_fragments_rich(enc, doc, idx, top_sentence_fragments,
+                                                         fragment_signature_terms);
+    if (rich.empty())
+        return rich;
+
+    std::vector<SemanticFragment> out;
+    out.reserve(rich.size());
+    const std::size_t base_count = rich.size() >= 2 ? rich.size() - 2 : rich.size();
+
+    auto max_overlap_with_kept = [&](const SparseSignature& sig) {
+        float max_ov = 0.0f;
+        for (const auto& kept : out)
+            max_ov = std::max(max_ov, weighted_overlap_coeff(sig, kept.signature));
+        return max_ov;
+    };
+
+    std::uint32_t kept_sentences = 0;
+    for (std::size_t i = 0; i < base_count; ++i) {
+        if (kept_sentences >= max_sentence_keep)
+            break;
+        const float max_ov = max_overlap_with_kept(rich[i].signature);
+        if (out.empty() || max_ov <= sentence_overlap_cap) {
+            out.push_back(std::move(rich[i]));
+            ++kept_sentences;
+        }
+    }
+
+    struct AnchorCandidate {
+        SemanticFragment frag;
+        float novelty = 0.0f;
+    };
+    std::vector<AnchorCandidate> anchors;
+    anchors.reserve(rich.size() - base_count);
+    for (std::size_t i = base_count; i < rich.size(); ++i) {
+        const float max_ov = max_overlap_with_kept(rich[i].signature);
+        const float novelty = 1.0f - max_ov;
+        if (max_ov <= anchor_overlap_cap && novelty >= anchor_novelty_floor)
+            anchors.push_back(AnchorCandidate{std::move(rich[i]), novelty});
+    }
+    std::sort(anchors.begin(), anchors.end(),
+              [](const auto& a, const auto& b) { return a.novelty > b.novelty; });
+    for (std::size_t i = 0; i < anchors.size() && i < max_anchor_keep; ++i)
+        out.push_back(std::move(anchors[i].frag));
+
+    if (out.empty()) {
+        if (base_count > 0)
+            out.push_back(std::move(rich[0]));
+        else
+            out.push_back(std::move(rich.back()));
+    }
+    return out;
+}
+
+struct ClusterAssignment {
+    std::uint32_t pool_index = 0;
+    float doc_seed = 0.0f;
+    float query_overlap = 0.0f;
+    const SparseSignature* fragment = nullptr;
+};
+
+struct ClusterCoverNode {
+    SparseSignature signature;
+    std::vector<ClusterAssignment> members;
+    float seed_mass = 0.0f;
+    float query_cover = 0.0f;
+};
+
+void zscore_inplace(std::vector<float>& v) {
+    if (v.empty())
+        return;
+    double mean = 0.0;
+    for (float x : v)
+        mean += x;
+    mean /= static_cast<double>(v.size());
+    double var = 0.0;
+    for (float x : v)
+        var += (static_cast<double>(x) - mean) * (static_cast<double>(x) - mean);
+    const float sd = static_cast<float>(std::sqrt(var / static_cast<double>(v.size())) + 1e-12);
+    for (float& x : v)
+        x = static_cast<float>((static_cast<double>(x) - mean) / sd);
+}
+
+float clamp_unit(float x) {
+    return std::clamp(x, 0.0f, 1.0f);
+}
+
+float lerp(float a, float b, float t) {
+    return a + (b - a) * t;
+}
+
+float bm25_pool_decay(std::span<const std::pair<std::uint32_t, float>> pool) {
+    if (pool.empty() || pool.front().second <= 0.0f)
+        return 0.0f;
+    const std::size_t i9 = pool.size() >= 10 ? std::size_t{9} : pool.size() - 1;
+    return clamp_unit((pool.front().second - pool[i9].second) / pool.front().second);
+}
+
+float geometry_query_confidence(std::span<const float> sims) {
+    if (sims.empty())
+        return 0.0f;
+    float top1 = -std::numeric_limits<float>::infinity();
+    float top2 = -std::numeric_limits<float>::infinity();
+    for (float x : sims) {
+        if (x > top1) {
+            top2 = top1;
+            top1 = x;
+        } else if (x > top2) {
+            top2 = x;
+        }
+    }
+    const float top_conf = clamp_unit((top1 - 0.10f) / 0.25f);
+    const float gap_conf = clamp_unit(((top1 - top2) - 0.02f) / 0.12f);
+    if (sims.size() == 1)
+        return 0.5f * (top_conf + gap_conf);
+
+    double zsum = 0.0;
+    for (float x : sims)
+        zsum += std::exp(static_cast<double>(x - top1));
+    double ent = 0.0;
+    if (zsum > 0.0) {
+        for (float x : sims) {
+            const double w = std::exp(static_cast<double>(x - top1)) / zsum;
+            if (w > 0.0)
+                ent -= w * std::log(w);
+        }
+    }
+    const float ent_norm = static_cast<float>(ent / std::log(static_cast<double>(sims.size())));
+    const float ent_conf = 1.0f - clamp_unit(ent_norm);
+    return (top_conf + gap_conf + ent_conf) / 3.0f;
+}
+
+bool is_stopword(std::string_view token) {
+    static const std::unordered_set<std::string_view> kStopwords = {
+        "a",    "an",    "and",  "are", "as",  "at",   "be",   "by", "for",
+        "from", "in",    "into", "is",  "it",  "of",   "on",   "or", "that",
+        "the",  "their", "this", "to",  "was", "were", "with",
+    };
+    return kStopwords.contains(token);
+}
+
+bool keep_phrase_window(std::span<const std::string> tokens) {
+    std::size_t stopwords = 0;
+    std::size_t informative = 0;
+    for (const auto& tok : tokens) {
+        stopwords += is_stopword(tok) ? 1u : 0u;
+        informative += tok.size() >= 3 ? 1u : 0u;
+    }
+    return informative > 0 && stopwords * 2 < tokens.size();
+}
+
+std::vector<std::string> build_textrank_titles(const Fixture& fx) {
+    simeon::TextRank ranker;
+    std::vector<std::string> out;
+    out.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts) {
+        const auto top = ranker.top_sentence(doc);
+        out.emplace_back(top);
+    }
+    return out;
+}
+
+std::vector<std::string> build_ac_dictionary(const Fixture& fx) {
+    simeon::TextRank ranker;
+    std::unordered_map<std::string, std::uint32_t> phrase_df;
+    std::vector<std::string> tokens;
+    std::unordered_set<std::string> doc_phrases;
+    const std::uint32_t max_df =
+        std::max<std::uint32_t>(10u, static_cast<std::uint32_t>(fx.doc_texts.size() / 10));
+
+    for (const auto& doc : fx.doc_texts) {
+        doc_phrases.clear();
+        const auto ranked = ranker.rank(doc, 2);
+        for (const auto& sent : ranked) {
+            tokenize_words(sent.text, tokens);
+            for (std::size_t n = 2; n <= 3; ++n) {
+                if (tokens.size() < n)
+                    continue;
+                for (std::size_t i = 0; i + n <= tokens.size(); ++i) {
+                    const auto window = std::span<const std::string>(tokens).subspan(i, n);
+                    if (!keep_phrase_window(window))
+                        continue;
+                    std::string phrase = tokens[i];
+                    for (std::size_t j = 1; j < n; ++j) {
+                        phrase.push_back(' ');
+                        phrase += tokens[i + j];
+                    }
+                    doc_phrases.insert(std::move(phrase));
+                }
+            }
+        }
+        for (const auto& phrase : doc_phrases) {
+            ++phrase_df[phrase];
+        }
+    }
+
+    std::vector<std::pair<std::string, std::uint32_t>> kept;
+    kept.reserve(phrase_df.size());
+    for (auto& [phrase, df] : phrase_df) {
+        if (df >= 10u && df <= max_df)
+            kept.emplace_back(std::move(phrase), df);
+    }
+    std::sort(kept.begin(), kept.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second)
+            return a.second > b.second;
+        return a.first < b.first;
+    });
+    if (kept.size() > 100'000)
+        kept.resize(100'000);
+
+    std::vector<std::string> patterns;
+    patterns.reserve(kept.size());
+    for (auto& [phrase, _df] : kept)
+        patterns.push_back(std::move(phrase));
+    return patterns;
+}
+
+std::vector<std::string> build_ac_token_field(std::span<const std::string> texts,
+                                              const std::vector<std::string>& patterns) {
+    std::vector<std::string> out(texts.size());
+    if (patterns.empty())
+        return out;
+
+    std::vector<std::string_view> pattern_views;
+    pattern_views.reserve(patterns.size());
+    for (const auto& p : patterns)
+        pattern_views.emplace_back(p);
+    std::vector<std::uint16_t> type_ids(patterns.size(), 0u);
+
+    simeon::AhoCorasick ac;
+    if (const auto err = ac.build(pattern_views, type_ids)) {
+        throw std::runtime_error("AhoCorasick build failed: " + err->message);
+    }
+
+    std::vector<std::uint32_t> seen(patterns.size(), 0u);
+    std::uint32_t epoch = 1u;
+    for (std::size_t di = 0; di < texts.size(); ++di) {
+        if (epoch == 0u) {
+            std::fill(seen.begin(), seen.end(), 0u);
+            epoch = 1u;
+        }
+        auto& field = out[di];
+        for (const auto& m : ac.match(texts[di])) {
+            if (seen[m.pattern_id] == epoch)
+                continue;
+            seen[m.pattern_id] = epoch;
+            if (!field.empty())
+                field.push_back(' ');
+            field += "ent";
+            field += std::to_string(m.pattern_id);
+        }
+        ++epoch;
+    }
+    return out;
+}
+
+std::vector<SoftMatchTerm> build_softmatch_vocab(const Fixture& fx,
+                                                 const simeon::PmiEmbeddings& pmi,
+                                                 const simeon::Bm25Index& idx,
+                                                 std::uint32_t min_token_count,
+                                                 std::uint32_t max_vocab_size) {
+    std::unordered_map<std::string, std::uint32_t> counts;
+    std::vector<std::string> tokens;
+    for (const auto& doc : fx.doc_texts) {
+        tokenize_words(doc, tokens);
+        for (const auto& tok : tokens)
+            ++counts[tok];
+    }
+
+    std::vector<std::pair<std::string, std::uint32_t>> ranked;
+    ranked.reserve(counts.size());
+    for (auto& [tok, count] : counts) {
+        if (count >= min_token_count && pmi.row(tok) != nullptr)
+            ranked.emplace_back(std::move(tok), count);
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second)
+            return a.second > b.second;
+        return a.first < b.first;
+    });
+    if (ranked.size() > max_vocab_size)
+        ranked.resize(max_vocab_size);
+
+    std::vector<SoftMatchTerm> out;
+    out.reserve(ranked.size());
+    for (auto& [tok, _count] : ranked) {
+        const float* row = pmi.row(tok);
+        if (!row)
+            continue;
+        double sq = 0.0;
+        for (std::uint32_t d = 0; d < pmi.dim(); ++d)
+            sq += static_cast<double>(row[d]) * row[d];
+        const float norm = static_cast<float>(std::sqrt(sq));
+        if (norm <= 0.0f)
+            continue;
+        out.push_back(SoftMatchTerm{std::move(tok), idx.hash_term(tok), row, norm});
+    }
+    return out;
+}
+
+std::vector<std::pair<std::uint64_t, float>>
+build_softmatch_query(const simeon::Bm25Index& idx, const simeon::PmiEmbeddings& pmi,
+                      std::span<const SoftMatchTerm> vocab, std::string_view query,
+                      const SoftMatchConfig& cfg) {
+    std::vector<std::string> q_tokens;
+    tokenize_words(query, q_tokens);
+    std::unordered_map<std::uint64_t, float> base;
+    std::unordered_map<std::uint64_t, float> expansion;
+    if (q_tokens.empty())
+        return {};
+
+    const float q_total = static_cast<float>(q_tokens.size());
+    for (const auto& tok : q_tokens)
+        base[idx.hash_term(tok)] += 1.0f / q_total;
+
+    for (const auto& tok : q_tokens) {
+        const float* qrow = pmi.row(tok);
+        if (!qrow)
+            continue;
+        double sq = 0.0;
+        for (std::uint32_t d = 0; d < pmi.dim(); ++d)
+            sq += static_cast<double>(qrow[d]) * qrow[d];
+        const float qnorm = static_cast<float>(std::sqrt(sq));
+        if (qnorm <= 0.0f)
+            continue;
+
+        std::vector<std::pair<float, std::uint64_t>> best;
+        best.reserve(cfg.nearest_k);
+        for (const auto& cand : vocab) {
+            if (cand.token == tok)
+                continue;
+            double dotp = 0.0;
+            for (std::uint32_t d = 0; d < pmi.dim(); ++d)
+                dotp += static_cast<double>(qrow[d]) * cand.row[d];
+            const float sim = static_cast<float>(dotp / (static_cast<double>(qnorm) * cand.norm));
+            if (sim < cfg.min_similarity)
+                continue;
+            if (best.size() < cfg.nearest_k) {
+                best.emplace_back(sim, cand.hash);
+                continue;
+            }
+            auto worst =
+                std::min_element(best.begin(), best.end(),
+                                 [](const auto& a, const auto& b) { return a.first < b.first; });
+            if (sim > worst->first)
+                *worst = {sim, cand.hash};
+        }
+        for (const auto& [sim, h] : best)
+            expansion[h] += sim;
+    }
+
+    std::vector<std::pair<std::uint64_t, float>> weighted;
+    weighted.reserve(base.size() + expansion.size());
+    if (expansion.empty() || cfg.lambda <= 0.0f) {
+        for (const auto& [h, w] : base)
+            weighted.emplace_back(h, w);
+        std::sort(weighted.begin(), weighted.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        return weighted;
+    }
+
+    double exp_sum = 0.0;
+    for (const auto& [_, w] : expansion)
+        exp_sum += w;
+    std::unordered_map<std::uint64_t, float> combined;
+    combined.reserve(base.size() + expansion.size());
+    const float one_minus_lambda = 1.0f - cfg.lambda;
+    for (const auto& [h, w] : base)
+        combined[h] += one_minus_lambda * w;
+    if (exp_sum > 0.0) {
+        for (const auto& [h, w] : expansion)
+            combined[h] += cfg.lambda * static_cast<float>(w / exp_sum);
+    }
+    for (const auto& [h, w] : combined)
+        weighted.emplace_back(h, w);
+    std::sort(weighted.begin(), weighted.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    return weighted;
+}
+
+#endif // SIMEON_RESEARCH_BENCH
 
 std::vector<std::pair<std::string, std::string>> read_tsv2(const std::string& path) {
     std::ifstream in(path);
@@ -415,6 +1396,20 @@ Bm25WithTiming build_bm25(const Fixture& fx, simeon::Bm25Config cfg = {}) {
     return out;
 }
 
+Bm25WithTiming build_bm25f(const Fixture& fx, std::span<const std::string> aux_texts,
+                           simeon::Bm25Config cfg = {}, double extra_build_us = 0.0) {
+    if (aux_texts.size() != fx.doc_texts.size()) {
+        throw std::runtime_error("build_bm25f aux_texts size mismatch");
+    }
+    Bm25WithTiming out{simeon::Bm25Index(cfg), 0.0};
+    auto t0 = Clock::now();
+    for (std::size_t i = 0; i < fx.doc_texts.size(); ++i)
+        out.idx.add_doc(fx.doc_texts[i], aux_texts[i]);
+    out.idx.finalize();
+    out.build_us = extra_build_us + elapsed_us(t0);
+    return out;
+}
+
 void run_bm25(const char* name, const Fixture& fx, const simeon::Bm25Index& idx, double build_us) {
     Timing t;
     t.index_build_us = build_us;
@@ -433,6 +1428,113 @@ void run_bm25(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
     // BM25 has no per-doc fixed footprint (variable inverted-index size); emit 0.
     emit(name, fx, score_rankings(rankings, fx), 0, t);
 }
+
+#ifdef SIMEON_RESEARCH_BENCH
+void run_bm25_softmatch(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                        double build_us, const simeon::PmiEmbeddings& pmi,
+                        std::span<const SoftMatchTerm> vocab, const SoftMatchConfig& cfg) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> s(nd, 0.0f);
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        const auto weighted = build_softmatch_query(idx, pmi, vocab, fx.query_texts[qi], cfg);
+        idx.score_weighted_hashes(weighted, s);
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(s[di], di);
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+void run_bm25_softmatch_grid(const Fixture& fx, const simeon::Bm25Index& idx, double build_us) {
+    simeon::PmiConfig pcfg;
+    pcfg.target_rank = 128;
+    pcfg.min_token_count = 5;
+    pcfg.max_vocab_size = 20'000;
+    std::vector<std::string_view> seed_views;
+    seed_views.reserve(fx.doc_texts.size());
+    for (const auto& d : fx.doc_texts)
+        seed_views.emplace_back(d);
+
+    auto t0 = Clock::now();
+    auto pmi = simeon::PmiEmbeddings::learn(std::span<const std::string_view>(seed_views), pcfg);
+    auto vocab = build_softmatch_vocab(fx, pmi, idx, pcfg.min_token_count, pcfg.max_vocab_size);
+    const double total_build_us = build_us + elapsed_us(t0);
+
+    for (const auto [k, min_sim] :
+         {std::pair<std::uint32_t, float>{3, 0.35f}, std::pair<std::uint32_t, float>{8, 0.20f}}) {
+        for (float lambda : {0.2f, 0.5f, 1.0f}) {
+            SoftMatchConfig cfg;
+            cfg.target_rank = pcfg.target_rank;
+            cfg.min_token_count = pcfg.min_token_count;
+            cfg.max_vocab_size = pcfg.max_vocab_size;
+            cfg.nearest_k = k;
+            cfg.lambda = lambda;
+            cfg.min_similarity = min_sim;
+            char name[128];
+            std::snprintf(name, sizeof(name), "bm25_pmi_softmatch_k%u_s%.2f_l%.1f",
+                          static_cast<unsigned>(k), static_cast<double>(min_sim),
+                          static_cast<double>(lambda));
+            run_bm25_softmatch(name, fx, idx, total_build_us, pmi, vocab, cfg);
+        }
+    }
+}
+
+void run_bm25f(const char* name, const Fixture& fx, const simeon::Bm25Index& idx, double build_us,
+               float weight_body, float weight_aux, std::span<const std::string> aux_queries = {}) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> s(nd, 0.0f);
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        const std::string_view aux_query = aux_queries.empty()
+                                               ? std::string_view(fx.query_texts[qi])
+                                               : std::string_view(aux_queries[qi]);
+        idx.score_bm25f(fx.query_texts[qi], aux_query, s, weight_body, weight_aux);
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di) {
+            rankings[qi].emplace_back(s[di], di);
+        }
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+void run_bm25f_textrank(const Fixture& fx, std::span<const float> aux_weights) {
+    auto t0 = Clock::now();
+    auto aux_texts = build_textrank_titles(fx);
+    const double aux_build_us = elapsed_us(t0);
+    auto idx = build_bm25f(fx, aux_texts, simeon::Bm25Config{}, aux_build_us);
+    run_bm25f("bm25_textrank_title_w0.0", fx, idx.idx, idx.build_us, 1.0f, 0.0f);
+    for (float w : aux_weights) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "bm25_textrank_title_w%.1f", static_cast<double>(w));
+        run_bm25f(name, fx, idx.idx, idx.build_us, 1.0f, w);
+    }
+}
+
+void run_bm25f_ac_entity(const Fixture& fx, std::span<const float> aux_weights) {
+    auto t0 = Clock::now();
+    auto patterns = build_ac_dictionary(fx);
+    auto aux_texts = build_ac_token_field(std::span<const std::string>(fx.doc_texts), patterns);
+    auto aux_queries = build_ac_token_field(std::span<const std::string>(fx.query_texts), patterns);
+    const double aux_build_us = elapsed_us(t0);
+    auto idx = build_bm25f(fx, aux_texts, simeon::Bm25Config{}, aux_build_us);
+    std::fprintf(stderr, "[bm25f-ac] patterns=%zu\n", patterns.size());
+    run_bm25f("bm25_ac_entity_w0.0", fx, idx.idx, idx.build_us, 1.0f, 0.0f, aux_queries);
+    for (float w : aux_weights) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "bm25_ac_entity_w%.1f", static_cast<double>(w));
+        run_bm25f(name, fx, idx.idx, idx.build_us, 1.0f, w, aux_queries);
+    }
+}
+#endif // SIMEON_RESEARCH_BENCH
 
 // BM25 with RM3 pseudo-relevance feedback expansion. Same BM25 variant the
 // passed-in idx was built with (Atire / BM25+ / SAB etc.); PRF only changes
@@ -456,6 +1558,35 @@ void run_bm25_prf(const char* name, const Fixture& fx, const simeon::Bm25Index& 
     emit(name, fx, score_rankings(rankings, fx), 0, t);
 }
 
+// T4 — clarity-adaptive RM3 (Bendersky-Metzler-Croft 2011). Per-query the
+// expansion-term count K is interpolated from simplified_clarity via
+// simeon::n_terms_for_clarity. Compute clarity inline via QueryRouter::features
+// (cheap: O(n_query_terms) df lookups, no first-pass scoring).
+void run_bm25_prf_adaptive(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                           double build_us, simeon::PrfConfig base_pc, std::uint32_t n_min = 5,
+                           std::uint32_t n_max = 50, float clarity_lo = 0.5f,
+                           float clarity_hi = 5.0f) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> s(nd, 0.0f);
+    simeon::QueryRouter router(idx, simeon::RouterConfig{});
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        const auto features = router.features(fx.query_texts[qi]);
+        base_pc.n_terms = simeon::n_terms_for_clarity(features.simplified_clarity, n_min, n_max,
+                                                      clarity_lo, clarity_hi);
+        simeon::score_with_prf(idx, fx.query_texts[qi], s, base_pc);
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di) {
+            rankings[qi].emplace_back(s[di], di);
+        }
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
 // SDM (Metzler & Croft 2005): three-leg BM25 blend (unigram + ordered bigram
 // + unordered bigram). idx must have been built with
 // Bm25Config::build_word_bigrams = true. cfg.lambda_* default to Metzler's
@@ -470,6 +1601,28 @@ void run_bm25_sdm(const char* name, const Fixture& fx, const simeon::Bm25Index& 
     auto t0 = Clock::now();
     for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
         idx.score_sdm(fx.query_texts[qi], s, scfg);
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di) {
+            rankings[qi].emplace_back(s[di], di);
+        }
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+// T3 — Weighted SDM (Bendersky-Croft 2010). Per-bigram λ scales with the
+// bigram's IDF (training-free reduction of full WSDM; see
+// docs/wsdm_results.md when populated).
+void run_bm25_wsdm(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                   double build_us, const simeon::WeightedSdmConfig& wcfg) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> s(nd, 0.0f);
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        idx.score_wsdm(fx.query_texts[qi], s, wcfg);
         rankings[qi].reserve(nd);
         for (std::uint32_t di = 0; di < nd; ++di) {
             rankings[qi].emplace_back(s[di], di);
@@ -515,6 +1668,1251 @@ void run_bm25_concepts(const char* name, const Fixture& fx, const simeon::Bm25In
     t.query_us = elapsed_us(t0);
     emit(name, fx, score_rankings(rankings, fx), 0, t);
 }
+
+#ifdef SIMEON_RESEARCH_BENCH
+void run_bm25_transport(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                        double build_us, const simeon::ConceptIndex* concepts,
+                        const TransportConfig& cfg) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> bm25_scores(nd, 0.0f);
+    std::vector<float> phrase_scores(nd, 0.0f);
+    std::vector<float> concept_scores(nd, 0.0f);
+
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        idx.score(fx.query_texts[qi], bm25_scores);
+        auto pool = simeon::top_k(bm25_scores, cfg.pool_size);
+
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(neg_inf, di);
+
+        std::fill(phrase_scores.begin(), phrase_scores.end(), 0.0f);
+        std::fill(concept_scores.begin(), concept_scores.end(), 0.0f);
+
+        if (cfg.mode == TransportLegMode::OrderedOnly ||
+            cfg.mode == TransportLegMode::OrderedUnordered ||
+            cfg.mode == TransportLegMode::OrderedUnorderedConcepts) {
+            simeon::SdmConfig scfg;
+            scfg.lambda_unigram = 0.0f;
+            scfg.lambda_ordered = 1.0f;
+            scfg.lambda_unordered = cfg.mode == TransportLegMode::OrderedOnly ? 0.0f : 0.5f;
+            idx.score_sdm(fx.query_texts[qi], phrase_scores, scfg);
+            if (cfg.normalize_by_query_phrase_count) {
+                const auto qbg = query_bigram_count(fx.query_texts[qi]);
+                if (qbg > 0) {
+                    const float inv = 1.0f / static_cast<float>(qbg);
+                    for (float& x : phrase_scores)
+                        x *= inv;
+                }
+            }
+        }
+
+        if (concepts && (cfg.mode == TransportLegMode::ConceptsOnly ||
+                         cfg.mode == TransportLegMode::OrderedUnorderedConcepts)) {
+            concepts->score(fx.query_texts[qi], concept_scores);
+            if (cfg.normalize_by_query_phrase_count) {
+                const auto qc = query_concept_count(idx, *concepts, fx.query_texts[qi]);
+                if (qc > 0) {
+                    const float inv = 1.0f / static_cast<float>(qc);
+                    for (float& x : concept_scores)
+                        x *= inv;
+                }
+            }
+        }
+
+        std::vector<float> bm_pool(pool.size(), 0.0f);
+        std::vector<float> tr_pool(pool.size(), 0.0f);
+        std::size_t positive_transport = 0;
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            bm_pool[i] = pool[i].second;
+            const auto did = pool[i].first;
+            tr_pool[i] = phrase_scores[did] + concept_scores[did];
+            positive_transport += tr_pool[i] > 0.0f ? 1u : 0u;
+        }
+        const float positive_fraction =
+            pool.empty() ? 0.0f
+                         : static_cast<float>(positive_transport) / static_cast<float>(pool.size());
+        if (positive_fraction == 0.0f || positive_fraction > cfg.max_positive_fraction) {
+            std::fill(tr_pool.begin(), tr_pool.end(), 0.0f);
+        }
+        zscore_inplace(bm_pool);
+        zscore_inplace(tr_pool);
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            rankings[qi][pool[i].first].first =
+                cfg.alpha * bm_pool[i] + (1.0f - cfg.alpha) * tr_pool[i];
+        }
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+void run_bm25_docanchored_concepts(const char* name, const Fixture& fx,
+                                   const simeon::Bm25Index& idx, double build_us,
+                                   const simeon::ConceptIndex& concepts, std::uint32_t pool_size,
+                                   float alpha) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> bm25_scores(nd, 0.0f);
+    std::vector<std::string> toks;
+    std::unordered_set<std::uint64_t> query_content_hashes;
+    std::unordered_map<const simeon::ConceptEntry*, float> concept_mass;
+    std::unordered_map<const simeon::ConceptEntry*, std::uint32_t> local_tf;
+
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        idx.score(fx.query_texts[qi], bm25_scores);
+        auto pool = simeon::top_k(bm25_scores, pool_size);
+        build_query_content_hashes(idx, fx.query_texts[qi], query_content_hashes);
+
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(neg_inf, di);
+
+        std::vector<std::vector<PooledConceptHit>> pooled_hits(pool.size());
+        concept_mass.clear();
+        float bm25_sum = 0.0f;
+        for (const auto& [_, sc] : pool)
+            bm25_sum += std::max(sc, 0.0f);
+
+        if (query_content_hashes.size() >= 2 && bm25_sum > 0.0f) {
+            for (std::size_t i = 0; i < pool.size(); ++i) {
+                const auto did = pool[i].first;
+                tokenize_words(fx.doc_texts[did], toks);
+                if (toks.size() < 2)
+                    continue;
+                local_tf.clear();
+                for (std::size_t j = 1; j < toks.size(); ++j) {
+                    const auto a = idx.hash_term(toks[j - 1]);
+                    const auto b = idx.hash_term(toks[j]);
+                    const auto* e = concepts.find(simeon::ConceptIndex::hash_bigram(a, b));
+                    if (!e)
+                        continue;
+                    if (!query_content_hashes.contains(e->a_hash) ||
+                        !query_content_hashes.contains(e->b_hash))
+                        continue;
+                    ++local_tf[e];
+                }
+                if (local_tf.empty())
+                    continue;
+                const float dl = static_cast<float>(toks.size() - 1);
+                const float doc_weight = std::max(pool[i].second, 0.0f) / bm25_sum;
+                pooled_hits[i].reserve(local_tf.size());
+                for (const auto& [entry, tf] : local_tf) {
+                    pooled_hits[i].push_back(PooledConceptHit{entry, tf, dl});
+                    concept_mass[entry] += doc_weight * (static_cast<float>(tf) / dl) *
+                                           bounded_pmi(entry->pmi) * entry->idf;
+                }
+            }
+        }
+
+        std::vector<float> bm_pool(pool.size(), 0.0f);
+        std::vector<float> tr_pool(pool.size(), 0.0f);
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            bm_pool[i] = pool[i].second;
+            float score = 0.0f;
+            for (const auto& hit : pooled_hits[i]) {
+                const auto it = concept_mass.find(hit.entry);
+                if (it == concept_mass.end())
+                    continue;
+                score += it->second * (static_cast<float>(hit.tf) / hit.dl);
+            }
+            tr_pool[i] = score;
+        }
+        zscore_inplace(bm_pool);
+        zscore_inplace(tr_pool);
+        for (std::size_t i = 0; i < pool.size(); ++i)
+            rankings[qi][pool[i].first].first = alpha * bm_pool[i] + (1.0f - alpha) * tr_pool[i];
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+void run_bm25_filtered_query_concepts(const char* name, const Fixture& fx,
+                                      const simeon::Bm25Index& idx, double build_us,
+                                      const simeon::ConceptIndex& concepts, std::uint32_t pool_size,
+                                      float alpha) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> bm25_scores(nd, 0.0f);
+    std::vector<std::string> toks;
+    std::unordered_set<std::uint64_t> query_content_hashes;
+    std::unordered_map<const simeon::ConceptEntry*, std::uint32_t> query_concepts;
+    std::unordered_map<const simeon::ConceptEntry*, std::uint32_t> local_tf;
+
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        idx.score(fx.query_texts[qi], bm25_scores);
+        auto pool = simeon::top_k(bm25_scores, pool_size);
+        build_query_content_hashes(idx, fx.query_texts[qi], query_content_hashes);
+        query_concepts.clear();
+
+        tokenize_words(fx.query_texts[qi], toks);
+        for (std::size_t i = 1; i < toks.size(); ++i) {
+            const auto a = idx.hash_term(toks[i - 1]);
+            const auto b = idx.hash_term(toks[i]);
+            const auto* e = concepts.find(simeon::ConceptIndex::hash_bigram(a, b));
+            if (!e)
+                continue;
+            if (!query_content_hashes.contains(e->a_hash) ||
+                !query_content_hashes.contains(e->b_hash))
+                continue;
+            ++query_concepts[e];
+        }
+
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(neg_inf, di);
+
+        std::vector<float> bm_pool(pool.size(), 0.0f);
+        std::vector<float> tr_pool(pool.size(), 0.0f);
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            bm_pool[i] = pool[i].second;
+            if (query_concepts.empty())
+                continue;
+            tokenize_words(fx.doc_texts[pool[i].first], toks);
+            if (toks.size() < 2)
+                continue;
+            local_tf.clear();
+            for (std::size_t j = 1; j < toks.size(); ++j) {
+                const auto a = idx.hash_term(toks[j - 1]);
+                const auto b = idx.hash_term(toks[j]);
+                const auto* e = concepts.find(simeon::ConceptIndex::hash_bigram(a, b));
+                if (!e)
+                    continue;
+                const auto qit = query_concepts.find(e);
+                if (qit == query_concepts.end())
+                    continue;
+                local_tf[e] += qit->second;
+            }
+            if (local_tf.empty())
+                continue;
+            const float dl = static_cast<float>(toks.size() - 1);
+            float score = 0.0f;
+            for (const auto& [entry, tf] : local_tf)
+                score += bounded_pmi(entry->pmi) * entry->idf * (static_cast<float>(tf) / dl);
+            tr_pool[i] = score;
+        }
+        zscore_inplace(bm_pool);
+        zscore_inplace(tr_pool);
+        for (std::size_t i = 0; i < pool.size(); ++i)
+            rankings[qi][pool[i].first].first = alpha * bm_pool[i] + (1.0f - alpha) * tr_pool[i];
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+void run_bm25_graph_ppr(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                        double build_us, const GraphConfig& cfg) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> bm25_scores(nd, 0.0f);
+    std::vector<std::uint64_t> doc_hashes;
+
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        idx.score(fx.query_texts[qi], bm25_scores);
+        auto pool = simeon::top_k(bm25_scores, cfg.pool_size);
+        const auto phrases = build_query_phrase_nodes(idx, fx.query_texts[qi]);
+
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(neg_inf, di);
+        if (pool.empty() || phrases.empty()) {
+            for (const auto& [did, sc] : pool)
+                rankings[qi][did].first = sc;
+            continue;
+        }
+
+        const std::size_t query_node = 0;
+        const std::size_t phrase_offset = 1;
+        const std::size_t doc_offset = phrase_offset + phrases.size();
+        const std::size_t n_nodes = doc_offset + pool.size();
+        std::vector<std::vector<std::pair<std::size_t, float>>> adj(n_nodes);
+        std::vector<std::vector<float>> doc_phrase(pool.size());
+
+        for (std::size_t pi = 0; pi < phrases.size(); ++pi) {
+            const auto pnode = phrase_offset + pi;
+            const float w = phrases[pi].query_weight;
+            adj[query_node].push_back({pnode, w});
+            adj[pnode].push_back({query_node, w});
+        }
+
+        for (std::size_t di = 0; di < pool.size(); ++di) {
+            build_doc_hash_tokens(idx, fx.doc_texts[pool[di].first], doc_hashes);
+            doc_phrase[di] = compute_doc_phrase_weights(doc_hashes, phrases, cfg.unordered_window);
+            for (std::size_t pi = 0; pi < phrases.size(); ++pi) {
+                const float w = doc_phrase[di][pi];
+                if (w <= 0.0f)
+                    continue;
+                const auto pnode = phrase_offset + pi;
+                const auto dnode = doc_offset + di;
+                adj[pnode].push_back({dnode, w});
+                adj[dnode].push_back({pnode, w});
+            }
+        }
+
+        if (cfg.include_docdoc) {
+            for (std::size_t i = 0; i < pool.size(); ++i) {
+                double norm_i = 0.0;
+                for (float x : doc_phrase[i])
+                    norm_i += static_cast<double>(x) * x;
+                if (norm_i <= 0.0)
+                    continue;
+                for (std::size_t j = i + 1; j < pool.size(); ++j) {
+                    double norm_j = 0.0;
+                    double dotp = 0.0;
+                    for (std::size_t pi = 0; pi < phrases.size(); ++pi) {
+                        dotp += static_cast<double>(doc_phrase[i][pi]) * doc_phrase[j][pi];
+                        norm_j += static_cast<double>(doc_phrase[j][pi]) * doc_phrase[j][pi];
+                    }
+                    if (norm_j <= 0.0 || dotp <= 0.0)
+                        continue;
+                    const float sim =
+                        static_cast<float>(dotp / (std::sqrt(norm_i) * std::sqrt(norm_j)));
+                    if (sim <= 0.0f)
+                        continue;
+                    const auto di_node = doc_offset + i;
+                    const auto dj_node = doc_offset + j;
+                    adj[di_node].push_back({dj_node, sim});
+                    adj[dj_node].push_back({di_node, sim});
+                }
+            }
+        }
+
+        std::vector<float> row_sum(n_nodes, 0.0f);
+        for (std::size_t i = 0; i < n_nodes; ++i) {
+            for (const auto& [j, w] : adj[i])
+                row_sum[i] += w;
+        }
+
+        std::vector<float> s(n_nodes, 0.0f), ns(n_nodes, 0.0f);
+        s[query_node] = 1.0f;
+        const float d = cfg.damping;
+        for (std::uint32_t iter = 0; iter < 30; ++iter) {
+            std::fill(ns.begin(), ns.end(), 0.0f);
+            ns[query_node] = 1.0f - d;
+            for (std::size_t j = 0; j < n_nodes; ++j) {
+                if (row_sum[j] <= 0.0f || s[j] == 0.0f)
+                    continue;
+                const float scale = d * s[j] / row_sum[j];
+                for (const auto& [i, w] : adj[j])
+                    ns[i] += scale * w;
+            }
+            float delta = 0.0f;
+            for (std::size_t i = 0; i < n_nodes; ++i)
+                delta += std::fabs(ns[i] - s[i]);
+            s.swap(ns);
+            if (delta < 1e-4f)
+                break;
+        }
+
+        std::vector<float> bm_pool(pool.size(), 0.0f), gr_pool(pool.size(), 0.0f);
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            bm_pool[i] = pool[i].second;
+            gr_pool[i] = s[doc_offset + i];
+        }
+        zscore_inplace(bm_pool);
+        zscore_inplace(gr_pool);
+        for (std::size_t i = 0; i < pool.size(); ++i)
+            rankings[qi][pool[i].first].first =
+                cfg.alpha * bm_pool[i] + (1.0f - cfg.alpha) * gr_pool[i];
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+void run_bm25_cluster_cover(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                            double build_us,
+                            std::span<const std::vector<ClusterFragment>> doc_frags,
+                            const ClusterConfig& cfg) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> bm25_scores(nd, 0.0f);
+
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        idx.score(fx.query_texts[qi], bm25_scores);
+        auto pool = simeon::top_k(bm25_scores, cfg.pool_size);
+        auto query_sig =
+            build_sparse_signature(idx, fx.query_texts[qi], cfg.fragment_signature_terms);
+
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(neg_inf, di);
+        if (pool.empty() || query_sig.terms.empty()) {
+            for (const auto& [did, sc] : pool)
+                rankings[qi][did].first = sc;
+            continue;
+        }
+
+        std::vector<float> seed_pool(pool.size(), 0.0f);
+        const float seed_denom = pool.empty() ? 1.0f : static_cast<float>(pool.size());
+        for (std::size_t i = 0; i < pool.size(); ++i)
+            seed_pool[i] = 1.0f / std::sqrt(1.0f + static_cast<float>(i));
+
+        std::vector<ClusterAssignment> fragments;
+        for (std::size_t pi = 0; pi < pool.size(); ++pi) {
+            const auto did = pool[pi].first;
+            for (const auto& frag : doc_frags[did]) {
+                const float q_overlap = weighted_containment(query_sig, frag.signature);
+                if (q_overlap <= 0.0f)
+                    continue;
+                fragments.push_back(ClusterAssignment{
+                    .pool_index = static_cast<std::uint32_t>(pi),
+                    .doc_seed = seed_pool[pi] / seed_denom,
+                    .query_overlap = q_overlap,
+                    .fragment = &frag.signature,
+                });
+            }
+        }
+        if (fragments.empty()) {
+            for (const auto& [did, sc] : pool)
+                rankings[qi][did].first = sc;
+            continue;
+        }
+
+        std::sort(fragments.begin(), fragments.end(), [](const auto& a, const auto& b) {
+            if (a.query_overlap != b.query_overlap)
+                return a.query_overlap > b.query_overlap;
+            return a.doc_seed > b.doc_seed;
+        });
+
+        std::vector<ClusterCoverNode> clusters;
+        clusters.reserve(fragments.size());
+        for (const auto& frag : fragments) {
+            std::size_t best_idx = clusters.size();
+            float best_overlap = 0.0f;
+            for (std::size_t ci = 0; ci < clusters.size(); ++ci) {
+                const float ov = weighted_overlap_coeff(*frag.fragment, clusters[ci].signature);
+                if (ov > best_overlap) {
+                    best_overlap = ov;
+                    best_idx = ci;
+                }
+            }
+            if (best_idx == clusters.size() || best_overlap < cfg.min_cluster_overlap) {
+                ClusterCoverNode node;
+                node.signature = *frag.fragment;
+                node.members.push_back(frag);
+                node.seed_mass = frag.doc_seed * frag.query_overlap;
+                clusters.push_back(std::move(node));
+            } else {
+                merge_signature_max(clusters[best_idx].signature, *frag.fragment,
+                                    cfg.cluster_signature_terms);
+                clusters[best_idx].members.push_back(frag);
+                clusters[best_idx].seed_mass += frag.doc_seed * frag.query_overlap;
+            }
+        }
+
+        for (auto& cluster : clusters)
+            cluster.query_cover = weighted_containment(query_sig, cluster.signature);
+
+        std::vector<float> bm_pool(pool.size(), 0.0f), cl_pool(pool.size(), 0.0f);
+        for (std::size_t i = 0; i < pool.size(); ++i)
+            bm_pool[i] = pool[i].second;
+
+        for (const auto& cluster : clusters) {
+            if (cluster.query_cover < cfg.min_query_cover)
+                continue;
+            const float activation = cluster.query_cover * cluster.seed_mass /
+                                     std::sqrt(static_cast<float>(cluster.members.size()));
+            for (const auto& member : cluster.members) {
+                const float membership = weighted_containment(*member.fragment, cluster.signature);
+                if (membership <= 0.0f)
+                    continue;
+                const float mass = activation * membership * (0.5f + 0.5f * member.query_overlap);
+                cl_pool[member.pool_index] += mass;
+            }
+        }
+
+        zscore_inplace(bm_pool);
+        zscore_inplace(cl_pool);
+        for (std::size_t i = 0; i < pool.size(); ++i)
+            rankings[qi][pool[i].first].first =
+                cfg.alpha * bm_pool[i] + (1.0f - cfg.alpha) * cl_pool[i];
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+void run_bm25_fragment_graph(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                             double build_us, const simeon::Encoder& enc,
+                             std::span<const std::vector<SemanticFragment>> doc_frags,
+                             const FragmentGraphConfig& cfg) {
+    struct FragRef {
+        std::uint32_t pool_index = 0;
+        const float* vec = nullptr;
+        const SparseSignature* sig = nullptr;
+    };
+
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    const std::uint32_t dim = enc.output_dim();
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> bm25_scores(nd, 0.0f);
+    std::vector<float> qvec(dim, 0.0f);
+
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        idx.score(fx.query_texts[qi], bm25_scores);
+        auto pool = simeon::top_k(bm25_scores, cfg.pool_size);
+        enc.encode(fx.query_texts[qi], qvec.data());
+        auto query_sig =
+            build_sparse_signature(idx, fx.query_texts[qi], cfg.fragment_signature_terms);
+
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(neg_inf, di);
+        if (pool.empty() || vector_l2_norm(qvec.data(), dim) <= 0.0f || query_sig.terms.empty()) {
+            for (const auto& [did, sc] : pool)
+                rankings[qi][did].first = sc;
+            continue;
+        }
+
+        std::vector<FragRef> frags;
+        frags.reserve(pool.size() * cfg.top_fragments_per_doc);
+        for (std::size_t pi = 0; pi < pool.size(); ++pi) {
+            const auto did = pool[pi].first;
+            const auto limit =
+                std::min<std::size_t>(cfg.top_fragments_per_doc, doc_frags[did].size());
+            for (std::size_t fi = 0; fi < limit; ++fi) {
+                const auto& frag = doc_frags[did][fi];
+                frags.push_back(FragRef{.pool_index = static_cast<std::uint32_t>(pi),
+                                        .vec = frag.vec.data(),
+                                        .sig = &frag.signature});
+            }
+        }
+        if (frags.empty()) {
+            for (const auto& [did, sc] : pool)
+                rankings[qi][did].first = sc;
+            continue;
+        }
+
+        std::vector<float> seed_pool(pool.size(), 0.0f);
+        for (std::size_t i = 0; i < pool.size(); ++i)
+            seed_pool[i] = 1.0f / std::sqrt(1.0f + static_cast<float>(i));
+
+        std::vector<float> teleport(frags.size(), 0.0f);
+        float teleport_sum = 0.0f;
+        for (std::size_t fi = 0; fi < frags.size(); ++fi) {
+            const float qsim = dot(qvec.data(), frags[fi].vec, dim);
+            const float qlex = weighted_containment(query_sig, *frags[fi].sig);
+            const float sem_mass = qsim > cfg.min_query_sim ? (qsim - cfg.min_query_sim) : 0.0f;
+            const float lex_mass = qlex > cfg.min_bridge_overlap
+                                       ? cfg.lexical_bridge_weight * (qlex - cfg.min_bridge_overlap)
+                                       : 0.0f;
+            const float total_mass = sem_mass + lex_mass;
+            if (total_mass <= 0.0f)
+                continue;
+            const float mass = total_mass * seed_pool[frags[fi].pool_index];
+            teleport[fi] = mass;
+            teleport_sum += mass;
+        }
+        if (teleport_sum <= 0.0f) {
+            for (const auto& [did, sc] : pool)
+                rankings[qi][did].first = sc;
+            continue;
+        }
+        for (float& x : teleport)
+            x /= teleport_sum;
+
+        std::vector<std::vector<std::pair<std::uint32_t, float>>> adj(frags.size());
+        std::vector<float> row_sum(frags.size(), 0.0f);
+        for (std::size_t i = 0; i < frags.size(); ++i) {
+            for (std::size_t j = i + 1; j < frags.size(); ++j) {
+                const float sem_sim = dot(frags[i].vec, frags[j].vec, dim);
+                const float bridge = weighted_overlap_coeff(*frags[i].sig, *frags[j].sig);
+                const float edge =
+                    (sem_sim > cfg.min_fragment_sim ? (sem_sim - cfg.min_fragment_sim) : 0.0f) +
+                    (bridge > cfg.min_bridge_overlap
+                         ? cfg.lexical_bridge_weight * (bridge - cfg.min_bridge_overlap)
+                         : 0.0f);
+                if (edge <= 0.0f)
+                    continue;
+                adj[i].push_back({static_cast<std::uint32_t>(j), edge});
+                adj[j].push_back({static_cast<std::uint32_t>(i), edge});
+                row_sum[i] += edge;
+                row_sum[j] += edge;
+            }
+        }
+
+        std::vector<float> s = teleport, ns(frags.size(), 0.0f);
+        const float d = cfg.damping;
+        for (std::uint32_t iter = 0; iter < cfg.max_iters; ++iter) {
+            std::fill(ns.begin(), ns.end(), 0.0f);
+            for (std::size_t i = 0; i < frags.size(); ++i)
+                ns[i] += (1.0f - d) * teleport[i];
+            for (std::size_t j = 0; j < frags.size(); ++j) {
+                if (s[j] <= 0.0f)
+                    continue;
+                if (row_sum[j] <= 0.0f) {
+                    ns[j] += d * s[j];
+                    continue;
+                }
+                const float scale = d * s[j] / row_sum[j];
+                for (const auto& [i, w] : adj[j])
+                    ns[i] += scale * w;
+            }
+            float delta = 0.0f;
+            for (std::size_t i = 0; i < frags.size(); ++i)
+                delta += std::fabs(ns[i] - s[i]);
+            s.swap(ns);
+            if (delta < 1e-4f)
+                break;
+        }
+
+        std::vector<float> bm_pool(pool.size(), 0.0f), fg_pool(pool.size(), 0.0f);
+        for (std::size_t i = 0; i < pool.size(); ++i)
+            bm_pool[i] = pool[i].second;
+        for (std::size_t fi = 0; fi < frags.size(); ++fi)
+            fg_pool[frags[fi].pool_index] += s[fi];
+
+        zscore_inplace(bm_pool);
+        zscore_inplace(fg_pool);
+        for (std::size_t i = 0; i < pool.size(); ++i)
+            rankings[qi][pool[i].first].first =
+                cfg.alpha * bm_pool[i] + (1.0f - cfg.alpha) * fg_pool[i];
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+void run_bm25_fragment_geometry(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                                double build_us, const simeon::Encoder& enc,
+                                std::span<const std::vector<SemanticFragment>> doc_frags,
+                                const GeometryGraphConfig& cfg) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        rankings[qi].reserve(nd);
+        const auto scores =
+            simeon::score_fragment_geometry(fx.query_texts[qi], idx, enc, doc_frags, cfg);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(scores[di], di);
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+void run_bm25_transport_grid(const Fixture& fx) {
+    simeon::Bm25Config cfg;
+    cfg.build_word_bigrams = true;
+    auto idx = build_bm25(fx, cfg);
+
+    std::vector<std::string_view> docs_view;
+    docs_view.reserve(fx.doc_texts.size());
+    for (const auto& s : fx.doc_texts)
+        docs_view.emplace_back(s);
+    auto tb = Clock::now();
+    const simeon::ConceptConfig ccfg{};
+    auto concepts =
+        simeon::mine_concepts(idx.idx, std::span<const std::string_view>(docs_view), ccfg);
+    const double concept_mine_us = elapsed_us(tb);
+
+    run_bm25_transport("bm25_transport_concepts_k100_a0.8", fx, idx.idx,
+                       idx.build_us + concept_mine_us, &concepts,
+                       TransportConfig{.pool_size = 100,
+                                       .alpha = 0.8f,
+                                       .normalize_by_query_phrase_count = true,
+                                       .mode = TransportLegMode::ConceptsOnly});
+    run_bm25_transport("bm25_transport_ordered_k100_a0.8", fx, idx.idx, idx.build_us, nullptr,
+                       TransportConfig{.pool_size = 100,
+                                       .alpha = 0.8f,
+                                       .normalize_by_query_phrase_count = true,
+                                       .mode = TransportLegMode::OrderedOnly});
+    run_bm25_transport("bm25_transport_phrase_k100_a0.8", fx, idx.idx, idx.build_us, nullptr,
+                       TransportConfig{.pool_size = 100,
+                                       .alpha = 0.8f,
+                                       .normalize_by_query_phrase_count = true,
+                                       .mode = TransportLegMode::OrderedUnordered});
+    run_bm25_transport("bm25_transport_phrase_concepts_k100_a0.8", fx, idx.idx,
+                       idx.build_us + concept_mine_us, &concepts,
+                       TransportConfig{.pool_size = 100,
+                                       .alpha = 0.8f,
+                                       .normalize_by_query_phrase_count = true,
+                                       .mode = TransportLegMode::OrderedUnorderedConcepts});
+    run_bm25_transport("bm25_transport_phrase_k500_a0.8", fx, idx.idx, idx.build_us, nullptr,
+                       TransportConfig{.pool_size = 500,
+                                       .alpha = 0.8f,
+                                       .normalize_by_query_phrase_count = true,
+                                       .mode = TransportLegMode::OrderedUnordered});
+    run_bm25_transport("bm25_transport_phrase_concepts_k500_a0.8", fx, idx.idx,
+                       idx.build_us + concept_mine_us, &concepts,
+                       TransportConfig{.pool_size = 500,
+                                       .alpha = 0.8f,
+                                       .normalize_by_query_phrase_count = true,
+                                       .mode = TransportLegMode::OrderedUnorderedConcepts});
+    run_bm25_transport("bm25_transport_phrase_concepts_k100_a0.5", fx, idx.idx,
+                       idx.build_us + concept_mine_us, &concepts,
+                       TransportConfig{.pool_size = 100,
+                                       .alpha = 0.5f,
+                                       .normalize_by_query_phrase_count = true,
+                                       .max_positive_fraction = 2.0f,
+                                       .mode = TransportLegMode::OrderedUnorderedConcepts});
+    run_bm25_transport("bm25_transport_phrase_k100_a0.8_gate0.2", fx, idx.idx, idx.build_us,
+                       nullptr,
+                       TransportConfig{.pool_size = 100,
+                                       .alpha = 0.8f,
+                                       .normalize_by_query_phrase_count = true,
+                                       .max_positive_fraction = 0.2f,
+                                       .mode = TransportLegMode::OrderedUnordered});
+    run_bm25_transport("bm25_transport_phrase_k100_a0.8_gate0.5", fx, idx.idx, idx.build_us,
+                       nullptr,
+                       TransportConfig{.pool_size = 100,
+                                       .alpha = 0.8f,
+                                       .normalize_by_query_phrase_count = true,
+                                       .max_positive_fraction = 0.5f,
+                                       .mode = TransportLegMode::OrderedUnordered});
+    run_bm25_docanchored_concepts("bm25_transport_docconcept_k100_a0.8", fx, idx.idx,
+                                  idx.build_us + concept_mine_us, concepts, 100, 0.8f);
+    run_bm25_docanchored_concepts("bm25_transport_docconcept_k500_a0.8", fx, idx.idx,
+                                  idx.build_us + concept_mine_us, concepts, 500, 0.8f);
+    run_bm25_filtered_query_concepts("bm25_transport_filtered_concepts_k100_a0.8", fx, idx.idx,
+                                     idx.build_us + concept_mine_us, concepts, 100, 0.8f);
+}
+
+void run_bm25_graph_grid(const Fixture& fx) {
+    simeon::Bm25Config cfg;
+    cfg.build_word_bigrams = true;
+    auto idx = build_bm25(fx, cfg);
+    run_bm25_graph_ppr("bm25_graph_phrase_ppr_k100_d0.85_a0.8", fx, idx.idx, idx.build_us,
+                       GraphConfig{.pool_size = 100,
+                                   .alpha = 0.8f,
+                                   .damping = 0.85f,
+                                   .include_docdoc = false,
+                                   .unordered_window = 8});
+    run_bm25_graph_ppr("bm25_graph_phrase_docdoc_ppr_k100_d0.85_a0.8", fx, idx.idx, idx.build_us,
+                       GraphConfig{.pool_size = 100,
+                                   .alpha = 0.8f,
+                                   .damping = 0.85f,
+                                   .include_docdoc = true,
+                                   .unordered_window = 8});
+    run_bm25_graph_ppr("bm25_graph_phrase_ppr_k300_d0.85_a0.8", fx, idx.idx, idx.build_us,
+                       GraphConfig{.pool_size = 300,
+                                   .alpha = 0.8f,
+                                   .damping = 0.85f,
+                                   .include_docdoc = false,
+                                   .unordered_window = 8});
+    run_bm25_graph_ppr("bm25_graph_phrase_docdoc_ppr_k100_d0.70_a0.8", fx, idx.idx, idx.build_us,
+                       GraphConfig{.pool_size = 100,
+                                   .alpha = 0.8f,
+                                   .damping = 0.70f,
+                                   .include_docdoc = true,
+                                   .unordered_window = 8});
+}
+
+void run_bm25_cluster_grid(const Fixture& fx) {
+    simeon::Bm25Config cfg;
+    cfg.build_word_bigrams = true;
+    auto idx = build_bm25(fx, cfg);
+
+    auto tb = Clock::now();
+    std::vector<std::vector<ClusterFragment>> doc_frags;
+    doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        doc_frags.push_back(build_doc_fragments(idx.idx, doc, 3, 8));
+    const double frag_build_us = elapsed_us(tb);
+
+    run_bm25_cluster_cover("bm25_cluster_cover_k100_o0.35_q0.35_a0.8", fx, idx.idx,
+                           idx.build_us + frag_build_us, doc_frags,
+                           ClusterConfig{.pool_size = 100,
+                                         .alpha = 0.8f,
+                                         .top_fragments_per_doc = 3,
+                                         .fragment_signature_terms = 8,
+                                         .cluster_signature_terms = 24,
+                                         .min_cluster_overlap = 0.35f,
+                                         .min_query_cover = 0.35f});
+    run_bm25_cluster_cover("bm25_cluster_cover_k100_o0.50_q0.35_a0.8", fx, idx.idx,
+                           idx.build_us + frag_build_us, doc_frags,
+                           ClusterConfig{.pool_size = 100,
+                                         .alpha = 0.8f,
+                                         .top_fragments_per_doc = 3,
+                                         .fragment_signature_terms = 8,
+                                         .cluster_signature_terms = 24,
+                                         .min_cluster_overlap = 0.50f,
+                                         .min_query_cover = 0.35f});
+    run_bm25_cluster_cover("bm25_cluster_cover_k100_o0.35_q0.20_a0.8", fx, idx.idx,
+                           idx.build_us + frag_build_us, doc_frags,
+                           ClusterConfig{.pool_size = 100,
+                                         .alpha = 0.8f,
+                                         .top_fragments_per_doc = 3,
+                                         .fragment_signature_terms = 8,
+                                         .cluster_signature_terms = 24,
+                                         .min_cluster_overlap = 0.35f,
+                                         .min_query_cover = 0.20f});
+    run_bm25_cluster_cover("bm25_cluster_cover_k300_o0.35_q0.35_a0.8", fx, idx.idx,
+                           idx.build_us + frag_build_us, doc_frags,
+                           ClusterConfig{.pool_size = 300,
+                                         .alpha = 0.8f,
+                                         .top_fragments_per_doc = 3,
+                                         .fragment_signature_terms = 8,
+                                         .cluster_signature_terms = 24,
+                                         .min_cluster_overlap = 0.35f,
+                                         .min_query_cover = 0.35f});
+}
+
+void run_bm25_fragment_graph_grid(const Fixture& fx) {
+    simeon::Bm25Config bcfg;
+    bcfg.build_word_bigrams = true;
+    auto idx = build_bm25(fx, bcfg);
+
+    std::vector<std::string_view> seed_views;
+    seed_views.reserve(fx.doc_texts.size());
+    for (const auto& d : fx.doc_texts)
+        seed_views.emplace_back(d);
+
+    auto tb = Clock::now();
+    simeon::PmiConfig pcfg;
+    pcfg.target_rank = 128;
+    pcfg.min_token_count = 5;
+    pcfg.max_vocab_size = 20'000;
+    auto pmi = simeon::PmiEmbeddings::learn(std::span<const std::string_view>(seed_views), pcfg);
+
+    simeon::EncoderConfig ecfg;
+    ecfg.ngram_mode = simeon::NGramMode::WordOnly;
+    ecfg.ngram_min = 1;
+    ecfg.ngram_max = 1;
+    ecfg.sketch_dim = 0;
+    ecfg.output_dim = pmi.dim();
+    ecfg.projection = simeon::ProjectionMode::None;
+    ecfg.l2_normalize = true;
+    ecfg.pmi_rows = &pmi;
+    simeon::Encoder enc(ecfg);
+
+    std::vector<std::vector<SemanticFragment>> doc_frags;
+    doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        doc_frags.push_back(simeon::build_doc_semantic_fragments(enc, doc, idx.idx, 6, 8));
+    const double total_build_us = idx.build_us + elapsed_us(tb);
+    auto rich_tb = Clock::now();
+    std::vector<std::vector<SemanticFragment>> rich_doc_frags;
+    rich_doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        rich_doc_frags.push_back(
+            simeon::build_doc_semantic_fragments_rich(enc, doc, idx.idx, 6, 8));
+    const double rich_total_build_us = total_build_us + elapsed_us(rich_tb);
+    auto cover_tb = Clock::now();
+    std::vector<std::vector<SemanticFragment>> rich_cov_doc_frags;
+    rich_cov_doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        rich_cov_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_covered(
+            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f));
+    const double rich_cov_total_build_us = total_build_us + elapsed_us(cover_tb);
+    auto mmr_tb = Clock::now();
+    std::vector<std::vector<SemanticFragment>> rich_mmr_doc_frags;
+    rich_mmr_doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        rich_mmr_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_mmr(
+            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.35f, 0.30f, 0.15f));
+    const double rich_mmr_total_build_us = total_build_us + elapsed_us(mmr_tb);
+    auto mmr_novel_tb = Clock::now();
+    std::vector<std::vector<SemanticFragment>> rich_mmr_novel_doc_frags;
+    rich_mmr_novel_doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        rich_mmr_novel_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_mmr(
+            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.50f, 0.24f, 0.12f));
+    const double rich_mmr_novel_total_build_us = total_build_us + elapsed_us(mmr_novel_tb);
+    auto budget_tb = Clock::now();
+    std::vector<std::vector<SemanticFragment>> rich_budget_doc_frags;
+    rich_budget_doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        rich_budget_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_budgeted(
+            enc, doc, idx.idx, 6, 8, 0.60f, 4, 0.80f, 0.15f, 1));
+    const double rich_budget_total_build_us = total_build_us + elapsed_us(budget_tb);
+
+    run_bm25_fragment_graph("bm25_fragment_graph_k100_d0.85_q0.20_f0.35_a0.8", fx, idx.idx,
+                            total_build_us, enc, doc_frags,
+                            FragmentGraphConfig{.pool_size = 100,
+                                                .alpha = 0.8f,
+                                                .damping = 0.85f,
+                                                .top_fragments_per_doc = 3,
+                                                .min_query_sim = 0.20f,
+                                                .min_fragment_sim = 0.35f,
+                                                .lexical_bridge_weight = 0.0f,
+                                                .min_bridge_overlap = 0.35f,
+                                                .fragment_signature_terms = 8,
+                                                .max_iters = 20});
+    run_bm25_fragment_graph("bm25_fragment_graph_k100_d0.70_q0.20_f0.35_a0.8", fx, idx.idx,
+                            total_build_us, enc, doc_frags,
+                            FragmentGraphConfig{.pool_size = 100,
+                                                .alpha = 0.8f,
+                                                .damping = 0.70f,
+                                                .top_fragments_per_doc = 3,
+                                                .min_query_sim = 0.20f,
+                                                .min_fragment_sim = 0.35f,
+                                                .lexical_bridge_weight = 0.0f,
+                                                .min_bridge_overlap = 0.35f,
+                                                .fragment_signature_terms = 8,
+                                                .max_iters = 20});
+    run_bm25_fragment_graph("bm25_fragment_graph_k100_d0.85_q0.10_f0.20_a0.8", fx, idx.idx,
+                            total_build_us, enc, doc_frags,
+                            FragmentGraphConfig{.pool_size = 100,
+                                                .alpha = 0.8f,
+                                                .damping = 0.85f,
+                                                .top_fragments_per_doc = 3,
+                                                .min_query_sim = 0.10f,
+                                                .min_fragment_sim = 0.20f,
+                                                .lexical_bridge_weight = 0.0f,
+                                                .min_bridge_overlap = 0.20f,
+                                                .fragment_signature_terms = 8,
+                                                .max_iters = 20});
+    run_bm25_fragment_graph("bm25_fragment_graph_k300_d0.85_q0.20_f0.35_a0.8", fx, idx.idx,
+                            total_build_us, enc, doc_frags,
+                            FragmentGraphConfig{.pool_size = 300,
+                                                .alpha = 0.8f,
+                                                .damping = 0.85f,
+                                                .top_fragments_per_doc = 3,
+                                                .min_query_sim = 0.20f,
+                                                .min_fragment_sim = 0.35f,
+                                                .lexical_bridge_weight = 0.0f,
+                                                .min_bridge_overlap = 0.35f,
+                                                .fragment_signature_terms = 8,
+                                                .max_iters = 20});
+    run_bm25_fragment_graph("bm25_fragment_hybrid_k100_t6_d0.70_q0.20_f0.35_b0.20_a0.8", fx,
+                            idx.idx, total_build_us, enc, doc_frags,
+                            FragmentGraphConfig{.pool_size = 100,
+                                                .alpha = 0.8f,
+                                                .damping = 0.70f,
+                                                .top_fragments_per_doc = 6,
+                                                .min_query_sim = 0.20f,
+                                                .min_fragment_sim = 0.35f,
+                                                .lexical_bridge_weight = 0.20f,
+                                                .min_bridge_overlap = 0.20f,
+                                                .fragment_signature_terms = 8,
+                                                .max_iters = 20});
+    run_bm25_fragment_graph("bm25_fragment_hybrid_k100_t6_d0.85_q0.10_f0.20_b0.35_a0.8", fx,
+                            idx.idx, total_build_us, enc, doc_frags,
+                            FragmentGraphConfig{.pool_size = 100,
+                                                .alpha = 0.8f,
+                                                .damping = 0.85f,
+                                                .top_fragments_per_doc = 6,
+                                                .min_query_sim = 0.10f,
+                                                .min_fragment_sim = 0.20f,
+                                                .lexical_bridge_weight = 0.35f,
+                                                .min_bridge_overlap = 0.10f,
+                                                .fragment_signature_terms = 8,
+                                                .max_iters = 20});
+    run_bm25_fragment_graph("bm25_fragment_hybrid_k300_t6_d0.70_q0.20_f0.35_b0.20_a0.8", fx,
+                            idx.idx, total_build_us, enc, doc_frags,
+                            FragmentGraphConfig{.pool_size = 300,
+                                                .alpha = 0.8f,
+                                                .damping = 0.70f,
+                                                .top_fragments_per_doc = 6,
+                                                .min_query_sim = 0.20f,
+                                                .min_fragment_sim = 0.35f,
+                                                .lexical_bridge_weight = 0.20f,
+                                                .min_bridge_overlap = 0.20f,
+                                                .fragment_signature_terms = 8,
+                                                .max_iters = 20});
+
+    run_bm25_fragment_geometry("bm25_fragment_geom_k100_t4_s8_k8_p2_a0.8", fx, idx.idx,
+                               total_build_us, enc, doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 4,
+                                                   .attention_scale = 8.0f,
+                                                   .knn = 8,
+                                                   .steps = 2,
+                                                   .use_phss = false});
+    run_bm25_fragment_geometry("bm25_fragment_geom_k100_t4_s4_k16_p2_a0.8", fx, idx.idx,
+                               total_build_us, enc, doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 4,
+                                                   .attention_scale = 4.0f,
+                                                   .knn = 16,
+                                                   .steps = 2,
+                                                   .use_phss = false});
+    run_bm25_fragment_geometry("bm25_fragment_geom_k100_t6_s8_k8_p3_a0.8", fx, idx.idx,
+                               total_build_us, enc, doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 6,
+                                                   .attention_scale = 8.0f,
+                                                   .knn = 8,
+                                                   .steps = 3,
+                                                   .use_phss = false});
+    run_bm25_fragment_geometry("bm25_fragment_geom_adapt_k100_t4_a0.70_0.98_s4_10_k4_16_p1_3", fx,
+                               idx.idx, total_build_us, enc, doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 4,
+                                                   .attention_scale = 8.0f,
+                                                   .knn = 8,
+                                                   .steps = 2,
+                                                   .adaptive = true,
+                                                   .adaptive_idf_lo = 2.0f,
+                                                   .adaptive_idf_hi = 5.0f,
+                                                   .adaptive_decay_lo = 0.25f,
+                                                   .adaptive_decay_hi = 0.95f,
+                                                   .adaptive_alpha_lo = 0.70f,
+                                                   .adaptive_alpha_hi = 0.98f,
+                                                   .adaptive_scale_lo = 4.0f,
+                                                   .adaptive_scale_hi = 10.0f,
+                                                   .adaptive_knn_lo = 4,
+                                                   .adaptive_knn_hi = 16,
+                                                   .adaptive_steps_lo = 1,
+                                                   .adaptive_steps_hi = 3,
+                                                   .use_phss = false});
+    run_bm25_fragment_geometry("bm25_fragment_geom_adapt_k100_t6_a0.65_0.95_s3_8_k8_20_p2_4", fx,
+                               idx.idx, total_build_us, enc, doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 6,
+                                                   .attention_scale = 8.0f,
+                                                   .knn = 8,
+                                                   .steps = 3,
+                                                   .adaptive = true,
+                                                   .adaptive_idf_lo = 1.5f,
+                                                   .adaptive_idf_hi = 4.5f,
+                                                   .adaptive_decay_lo = 0.20f,
+                                                   .adaptive_decay_hi = 0.90f,
+                                                   .adaptive_alpha_lo = 0.65f,
+                                                   .adaptive_alpha_hi = 0.95f,
+                                                   .adaptive_scale_lo = 3.0f,
+                                                   .adaptive_scale_hi = 8.0f,
+                                                   .adaptive_knn_lo = 8,
+                                                   .adaptive_knn_hi = 20,
+                                                   .adaptive_steps_lo = 2,
+                                                   .adaptive_steps_hi = 4,
+                                                   .use_phss = false});
+    run_bm25_fragment_geometry("bm25_fragment_geom_rich_k100_t8_s8_k8_p2_a0.8", fx, idx.idx,
+                               rich_total_build_us, enc, rich_doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 8,
+                                                   .attention_scale = 8.0f,
+                                                   .knn = 8,
+                                                   .steps = 2,
+                                                   .use_phss = false});
+    run_bm25_fragment_geometry("bm25_fragment_geom_gsig_k100_t4_a0.65_0.98_s3_10_k4_16_p1_3", fx,
+                               idx.idx, total_build_us, enc, doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 4,
+                                                   .attention_scale = 8.0f,
+                                                   .knn = 8,
+                                                   .steps = 2,
+                                                   .geometry_signal_adaptive = true,
+                                                   .geometry_alpha_lo = 0.65f,
+                                                   .geometry_alpha_hi = 0.98f,
+                                                   .geometry_scale_lo = 3.0f,
+                                                   .geometry_scale_hi = 10.0f,
+                                                   .geometry_knn_lo = 4,
+                                                   .geometry_knn_hi = 16,
+                                                   .geometry_steps_lo = 1,
+                                                   .geometry_steps_hi = 3,
+                                                   .use_phss = false});
+    run_bm25_fragment_geometry("bm25_fragment_geom_rich_gsig_k100_t8_a0.65_0.98_s3_10_k4_16_p1_3",
+                               fx, idx.idx, rich_total_build_us, enc, rich_doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 8,
+                                                   .attention_scale = 8.0f,
+                                                   .knn = 8,
+                                                   .steps = 2,
+                                                   .geometry_signal_adaptive = true,
+                                                   .geometry_alpha_lo = 0.65f,
+                                                   .geometry_alpha_hi = 0.98f,
+                                                   .geometry_scale_lo = 3.0f,
+                                                   .geometry_scale_hi = 10.0f,
+                                                   .geometry_knn_lo = 4,
+                                                   .geometry_knn_hi = 16,
+                                                   .geometry_steps_lo = 1,
+                                                   .geometry_steps_hi = 3,
+                                                   .use_phss = false});
+    run_bm25_fragment_geometry("bm25_fragment_geom_richcov_k100_t8_o0.60_0.80_s8_k8_p2_a0.8", fx,
+                               idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 8,
+                                                   .attention_scale = 8.0f,
+                                                   .knn = 8,
+                                                   .steps = 2,
+                                                   .use_phss = false});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_richcov_gsig_k100_t8_o0.60_0.80_a0.65_0.98_s3_10_k4_16_p1_3", fx,
+        idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 8,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .geometry_signal_adaptive = true,
+                            .geometry_alpha_lo = 0.65f,
+                            .geometry_alpha_hi = 0.98f,
+                            .geometry_scale_lo = 3.0f,
+                            .geometry_scale_hi = 10.0f,
+                            .geometry_knn_lo = 4,
+                            .geometry_knn_hi = 16,
+                            .geometry_steps_lo = 1,
+                            .geometry_steps_hi = 3,
+                            .use_phss = false});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_richmmr_k100_t8_l0.35_m0.30_0.15_o0.60_0.80_s8_k8_p2_a0.8", fx, idx.idx,
+        rich_mmr_total_build_us, enc, rich_mmr_doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 8,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = false});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_richmmr_k100_t8_l0.50_m0.24_0.12_o0.60_0.80_s8_k8_p2_a0.8", fx, idx.idx,
+        rich_mmr_novel_total_build_us, enc, rich_mmr_novel_doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 8,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = false});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_richbud_k100_t6_s4_a1_n0.15_o0.60_0.80_s8_k8_p2_a0.8", fx, idx.idx,
+        rich_budget_total_build_us, enc, rich_budget_doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 6,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = false});
+    run_bm25_fragment_geometry("bm25_fragment_geom_richbud_gsig_k100_t6_s4_a1_n0.15_o0.60_0.80_a0."
+                               "65_0.98_s3_10_k4_16_p1_3",
+                               fx, idx.idx, rich_budget_total_build_us, enc, rich_budget_doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 6,
+                                                   .attention_scale = 8.0f,
+                                                   .knn = 8,
+                                                   .steps = 2,
+                                                   .geometry_signal_adaptive = true,
+                                                   .geometry_alpha_lo = 0.65f,
+                                                   .geometry_alpha_hi = 0.98f,
+                                                   .geometry_scale_lo = 3.0f,
+                                                   .geometry_scale_hi = 10.0f,
+                                                   .geometry_knn_lo = 4,
+                                                   .geometry_knn_hi = 16,
+                                                   .geometry_steps_lo = 1,
+                                                   .geometry_steps_hi = 3,
+                                                   .use_phss = false});
+
+    // Asymmetric two-stage: richcov sentences + MMR anchors
+    auto asym_tb = Clock::now();
+    std::vector<std::vector<SemanticFragment>> rich_asym_doc_frags;
+    rich_asym_doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        rich_asym_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_asymmetric(
+            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.35f, 0.15f));
+    const double rich_asym_total_build_us = total_build_us + elapsed_us(asym_tb);
+    run_bm25_fragment_geometry("bm25_fragment_geom_richasym_k100_t6_s8_k8_p2_a0.8", fx, idx.idx,
+                               rich_asym_total_build_us, enc, rich_asym_doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 6,
+                                                   .attention_scale = 8.0f,
+                                                   .knn = 8,
+                                                   .steps = 2,
+                                                   .use_phss = false});
+
+    // Asymmetric variant 2: stricter anchor novelty (lambda=0.50)
+    auto asym2_tb = Clock::now();
+    std::vector<std::vector<SemanticFragment>> rich_asym2_doc_frags;
+    rich_asym2_doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        rich_asym2_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_asymmetric(
+            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.50f, 0.15f));
+    const double rich_asym2_total_build_us = total_build_us + elapsed_us(asym2_tb);
+    run_bm25_fragment_geometry("bm25_fragment_geom_richasym2_k100_t6_s8_k8_p2_a0.8", fx, idx.idx,
+                               rich_asym2_total_build_us, enc, rich_asym2_doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 6,
+                                                   .attention_scale = 8.0f,
+                                                   .knn = 8,
+                                                   .steps = 2,
+                                                   .use_phss = false});
+
+    // Persistent Homology Scale Selection (PHSS) variants
+    // Replace fixed knn/top-k with data-driven threshold from 0D persistence.
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phss_k100_t4_gap", fx, idx.idx, total_build_us, enc, doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 4,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGap}});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phss_k100_t4_persist", fx, idx.idx, total_build_us, enc, doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 4,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::MaxPersistence}});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phss_k100_t4_elbow", fx, idx.idx, total_build_us, enc, doc_frags,
+        GeometryGraphConfig{
+            .pool_size = 100,
+            .alpha = 0.8f,
+            .top_fragments_per_doc = 4,
+            .attention_scale = 8.0f,
+            .knn = 8,
+            .steps = 2,
+            .use_phss = true,
+            .phss_config = simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::Elbow}});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phss_k100_t8_richcov_gap", fx, idx.idx, rich_cov_total_build_us, enc,
+        rich_cov_doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 8,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGap}});
+}
+#endif // SIMEON_RESEARCH_BENCH
 
 void run_simeon_bm25_rrf(const char* name, simeon::EncoderConfig cfg, const Fixture& fx,
                          const simeon::Bm25Index& idx) {
@@ -1153,6 +3551,7 @@ void run_router_grid(const std::string& prefix, simeon::EncoderConfig sc, const 
                              "\"n_terms\":%u,\"avg_term_chars\":%.2f,"
                              "\"score_decay_rate\":%.4f,\"score_normalized_var\":%.4f,"
                              "\"top_k_score_entropy\":%.4f,\"pool_overlap_jaccard\":%.4f,"
+                             "\"nqc\":%.4f,\"wig_full\":%.4f,"
                              "\"has_relevant\":%s,\"ndcg_at_10\":%.4f,"
                              "\"recall_at_10\":%.4f,\"recall_at_100\":%.4f,"
                              "\"mrr_at_10\":%.4f}\n",
@@ -1161,8 +3560,9 @@ void run_router_grid(const std::string& prefix, simeon::EncoderConfig sc, const 
                              features.min_idf, features.idf_stddev, features.n_terms,
                              features.avg_term_chars, features.score_decay_rate,
                              features.score_normalized_var, features.top_k_score_entropy,
-                             features.pool_overlap_jaccard, pq.has_relevant ? "true" : "false",
-                             pq.ndcg_at_10, pq.recall_at_10, pq.recall_at_100, pq.mrr_at_10);
+                             features.pool_overlap_jaccard, features.nqc, features.wig_full,
+                             pq.has_relevant ? "true" : "false", pq.ndcg_at_10, pq.recall_at_10,
+                             pq.recall_at_100, pq.mrr_at_10);
             }
         }
         t.query_us = elapsed_us(t1);
@@ -1276,6 +3676,8 @@ void run_oracle_router(const char* name, simeon::EncoderConfig sc, const Fixture
                          "\"n_terms\":%u,\"avg_term_chars\":%.2f,"
                          "\"score_decay_rate\":%.4f,\"score_normalized_var\":%.4f,"
                          "\"top_k_score_entropy\":%.4f,\"pool_overlap_jaccard\":%.4f,"
+                         "\"nqc\":%.4f,\"wig_full\":%.4f,"
+                         "\"scq_sum\":%.4f,\"simplified_clarity\":%.4f,"
                          "\"has_relevant\":%s,\"ndcg_at_10\":%.4f,"
                          "\"recall_at_10\":%.4f,\"recall_at_100\":%.4f,"
                          "\"mrr_at_10\":%.4f,"
@@ -1284,7 +3686,8 @@ void run_oracle_router(const char* name, simeon::EncoderConfig sc, const Fixture
                          features.oov_rate, features.avg_idf, features.max_idf, features.min_idf,
                          features.idf_stddev, features.n_terms, features.avg_term_chars,
                          features.score_decay_rate, features.score_normalized_var,
-                         features.top_k_score_entropy, features.pool_overlap_jaccard,
+                         features.top_k_score_entropy, features.pool_overlap_jaccard, features.nqc,
+                         features.wig_full, features.scq_sum, features.simplified_clarity,
                          best->m->has_relevant ? "true" : "false", best->m->ndcg_at_10,
                          best->m->recall_at_10, best->m->recall_at_100, best->m->mrr_at_10,
                          m_atire.ndcg_at_10, m_sab.ndcg_at_10, m_cascade.ndcg_at_10);
@@ -1308,6 +3711,14 @@ int main(int argc, char** argv) {
     const char* fixture_dir = nullptr;
     std::string queries_from = "test"; // "test" | "dev"
     const char* router_per_query_path = nullptr;
+#ifdef SIMEON_RESEARCH_BENCH
+    AuxFieldMode aux_mode = AuxFieldMode::None;
+    bool softmatch_only = false;
+    bool transport_only = false;
+    bool graph_only = false;
+    bool cluster_only = false;
+    bool fragment_only = false;
+#endif
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1317,17 +3728,62 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "--queries-from must be test|dev\n");
                 return 2;
             }
+#ifdef SIMEON_RESEARCH_BENCH
+        } else if (a == "--aux-from" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v == "none") {
+                aux_mode = AuxFieldMode::None;
+            } else if (v == "textrank") {
+                aux_mode = AuxFieldMode::TextRankTitle;
+            } else if (v == "ac") {
+                aux_mode = AuxFieldMode::AhoCorasickEntity;
+            } else {
+                std::fprintf(stderr, "--aux-from must be none|textrank|ac\n");
+                return 2;
+            }
+        } else if (a == "--softmatch-only") {
+            softmatch_only = true;
+        } else if (a == "--transport-only") {
+            transport_only = true;
+        } else if (a == "--graph-only") {
+            graph_only = true;
+        } else if (a == "--cluster-only") {
+            cluster_only = true;
+        } else if (a == "--fragment-only") {
+            fragment_only = true;
+#endif
         } else if (a == "--router-per-query" && i + 1 < argc) {
             router_per_query_path = argv[++i];
         } else if (a == "--help" || a == "-h") {
+#ifdef SIMEON_RESEARCH_BENCH
+            std::fprintf(
+                stderr,
+                "usage: %s [flags] <fixture_dir>\n"
+                "  --queries-from {test,dev}    pick split (default test)\n"
+                "  --aux-from {none,textrank,ac} add BM25F structural rows (default none)\n"
+                "  --softmatch-only             run PMI soft-match rows only\n"
+                "  --transport-only             run phrase/document transport rows only\n"
+                "  --graph-only                 run graph transport rows only\n"
+                "  --cluster-only               run fragment/cluster topology rows only\n"
+                "  --fragment-only              run PMI fragment graph rows only\n"
+                "  --router-per-query <path>    write per-query router telemetry JSONL\n"
+                "  fixture_dir expects corpus.tsv, queries[_dev].tsv,\n"
+                "  qrels[_dev].tsv, reference[_dev].bin\n"
+                "  see docs/reference_fixture.md\n",
+                argv[0]);
+#else
             std::fprintf(stderr,
                          "usage: %s [flags] <fixture_dir>\n"
                          "  --queries-from {test,dev}    pick split (default test)\n"
                          "  --router-per-query <path>    write per-query router telemetry JSONL\n"
                          "  fixture_dir expects corpus.tsv, queries[_dev].tsv,\n"
                          "  qrels[_dev].tsv, reference[_dev].bin\n"
-                         "  see docs/reference_fixture.md\n",
+                         "  see docs/reference_fixture.md\n"
+                         "\n"
+                         "For archived probe-style experiment grids, use\n"
+                         "  build/benchmarks/simeon_bench_vs_reference_research\n",
                          argv[0]);
+#endif
             return 0;
         } else if (!a.empty() && a[0] == '-') {
             std::fprintf(stderr, "unknown flag: %s\n", a.c_str());
@@ -1380,6 +3836,48 @@ int main(int argc, char** argv) {
 
     run_reference(fx);
 
+    auto bm25 = build_bm25(fx);
+    run_bm25("bm25_only", fx, bm25.idx, bm25.build_us);
+#ifdef SIMEON_RESEARCH_BENCH
+    static constexpr std::array<float, 3> kBm25fAuxWeights{0.2f, 0.5f, 1.0f};
+    if (aux_mode == AuxFieldMode::TextRankTitle) {
+        run_bm25f_textrank(fx, kBm25fAuxWeights);
+        if (g_router_per_query_fp)
+            std::fclose(g_router_per_query_fp);
+        return 0;
+    } else if (aux_mode == AuxFieldMode::AhoCorasickEntity) {
+        run_bm25f_ac_entity(fx, kBm25fAuxWeights);
+        if (g_router_per_query_fp)
+            std::fclose(g_router_per_query_fp);
+        return 0;
+    } else if (softmatch_only) {
+        run_bm25_softmatch_grid(fx, bm25.idx, bm25.build_us);
+        if (g_router_per_query_fp)
+            std::fclose(g_router_per_query_fp);
+        return 0;
+    } else if (transport_only) {
+        run_bm25_transport_grid(fx);
+        if (g_router_per_query_fp)
+            std::fclose(g_router_per_query_fp);
+        return 0;
+    } else if (graph_only) {
+        run_bm25_graph_grid(fx);
+        if (g_router_per_query_fp)
+            std::fclose(g_router_per_query_fp);
+        return 0;
+    } else if (cluster_only) {
+        run_bm25_cluster_grid(fx);
+        if (g_router_per_query_fp)
+            std::fclose(g_router_per_query_fp);
+        return 0;
+    } else if (fragment_only) {
+        run_bm25_fragment_graph_grid(fx);
+        if (g_router_per_query_fp)
+            std::fclose(g_router_per_query_fp);
+        return 0;
+    }
+#endif
+
     run_simeon("achlioptas_4096_384", base(384, PM::AchlioptasSparse), fx);
     run_simeon("achlioptas_4096_768", base(768, PM::AchlioptasSparse), fx);
     run_simeon("very_sparse_4096_384", base(384, PM::VerySparse), fx);
@@ -1392,9 +3890,6 @@ int main(int argc, char** argv) {
     run_simeon_pq("achlioptas_4096_384_pq8", base(384, PM::AchlioptasSparse), fx, 8);
     run_simeon_pq("achlioptas_4096_384_pq16", base(384, PM::AchlioptasSparse), fx, 16);
     run_simeon_pq("achlioptas_4096_384_pq32", base(384, PM::AchlioptasSparse), fx, 32);
-
-    auto bm25 = build_bm25(fx);
-    run_bm25("bm25_only", fx, bm25.idx, bm25.build_us);
     run_simeon_bm25_rrf("bm25_rrf_simeon_4096_384", base(384, PM::AchlioptasSparse), fx, bm25.idx);
     run_pq_first_then_full("pq16_first_stage_then_full_k100", base(384, PM::AchlioptasSparse), fx,
                            16, 100);
@@ -1451,6 +3946,22 @@ int main(int argc, char** argv) {
     bm25_variant("bm25_pl2", simeon::Bm25Variant::PL2);
     bm25_variant("bm25_dph", simeon::Bm25Variant::DPH);
     bm25_variant("bm25_dcm", simeon::Bm25Variant::Dcm);
+    // T5 — Atire BM25 with Fang-Zhai 2005 axiomatic LTD correction.
+    // Sweep α ∈ {0.3, 0.5, 0.7, 1.0}; α=1 is the byte-identity sanity row
+    // against bm25_atire, α=0.5 is Fang-Zhai's recommended midpoint, α=0.3
+    // / α=0.7 bracket it. See docs/ltd_results.md for the expected
+    // long-doc-corpus (FiQA) lift hypothesis.
+    auto ltd_variant = [&](const char* name, float alpha) {
+        simeon::Bm25Config cfg;
+        cfg.variant = simeon::Bm25Variant::AtireLTD;
+        cfg.ltd_alpha = alpha;
+        auto idx = build_bm25(fx, cfg);
+        run_bm25(name, fx, idx.idx, idx.build_us);
+    };
+    ltd_variant("bm25_atire_ltd_a1.0", 1.0f);
+    ltd_variant("bm25_atire_ltd_a0.7", 0.7f);
+    ltd_variant("bm25_atire_ltd_a0.5", 0.5f);
+    ltd_variant("bm25_atire_ltd_a0.3", 0.3f);
     auto sab_strict =
         bm25_variant("bm25_sab_strict", simeon::Bm25Variant::SubwordAwareBackoff, 1.0f, 0.0f);
     auto sab_smooth = bm25_variant("bm25_sab_smooth_gamma5",
@@ -1479,6 +3990,25 @@ int main(int argc, char** argv) {
     run_bm25_prf("bm25_atire_rm3_k10_a0.5", fx, bm25.idx, bm25.build_us, prf_canonical);
     run_bm25_prf("bm25_sab_smooth_rm3_k10_a0.5", fx, sab_smooth.idx, sab_smooth.build_us,
                  prf_canonical);
+
+    // T4 — fixed-K sweep + clarity-adaptive K (Bendersky-Metzler-Croft 2011).
+    // SAB-only (RM3 lift is dominantly a SAB-side phenomenon per sdm_results
+    // mechanism notes). The k10_a0.5 row above is N=20 by default and serves
+    // as the middle of the sweep. Fixed-N rows isolate the sweet spot;
+    // adaptive row tests whether per-query clarity beats any single fixed N.
+    auto prf_n = [&](std::uint32_t n) {
+        simeon::PrfConfig p = prf_canonical;
+        p.n_terms = n;
+        return p;
+    };
+    run_bm25_prf("bm25_sab_smooth_rm3_n10_a0.5", fx, sab_smooth.idx, sab_smooth.build_us,
+                 prf_n(10));
+    run_bm25_prf("bm25_sab_smooth_rm3_n30_a0.5", fx, sab_smooth.idx, sab_smooth.build_us,
+                 prf_n(30));
+    run_bm25_prf("bm25_sab_smooth_rm3_n50_a0.5", fx, sab_smooth.idx, sab_smooth.build_us,
+                 prf_n(50));
+    run_bm25_prf_adaptive("bm25_sab_smooth_rm3_adaptive_a0.5", fx, sab_smooth.idx,
+                          sab_smooth.build_us, prf_canonical);
 
     // Step 1l — SDM (Sequential Dependence Model, Metzler & Croft 2005).
     // Builds a separate Atire and SAB-smooth index with build_word_bigrams=true
@@ -1509,6 +4039,26 @@ int main(int argc, char** argv) {
                  sdm_default);
     run_bm25_sdm("bm25_atire_sdm_l0.90_0.05_0.05", fx, bm25_sdm_atire.idx, bm25_sdm_atire.build_us,
                  sdm_unigram_heavy);
+
+    // T3 — Weighted SDM sweep over β at canonical λ. β=0 sanity-checks
+    // byte-identity with sdm_default; β∈{0.5, 1.0, 1.5} brackets the
+    // Bendersky-Croft 2010 IDF-reweighting recipe. Run on both Atire and
+    // SAB-smooth so comparison is direct against the existing SDM rows.
+    auto wsdm = [&](float beta) {
+        simeon::WeightedSdmConfig w;
+        w.beta = beta;
+        return w;
+    };
+    run_bm25_wsdm("bm25_atire_wsdm_b0.0", fx, bm25_sdm_atire.idx, bm25_sdm_atire.build_us,
+                  wsdm(0.0f));
+    run_bm25_wsdm("bm25_atire_wsdm_b0.5", fx, bm25_sdm_atire.idx, bm25_sdm_atire.build_us,
+                  wsdm(0.5f));
+    run_bm25_wsdm("bm25_atire_wsdm_b1.0", fx, bm25_sdm_atire.idx, bm25_sdm_atire.build_us,
+                  wsdm(1.0f));
+    run_bm25_wsdm("bm25_atire_wsdm_b1.5", fx, bm25_sdm_atire.idx, bm25_sdm_atire.build_us,
+                  wsdm(1.5f));
+    run_bm25_wsdm("bm25_sab_smooth_wsdm_b1.0", fx, bm25_sdm_sab.idx, bm25_sdm_sab.build_us,
+                  wsdm(1.0f));
 
     // Step 1n — Latent Concept Model (Bendersky 2008). Corpus-PMI word-bigram
     // concept mining + PMI-weighted concept BM25 fused with the base variant.

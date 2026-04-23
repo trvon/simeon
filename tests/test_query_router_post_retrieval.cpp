@@ -5,8 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "simeon/bm25.hpp"
-#include "simeon/query_router.hpp"
+#include "simeon/retrieval.hpp"
 
 using simeon::Bm25Config;
 using simeon::Bm25Index;
@@ -36,7 +35,8 @@ Bm25Index build(Bm25Variant v) {
     Bm25Config cfg;
     cfg.variant = v;
     Bm25Index idx{cfg};
-    for (const auto& d : corpus()) idx.add_doc(d);
+    for (const auto& d : corpus())
+        idx.add_doc(d);
     idx.finalize();
     return idx;
 }
@@ -84,14 +84,16 @@ void test_pool_overlap_jaccard_identical_indexes_is_one() {
 }
 
 void test_pool_overlap_jaccard_disjoint_pools() {
-    Bm25Config cfg_a; cfg_a.variant = Bm25Variant::Atire;
+    Bm25Config cfg_a;
+    cfg_a.variant = Bm25Variant::Atire;
     Bm25Index a{cfg_a};
     a.add_doc("alpha");
     a.add_doc("beta");
     a.add_doc("gamma");
     a.finalize();
 
-    Bm25Config cfg_b; cfg_b.variant = Bm25Variant::Atire;
+    Bm25Config cfg_b;
+    cfg_b.variant = Bm25Variant::Atire;
     Bm25Index b{cfg_b};
     b.add_doc("delta");
     b.add_doc("epsilon");
@@ -133,10 +135,10 @@ void test_features_with_pool_is_deterministic() {
 void test_atire_max_pool_jaccard_blocks_when_pools_agree() {
     auto atire = build(Bm25Variant::Atire);
     RouterConfig cfg;
-    cfg.high_idf_threshold = 1.5f;  // make Atire reachable
-    cfg.atire_max_pool_jaccard = 0.5f;  // require pools to disagree
+    cfg.high_idf_threshold = 1.5f;     // make Atire reachable
+    cfg.atire_max_pool_jaccard = 0.5f; // require pools to disagree
     QueryRouter r(atire, cfg);
-    std::array<const Bm25Index*, 2> p2{&atire, &atire};  // identical → jaccard=1
+    std::array<const Bm25Index*, 2> p2{&atire, &atire}; // identical → jaccard=1
     auto f = r.features_with_pool("apoptosis", p2, 50);
     // Pools are identical so jaccard=1.0 > 0.5 → Atire route blocked.
     assert(f.pool_overlap_jaccard > 0.5f);
@@ -168,7 +170,7 @@ void test_atire_min_score_decay_blocks_when_pool_is_flat() {
 
 void test_default_router_unchanged_by_step1g_gates() {
     auto atire = build(Bm25Variant::Atire);
-    RouterConfig cfg;  // defaults: atire_max_pool_jaccard=1.0, atire_min_score_decay=0.0
+    RouterConfig cfg; // defaults: atire_max_pool_jaccard=1.0, atire_min_score_decay=0.0
     cfg.high_idf_threshold = 1.5f;
     QueryRouter r(atire, cfg);
     // Default gates are no-ops: post-retrieval defaults (jaccard=1, decay=0)
@@ -192,7 +194,7 @@ void test_features_with_pool_preserves_pre_retrieval_fields() {
     assert(f_pre.avg_term_chars == f_post.avg_term_chars);
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     test_no_pool_leaves_post_retrieval_at_defaults();

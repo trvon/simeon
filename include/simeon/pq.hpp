@@ -18,9 +18,9 @@ namespace simeon {
 // brute-force dense distance.
 
 struct PQConfig {
-    std::uint32_t dim = 0;   // input vector dimension; must be divisible by m
-    std::uint32_t m = 0;     // number of subquantizers
-    std::uint32_t k = 256;   // centroids per subquantizer; must be <= 256 (fits in a byte)
+    std::uint32_t dim = 0; // input vector dimension; must be divisible by m
+    std::uint32_t m = 0;   // number of subquantizers
+    std::uint32_t k = 256; // centroids per subquantizer; must be <= 256 (fits in a byte)
     std::uint64_t seed = 0xC0FFEE5EED5EEDC0ULL;
 };
 
@@ -38,7 +38,7 @@ public:
     std::uint32_t dim() const noexcept;
     std::uint32_t m() const noexcept;
     std::uint32_t k() const noexcept;
-    std::uint32_t dsub() const noexcept;  // dim / m
+    std::uint32_t dsub() const noexcept; // dim / m
 
     // Training-free init: centroids are deterministic Gaussian samples per
     // subspace (seeded by `cfg.seed`). Recall is lower than a trained PQ but
@@ -68,6 +68,13 @@ public:
     // Did training install non-default centroids? False if neither
     // init_random_gaussian() nor train() has been called.
     bool is_trained() const noexcept;
+
+    // Flat view over all codebooks as [m * k * dsub] floats.
+    std::span<const float> codebooks() const noexcept;
+
+    // Install externally persisted codebooks. The input must contain exactly
+    // m * k * dsub floats laid out identically to `codebooks()`.
+    void import_codebooks(std::span<const float> codebooks, bool trained = true);
 
 private:
     friend class PQQuery;
@@ -105,4 +112,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace simeon
+} // namespace simeon

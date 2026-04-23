@@ -12,18 +12,18 @@
 
 namespace simeon {
 
-// Latent Concept Model (Bendersky 2008, revisited 2024) — training-free
-// concept mining from corpus statistics. At finalize() time, we discover
-// word-bigram "concepts" whose pointwise mutual information (PMI) exceeds a
-// floor and whose total corpus frequency clears a minimum. At query time,
-// matched concepts in the query contribute a PMI-weighted BM25 term score
-// that is linearly blended with the base BM25 variant's score.
+// Experimental latent concept model (Bendersky 2008, revisited 2024) —
+// training-free concept mining from corpus statistics. At finalize() time, we
+// discover word-bigram "concepts" whose pointwise mutual information (PMI)
+// exceeds a floor and whose total corpus frequency clears a minimum. At query
+// time, matched concepts in the query contribute a PMI-weighted BM25 term
+// score that is linearly blended with the base BM25 variant's score.
 //
-// This is simeon's answer to FiQA's paraphrase gap (−0.147 vs MiniLM): a
-// training-free, corpus-statistic mechanism that rewards documents matching
-// high-coherence multi-word terms from the query (e.g. "time value of
-// money"). The concept index is deterministic and reproducible — given the
-// same corpus and config, mine_concepts() emits byte-identical output.
+// The implementation is deterministic and reproducible — given the same corpus
+// and config, mine_concepts() emits byte-identical output. But the current
+// BEIR-3 evaluation regressed across all three shipped corpora, so this
+// remains an explicit opt-in utility and is not wired into the default router
+// or retrieval recipes.
 //
 // Initial ship is bigrams-only. Trigrams are deferred to a follow-on step.
 
@@ -52,6 +52,8 @@ struct ConceptEntry {
     float pmi = 0.0f; // PMI in natural log units
     float idf = 0.0f; // log((N - df + 0.5) / (df + 0.5) + 1)
     std::uint64_t total_tf = 0;
+    std::uint64_t a_hash = 0;
+    std::uint64_t b_hash = 0;
     // Posting list (doc_id, per-doc tf) sorted by doc_id.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> docs;
 };

@@ -62,8 +62,8 @@ void test_idf_rare_beats_common() {
 void test_tf_saturation() {
     // BM25 with k1=1.2 saturates: doubling tf does NOT double the contribution.
     Bm25Index idx;
-    idx.add_doc("alpha");                          // tf=1
-    idx.add_doc("alpha alpha alpha alpha alpha");  // tf=5
+    idx.add_doc("alpha");                         // tf=1
+    idx.add_doc("alpha alpha alpha alpha alpha"); // tf=5
     idx.finalize();
 
     std::vector<float> s(2, 0.0f);
@@ -131,7 +131,54 @@ void test_add_after_finalize_throws() {
     assert(threw);
 }
 
-}  // namespace
+void test_bm25f_aux_weight_zero_recovers_plain_bm25() {
+    Bm25Index idx;
+    idx.add_doc("gene therapy reduced inflammation", "gene therapy breakthrough");
+    idx.add_doc("inflammation markers remained elevated", "biomarker update");
+    idx.finalize();
+
+    std::vector<float> plain(2, 0.0f), fused(2, 0.0f);
+    idx.score("gene therapy", plain);
+    idx.score_bm25f("gene therapy", fused, 1.0f, 0.0f);
+    assert(plain == fused);
+}
+
+void test_bm25f_aux_field_adds_signal() {
+    Bm25Index idx;
+    idx.add_doc("general overview of methods", "gene therapy breakthrough");
+    idx.add_doc("general overview of methods", "market outlook summary");
+    idx.finalize();
+
+    std::vector<float> s(2, 0.0f);
+    idx.score_bm25f("gene therapy", s, 0.0f, 1.0f);
+    assert(s[0] > 0.0f);
+    assert(s[1] == 0.0f);
+}
+
+void test_add_doc_without_aux_keeps_bm25f_safe() {
+    Bm25Index idx;
+    idx.add_doc("alpha beta gamma");
+    idx.finalize();
+
+    std::vector<float> plain(1, 0.0f), fused(1, 0.0f);
+    idx.score("alpha", plain);
+    idx.score_bm25f("alpha", fused, 1.0f, 1.0f);
+    assert(plain == fused);
+}
+
+void test_bm25f_accepts_distinct_aux_query_text() {
+    Bm25Index idx;
+    idx.add_doc("general overview", "ent7");
+    idx.add_doc("general overview", "");
+    idx.finalize();
+
+    std::vector<float> s(2, 0.0f);
+    idx.score_bm25f("missing body term", "ent7", s, 0.0f, 1.0f);
+    assert(s[0] > 0.0f);
+    assert(s[1] == 0.0f);
+}
+
+} // namespace
 
 int main() {
     test_empty_index_score_throws();
@@ -142,5 +189,9 @@ int main() {
     test_unknown_term_zero();
     test_score_size_mismatch_throws();
     test_add_after_finalize_throws();
+    test_bm25f_aux_weight_zero_recovers_plain_bm25();
+    test_bm25f_aux_field_adds_signal();
+    test_add_doc_without_aux_keeps_bm25f_safe();
+    test_bm25f_accepts_distinct_aux_query_text();
     return 0;
 }

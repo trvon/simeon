@@ -208,7 +208,7 @@ on scifact at all — every Pass B row scores 0.640 nDCG@10 with the same
 default thresholds because the route mix doesn't change.
 
 For corpora other than scifact, repeat the sweep on a held-out dev fold
-before reporting test numbers, per the workflow in [build.md](build.md).
+before reporting test numbers, per the workflow in [build.md](../build.md).
 
 ### Step 1f tuning result (negative)
 

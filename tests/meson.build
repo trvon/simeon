@@ -27,6 +27,7 @@ simeon_tests = {
   'test_concept_mining': 'test_concept_mining.cpp',
   'test_aho_corasick': 'test_aho_corasick.cpp',
   'test_text_rank': 'test_text_rank.cpp',
+  'test_persistent_homology': 'test_persistent_homology.cpp',
 }
 
 foreach name, src : simeon_tests

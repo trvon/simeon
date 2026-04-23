@@ -10,7 +10,7 @@
 namespace simeon {
 
 // Router config. Defaults are scifact-tuned; override per corpus by sweeping
-// on a held-out fold (see docs/router_design.md).
+// on a held-out fold (see docs/research/router_design.md).
 struct RouterConfig {
     // (>) → Bm25SabSmooth. Even one OOV term in the query justifies the
     // SAB n-gram backoff path.
@@ -99,6 +99,21 @@ struct QueryFeatures {
     // Atire pool-Jaccard gate a no-op when post-retrieval signals are absent.
     float pool_overlap_jaccard = 1.0f;
 
+    // T1 — Normalized Query Commitment (Shtok, Kurland, Carmel 2012, TOIS):
+    //   NQC = σ(S_top_K) / μ(S_corpus)
+    // where σ is population stddev of top-K pool-0 BM25 scores and μ is the
+    // mean over all corpus scores. Commitment of the top-K as a fraction of
+    // the collection baseline; higher = more committed / easier query. 0 when
+    // pool empty or μ ≤ 0. Filled only by features_with_pool().
+    float nqc = 0.0f;
+    // T2 — Full Weighted Information Gain (Zhou & Croft 2007, SIGIR §3.2),
+    // BM25-adapted form:
+    //   WIG = (μ(S_top_K) - μ(S_corpus)) / sqrt(|Q|)
+    // Per-term information gain of top-K over collection baseline, normalized
+    // by query length. Distinct from score_decay_rate ("WIG-lite") which only
+    // measures intra-top decay. Filled only by features_with_pool().
+    float wig_full = 0.0f;
+
     // Step 1k B2 pre-retrieval predictors. Computed in features() from
     // collection statistics (total_tf, total_tokens) — no first-pass scoring
     // required, keeping them cheap.
@@ -144,4 +159,4 @@ private:
 
 const char* recipe_name(Recipe r) noexcept;
 
-}  // namespace simeon
+} // namespace simeon

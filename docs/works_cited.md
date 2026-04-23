@@ -37,6 +37,6 @@ understanding the library's design or citing its evaluation context.
 
 - Cite **the software** with [`CITATION.cff`](../CITATION.cff).
 - Cite **the benchmark tables and negative findings** with
-  [benchmarks.md](benchmarks.md), [router_design.md](router_design.md), and
-  [pmi_projection.md](pmi_projection.md).
+  [docs/research/benchmarks.md](research/benchmarks.md), [docs/research/router_design.md](research/router_design.md), and
+  [docs/research/pmi_projection.md](research/pmi_projection.md).
 - Cite the **upstream papers above** when discussing the underlying prior work.

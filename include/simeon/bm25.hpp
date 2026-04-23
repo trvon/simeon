@@ -50,6 +50,16 @@ enum class Bm25Variant : std::uint8_t {
     // df(t)=0; γ=0 recovers the strict OOV-fallback variant. Roughly
     // doubles index size and finalize time.
     SubwordAwareBackoff,
+    // Atire BM25 with Fang-Zhai 2005 axiomatic Length Term-Discrimination
+    // (LTD) correction. Replaces BM25's linear length normalization
+    //     L(dl) = 1 - b + b · (dl/avg_dl)
+    // with a sublinear power form
+    //     L(dl) = 1 - b + b · (dl/avg_dl)^α
+    // where α ∈ (0, 1] is `Bm25Config::ltd_alpha`. α=1 recovers Atire
+    // byte-identically; α<1 reduces the long-doc penalty (BM25's b
+    // overpenalizes long docs that legitimately satisfy LTD). Default
+    // α=0.5 per Fang-Zhai's recommended midpoint.
+    AtireLTD,
 };
 
 struct Bm25Config {
@@ -76,6 +86,10 @@ struct Bm25Config {
     // Free parameter c for PL2. Terrier default is 1.0. Ignored by other
     // variants.
     float pl2_c = 1.0f;
+    // Length-norm exponent α ∈ (0, 1] for AtireLTD. α=1 recovers Atire
+    // byte-identically; α=0.5 is Fang-Zhai 2005's recommended midpoint
+    // for LTD compliance on long-doc corpora. Ignored by other variants.
+    float ltd_alpha = 0.5f;
     // Step 1l: opt-in parallel word-bigram postings for SDM (Metzler & Croft
     // 2005). When true, finalize() builds ordered and unordered bigram
     // indexes so score_sdm() can run. Cost is ~30% extra index size and
@@ -101,6 +115,33 @@ struct SdmConfig {
     float lambda_unordered = 0.05f;
 };
 
+// Weighted SDM (Bendersky & Croft 2010, "Learning Concept Importance Using
+// a Weighted Dependence Model"). Replaces fixed λ_o / λ_uw with per-bigram
+// weights derived from the bigram's discriminative power, scaled so the
+// query-mean equals the corresponding fixed λ — the recipe is byte-
+// identical to fixed SDM on a single-bigram query but rewards rare /
+// discriminative bigrams over common ones on multi-term queries.
+//
+// Per Bendersky-Croft §4: full WSDM combines linear-regressed
+// per-feature weights over {tf_collection, df, length-norm, plus external
+// resources}; the training-free reduction kept here uses bigram IDF as the
+// single feature, which §6.4 reports captures most of the gain on TREC
+// corpora when the regression weights are unavailable.
+//
+// Per-bigram weight (BigramIdfNorm strategy):
+//   λ_b = λ_base * (idf_b / mean_query_bigram_idf)^β
+// where β controls how aggressively rare bigrams are upweighted (β=0
+// recovers fixed SDM; β=1 is canonical Bendersky-Croft IDF reweighting).
+struct WeightedSdmConfig {
+    // Same defaults as fixed SDM so WSDM(β=0) = SDM(0.85, 0.10, 0.05).
+    float lambda_unigram = 0.85f;
+    float lambda_ordered = 0.10f;
+    float lambda_unordered = 0.05f;
+    // Bendersky-Croft canonical IDF-normalization exponent. β=0 disables
+    // weighting (recovers fixed-λ SDM); β=1 is the published recipe.
+    float beta = 1.0f;
+};
+
 // Streaming BM25 index over word tokens. Tokenization reuses the simeon
 // tokenizer with `emit_word=true, emit_char=false` so term boundaries match
 // other simeon components when the same text is processed by both.
@@ -112,8 +153,20 @@ public:
     explicit Bm25Index(Bm25Config cfg = {}) noexcept;
 
     void add_doc(std::string_view text);
+    // Optional second field for BM25F-style scoring. This is an opt-in utility:
+    // the default router and shipped production rows remain body-only unless the
+    // caller explicitly uses score_bm25f().
+    void add_doc(std::string_view text, std::string_view aux_text);
     void finalize();
     void score(std::string_view query, std::span<float> out_scores) const;
+    // Opt-in multi-field scoring path. `weight_aux = 0` recovers body-only
+    // BM25. Useful for explicit auxiliary fields, but not part of the default
+    // routed retrieval path.
+    void score_bm25f(std::string_view query, std::span<float> out_scores, float weight_body = 1.0f,
+                     float weight_aux = 0.0f) const;
+    void score_bm25f(std::string_view body_query, std::string_view aux_query,
+                     std::span<float> out_scores, float weight_body = 1.0f,
+                     float weight_aux = 0.0f) const;
 
     std::uint32_t doc_count() const noexcept {
         return static_cast<std::uint32_t>(doc_lengths_.size());
@@ -178,8 +231,21 @@ public:
     // zero and score_sdm() degenerates to λ_u · score(). Throws if the
     // index is not finalized. Bigram legs always use Atire-style BM25
     // (k1/b from cfg_); the unigram leg uses the configured variant.
+    //
+    // This is an opt-in enrichment path. The benchmark fixtures showed it can
+    // help some corpora modestly, but it is not part of the default routed
+    // retrieval recipe.
     void score_sdm(std::string_view query, std::span<float> out_scores,
                    const SdmConfig& cfg = {}) const;
+
+    // Weighted SDM (Bendersky & Croft 2010): same three-leg structure as
+    // score_sdm() but per-bigram λ scales with the bigram's IDF, normalized
+    // so the query-mean weight equals the fixed-λ baseline. Reduces to
+    // score_sdm() when cfg.beta == 0. Same finalize() / build_word_bigrams
+    // requirements as score_sdm(). Experimental / opt-in: the current
+    // benchmark evidence did not justify routing this by default.
+    void score_wsdm(std::string_view query, std::span<float> out_scores,
+                    const WeightedSdmConfig& cfg = {}) const;
 
     // Combine two 64-bit term hashes into a stable 64-bit bigram hash using
     // splitmix64_mix. Ordered: pass (a, b) as-is. Unordered: canonicalize
@@ -208,11 +274,23 @@ private:
     float alpha_sum_ = 0.0f;
     bool finalized_ = false;
 
+    // Optional auxiliary text field for BM25F-style linear field fusion.
+    // Indexed in parallel with the body so doc ids stay aligned; callers that
+    // only use add_doc(text) get an all-empty aux field.
+    std::vector<std::uint32_t> aux_doc_lengths_;
+    FlatHashMapU64<TermPostings> aux_postings_;
+    float aux_avg_dl_ = 0.0f;
+    std::uint64_t aux_total_tokens_ = 0;
+    float aux_alpha_sum_ = 0.0f;
+
     // SubwordAwareBackoff secondary index: char n-gram postings over the
     // same docs. Only populated when cfg_.variant == SubwordAwareBackoff.
     std::vector<std::uint32_t> ngram_doc_lengths_;
     FlatHashMapU64<TermPostings> ngram_postings_;
     float ngram_avg_dl_ = 0.0f;
+    std::vector<std::uint32_t> aux_ngram_doc_lengths_;
+    FlatHashMapU64<TermPostings> aux_ngram_postings_;
+    float aux_ngram_avg_dl_ = 0.0f;
 
     // Step 1l word-bigram secondary indexes. Only populated when
     // cfg_.build_word_bigrams == true. Scored by Atire BM25 using the word

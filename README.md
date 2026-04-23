@@ -28,9 +28,10 @@ The whole pipeline is deterministic, seeded, and byte-identical across architect
 - **Three projection heads** — Achlioptas sparse, very-sparse (Li 2006), dense Gaussian
 - **Matryoshka-style nested output** — one projection, queryable at any prefix width with `1/sqrt(1 + r/decay)` row weights (training-free analog of Kusupati et al. 2022)
 - **Product Quantization + ADC** — 8–192× index compression with near-baseline R@10 (Jégou, Douze, Schmid 2010)
-- **BM25 index + RRF fusion + cascade rerank helpers** — pure-lexical first stage and reciprocal-rank fusion primitives, so simeon can plug into hybrid retrieval pipelines without an external IR library
+- **Stable retrieval core** via [`<simeon/retrieval.hpp>`](include/simeon/retrieval.hpp) — BM25 variants, fusion helpers, and the query router that backs the shipped sparse/cascade recipes
 - **5 BM25 variants** including the novel **SubwordAwareBackoff** (training-free morphological backoff via a parallel char-n-gram inverted index)
 - **Per-query router** picks among `Bm25Atire` / `Bm25SabSmooth` / `CascadeLinearAlpha` from cheap pre-retrieval predictors (Carmel & Yom-Tov 2010 family) — matches MiniLM-L6 nDCG@10 on BEIR scifact, training-free, no GPU
+- **Opt-in retrieval extensions** — BM25F auxiliary fields, SDM/WSDM, RM3, and concept mining remain available, but they are corpus-sensitive and not part of the default routed path
 - **Densified MinHash head** (Shrivastava 2017) for Jaccard-space three-way fusion on duplicate-heavy corpora
 - **BPE-lite subword tokenizer** with caller-supplied merges (no built-in vocab; deterministic across runs)
 - **Three hash families** — SplitMix64, XXH64 (canonical), CRC32C (hardware on x86 SSE4.2 / aarch64 +crc, slice-by-1 fallback), plus Mixed Tabulation (Houen & Thorup 2023, sparse-JL with practical hashing)
@@ -55,9 +56,9 @@ simeon is best read as an engineering and evaluation layer over several lines of
 | Topic              | File                                                  |
 |--------------------|-------------------------------------------------------|
 | Build              | [docs/build.md](docs/build.md)                        |
-| Benchmarks         | [docs/benchmarks.md](docs/benchmarks.md)              |
-| Research notes     | [docs/research.md](docs/research.md)                  |
-| Research saturation | [docs/training_free_saturation.md](docs/training_free_saturation.md) |
+| Benchmarks         | [docs/research/benchmarks.md](docs/research/benchmarks.md)              |
+| Research notes     | [docs/research/index.md](docs/research/index.md)                  |
+| Research saturation | [docs/research/training_free_saturation.md](docs/research/training_free_saturation.md) |
 | Works cited        | [docs/works_cited.md](docs/works_cited.md)            |
 | Reference fixture  | [docs/reference_fixture.md](docs/reference_fixture.md)|
 | Headers            | [include/simeon/](include/simeon/)                    |
@@ -120,12 +121,14 @@ float score = q.inner_product(codes.data() + i * pcfg.m);  // O(m) per db code
 
 ## Status
 
-Stable: tokenizer, hasher, three projection heads, L2 normalization, NEON + AVX2 + scalar dispatch, matryoshka, Product Quantization + ADC. Defaults and the public surface may still change.
+Stable: tokenizer, hasher, three projection heads, L2 normalization, NEON + AVX2 + scalar dispatch, matryoshka, Product Quantization + ADC, and the retrieval core in [`<simeon/retrieval.hpp>`](include/simeon/retrieval.hpp) (BM25 variants + fusion + query router).
+
+Opt-in / corpus-sensitive: BM25F auxiliary fields, SDM/WSDM, RM3, concept mining, and the other research surfaces documented under [docs/research/](docs/research/). Defaults and the public surface may still change.
 
 ## Citation
 
 If you use simeon in research or benchmarks, cite the software via
-[CITATION.cff](CITATION.cff), use [docs/research.md](docs/research.md) for
+[CITATION.cff](CITATION.cff), use [docs/research/index.md](docs/research/index.md) for
 claim-to-document mapping, and use [docs/works_cited.md](docs/works_cited.md)
 when you need the underlying prior-work list.
 
