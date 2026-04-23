@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -10,22 +11,20 @@ namespace simeon {
 
 // Open-addressing hash map specialized for uint64 keys. Used by Bm25Index
 // for the insert-heavy postings maps where std::unordered_map dominated
-// build time (~27% of total wall time in the SAB-smooth profile audit).
+// build time and memory.
 //
 // Design choices:
 //   - Identity hash. Keys come from hash64() which produces high-entropy
 //     uint64_t values; re-hashing would waste cycles.
-//   - Linear probing with power-of-two capacity so bucket index is
-//     key & mask_.
-//   - Parallel occupancy vector (uint8_t per slot) to distinguish empty
-//     from "occupied with default V" without reserving a key sentinel.
+//   - Linear probing with power-of-two capacity so bucket index is key & mask_.
+//   - Parallel occupancy + key arrays for the slot directory.
+//   - Dense entries array that stores actual (key, value) pairs only for
+//     occupied buckets. This avoids paying for a full V in every empty slot.
 //   - Insert-only API. No erase(). Bm25Index never removes postings.
-//   - Stored value_type is std::pair<std::uint64_t, V> (AoS) so iterators
-//     can return real references and structured bindings work the same
-//     way they did against std::unordered_map.
 template <class V> class FlatHashMapU64 {
     static constexpr std::size_t kDefaultCapacity = 16;
     static constexpr double kMaxLoadFactor = 0.70;
+    static constexpr std::uint32_t kEmptyEntry = std::numeric_limits<std::uint32_t>::max();
 
 public:
     using key_type = std::uint64_t;
@@ -34,9 +33,9 @@ public:
 
     FlatHashMapU64() = default;
 
-    std::size_t size() const noexcept { return size_; }
-    bool empty() const noexcept { return size_ == 0; }
-    std::size_t capacity() const noexcept { return slots_.size(); }
+    std::size_t size() const noexcept { return entries_.size(); }
+    bool empty() const noexcept { return entries_.empty(); }
+    std::size_t capacity() const noexcept { return keys_.size(); }
 
     class iterator {
     public:
@@ -49,8 +48,8 @@ public:
         iterator() = default;
         iterator(FlatHashMapU64* m, std::size_t idx) noexcept : m_(m), idx_(idx) { advance(); }
 
-        reference operator*() const noexcept { return m_->slots_[idx_]; }
-        pointer operator->() const noexcept { return &m_->slots_[idx_]; }
+        reference operator*() const noexcept { return m_->entries_[m_->entry_indices_[idx_]]; }
+        pointer operator->() const noexcept { return &m_->entries_[m_->entry_indices_[idx_]]; }
         iterator& operator++() noexcept {
             ++idx_;
             advance();
@@ -82,8 +81,8 @@ public:
             advance();
         }
 
-        reference operator*() const noexcept { return m_->slots_[idx_]; }
-        pointer operator->() const noexcept { return &m_->slots_[idx_]; }
+        reference operator*() const noexcept { return m_->entries_[m_->entry_indices_[idx_]]; }
+        pointer operator->() const noexcept { return &m_->entries_[m_->entry_indices_[idx_]]; }
         const_iterator& operator++() noexcept {
             ++idx_;
             advance();
@@ -114,7 +113,7 @@ public:
             return end();
         std::size_t idx = key & mask_;
         while (occupied_[idx]) {
-            if (slots_[idx].first == key)
+            if (keys_[idx] == key)
                 return iterator(this, idx);
             idx = (idx + 1) & mask_;
         }
@@ -126,7 +125,7 @@ public:
             return end();
         std::size_t idx = key & mask_;
         while (occupied_[idx]) {
-            if (slots_[idx].first == key)
+            if (keys_[idx] == key)
                 return const_iterator(this, idx);
             idx = (idx + 1) & mask_;
         }
@@ -136,56 +135,85 @@ public:
     V& operator[](std::uint64_t key) {
         if (capacity() == 0)
             rehash(kDefaultCapacity);
-        else if (static_cast<double>(size_ + 1) > kMaxLoadFactor * static_cast<double>(capacity()))
+        else if (static_cast<double>(size() + 1) > kMaxLoadFactor * static_cast<double>(capacity()))
             rehash(capacity() * 2);
 
         std::size_t idx = key & mask_;
         while (occupied_[idx]) {
-            if (slots_[idx].first == key)
-                return slots_[idx].second;
+            if (keys_[idx] == key)
+                return entries_[entry_indices_[idx]].second;
             idx = (idx + 1) & mask_;
         }
+
         occupied_[idx] = 1;
-        slots_[idx].first = key;
-        slots_[idx].second = V{};
-        ++size_;
-        return slots_[idx].second;
+        keys_[idx] = key;
+        entry_indices_[idx] = static_cast<std::uint32_t>(entries_.size());
+        entries_.emplace_back(key, V{});
+        return entries_.back().second;
     }
 
     void reserve(std::size_t n) {
         std::size_t target = 1;
         while (static_cast<double>(n) > kMaxLoadFactor * static_cast<double>(target))
             target <<= 1;
+        entries_.reserve(n);
         if (target > capacity())
             rehash(target);
     }
 
+    void shrink_to_fit() {
+        if (entries_.empty()) {
+            entries_.clear();
+            entries_.shrink_to_fit();
+            keys_.clear();
+            keys_.shrink_to_fit();
+            entry_indices_.clear();
+            entry_indices_.shrink_to_fit();
+            occupied_.clear();
+            occupied_.shrink_to_fit();
+            mask_ = 0;
+            return;
+        }
+
+        std::size_t target = kDefaultCapacity;
+        while (static_cast<double>(entries_.size()) >
+               kMaxLoadFactor * static_cast<double>(target)) {
+            target <<= 1;
+        }
+
+        entries_.shrink_to_fit();
+        if (target != capacity()) {
+            rehash(target);
+        }
+        keys_.shrink_to_fit();
+        entry_indices_.shrink_to_fit();
+        occupied_.shrink_to_fit();
+    }
+
 private:
     void rehash(std::size_t new_cap) {
-        // new_cap must be a power of two.
-        std::vector<value_type> old_slots = std::move(slots_);
-        std::vector<std::uint8_t> old_occ = std::move(occupied_);
-        slots_ = std::vector<value_type>(new_cap);
+        keys_.assign(new_cap, 0);
         occupied_.assign(new_cap, 0);
+        entry_indices_.assign(new_cap, kEmptyEntry);
         mask_ = new_cap - 1;
-        size_ = 0;
-        for (std::size_t i = 0; i < old_slots.size(); ++i) {
-            if (!old_occ[i])
-                continue;
-            std::uint64_t k = old_slots[i].first;
-            std::size_t idx = k & mask_;
+
+        for (std::uint32_t entry_idx = 0; entry_idx < static_cast<std::uint32_t>(entries_.size());
+             ++entry_idx) {
+            const auto& entry = entries_[entry_idx];
+            const std::uint64_t key = entry.first;
+            std::size_t idx = key & mask_;
             while (occupied_[idx])
                 idx = (idx + 1) & mask_;
             occupied_[idx] = 1;
-            slots_[idx].first = k;
-            slots_[idx].second = std::move(old_slots[i].second);
-            ++size_;
+            keys_[idx] = key;
+            entry_indices_[idx] = entry_idx;
         }
     }
 
-    std::vector<value_type> slots_;
+    std::vector<value_type> entries_;
+    std::vector<key_type> keys_;
+    std::vector<std::uint32_t> entry_indices_;
     std::vector<std::uint8_t> occupied_;
-    std::size_t size_ = 0;
     std::size_t mask_ = 0;
 };
 

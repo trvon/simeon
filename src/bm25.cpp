@@ -348,6 +348,7 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
         for (const auto& [h, c] : tf)
             dl += c;
         lengths.push_back(dl);
+        postings.reserve(postings.size() + tf.size());
         for (const auto& [h, c] : tf) {
             postings[h].docs.emplace_back(did, c);
         }
@@ -368,6 +369,7 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
         for (const auto& [h, c] : ngram_tf)
             ngram_dl += c;
         lengths.push_back(ngram_dl);
+        postings.reserve(postings.size() + ngram_tf.size());
         for (const auto& [h, c] : ngram_tf) {
             postings[h].docs.emplace_back(did, c);
         }
@@ -404,6 +406,7 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
         for (std::size_t i = 1; i < ordered_words.size(); ++i) {
             ++ord_bgm_tf[hash_bigram(ordered_words[i - 1], ordered_words[i])];
         }
+        ordered_bigram_postings_.reserve(ordered_bigram_postings_.size() + ord_bgm_tf.size());
         for (const auto& [h, c] : ord_bgm_tf) {
             ordered_bigram_postings_[h].docs.emplace_back(did, c);
         }
@@ -426,6 +429,7 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
                 }
             }
         }
+        unordered_bigram_postings_.reserve(unordered_bigram_postings_.size() + unord_bgm_tf.size());
         for (const auto& [h, c] : unord_bgm_tf) {
             unordered_bigram_postings_[h].docs.emplace_back(did, c);
         }
@@ -457,7 +461,9 @@ void Bm25Index::finalize() {
             for (const auto& [_did, dtf] : tp.docs)
                 ttf += dtf;
             tp.total_tf = ttf;
+            tp.docs.shrink_to_fit();
         }
+        postings.shrink_to_fit();
     };
 
     auto finalize_ngram_field = [&](const std::vector<std::uint32_t>& lengths,
@@ -479,7 +485,9 @@ void Bm25Index::finalize() {
             for (const auto& [_did, dtf] : tp.docs)
                 ttf += dtf;
             tp.total_tf = ttf;
+            tp.docs.shrink_to_fit();
         }
+        postings.shrink_to_fit();
     };
 
     finalize_word_field(doc_lengths_, postings_, avg_dl_, total_tokens_, alpha_sum_);
@@ -501,7 +509,9 @@ void Bm25Index::finalize() {
                 for (const auto& [_did, dtf] : tp.docs)
                     ttf += dtf;
                 tp.total_tf = ttf;
+                tp.docs.shrink_to_fit();
             }
+            table->shrink_to_fit();
         }
     }
     finalized_ = true;
