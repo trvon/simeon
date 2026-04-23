@@ -51,6 +51,11 @@ struct PhssConfig {
         // suggesting a natural cluster boundary.
         LargestGap,
 
+        // Cheap approximation of LargestGap using the raw pairwise similarity
+        // distribution rather than the 0D persistence deaths. This avoids the
+        // edge sort + union-find pass and is meant as a latency-oriented proxy.
+        LargestGapApprox,
+
         // The death similarity of the most persistent pair.
         // This selects the scale where the strongest cluster survives.
         MaxPersistence,

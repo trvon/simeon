@@ -35,6 +35,12 @@ profile_sab_exe = executable('simeon_profile_sab_smooth',
   install: false,
 )
 
+profile_fragment_geometry_exe = executable('simeon_profile_fragment_geometry',
+  'profile_fragment_geometry.cpp',
+  dependencies: simeon_dep,
+  install: false,
+)
+
 aho_corasick_exe = executable('simeon_aho_corasick_bench',
   'aho_corasick_bench.cpp',
   dependencies: simeon_dep,

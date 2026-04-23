@@ -48,6 +48,11 @@ void test_three_point_line() {
     // Gap-based scale should be the midpoint between 0.5 and 0.9
     assert(std::fabs(r.selected_scale - 0.7f) < 1e-4f);
 
+    cfg.criterion = PhssConfig::Criterion::LargestGapApprox;
+    r = phss_select_scale(tri, n, cfg);
+    assert(r.selected_scale > 0.0f);
+    assert(std::fabs(r.selected_scale - 0.7f) < 1e-4f);
+
     cfg.criterion = PhssConfig::Criterion::MaxPersistence;
     r = phss_select_scale(tri, n, cfg);
     assert(r.selected_scale > 0.0f);
@@ -135,6 +140,12 @@ void test_two_clusters() {
     assert(r.selected_scale > 0.3f);
     assert(r.selected_scale < 0.95f);
     // Should be midpoint of the big gap
+    assert(std::fabs(r.selected_scale - 0.625f) < 1e-4f);
+
+    cfg.criterion = PhssConfig::Criterion::LargestGapApprox;
+    r = phss_select_scale(tri, n, cfg);
+    assert(r.selected_scale > 0.3f);
+    assert(r.selected_scale < 0.95f);
     assert(std::fabs(r.selected_scale - 0.625f) < 1e-4f);
 }
 

@@ -90,6 +90,32 @@ struct FragmentGeometryConfig {
     // replacing the fixed top-k selection. Default true (data-driven).
     bool use_phss = true;
     PhssConfig phss_config{};
+
+    // Query-adaptive PHSS: if enabled, use PHSS only when the geometry-side
+    // query confidence clears the threshold; otherwise fall back to fixed-kNN.
+    bool phss_adaptive = false;
+    float phss_confidence_threshold = 0.55f;
+};
+
+struct FragmentGeometryProfile {
+    double total_us = 0.0;
+    double bm25_us = 0.0;
+    double query_encode_us = 0.0;
+    double gather_us = 0.0;
+    double whiten_us = 0.0;
+    double phss_pairwise_us = 0.0;
+    double phss_select_us = 0.0;
+    double query_attention_us = 0.0;
+    double adjacency_us = 0.0;
+    double diffuse_us = 0.0;
+    double blend_us = 0.0;
+    std::uint32_t pool_docs = 0;
+    std::uint32_t pool_fragments = 0;
+    std::uint64_t graph_edges = 0;
+    bool phss_enabled = false;
+    bool phss_used = false;
+    float phss_selected_scale = 0.0f;
+    float query_confidence = 0.0f;
 };
 
 // ---------------------------------------------------------------------------
@@ -149,5 +175,11 @@ std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Ind
                                            const Encoder& enc,
                                            std::span<const std::vector<SemanticFragment>> doc_frags,
                                            const FragmentGeometryConfig& cfg);
+
+std::vector<float>
+score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, const Encoder& enc,
+                                 std::span<const std::vector<SemanticFragment>> doc_frags,
+                                 const FragmentGeometryConfig& cfg,
+                                 FragmentGeometryProfile* profile);
 
 } // namespace simeon

@@ -65,6 +65,38 @@ Two fragment sets were tested:
 3. **NFCorpus remains the tradeoff.** The persistence-selected threshold is slightly too conservative there.
 4. **Latency is the cost.** PHSS pays the expected O(N^2) similarity cost and is consistently slower than fixed `knn`.
 
+## Follow-up Rows
+
+Two follow-up branches were tested after the initial PHSS pass:
+
+- **adaptive PHSS**: run PHSS only on higher-confidence queries and fall back to fixed `knn` otherwise;
+- **richmmr + PHSS**: combine the best upside-seeking fragment selector with PHSS graph construction.
+
+Headline results:
+
+- **Scifact:** `richcov + adaptive PHSS` reaches `0.6176`, which is better than fixed `richcov` (`0.6161`) but still below `phss_gap` on the basic builder (`0.6188`).
+- **NFCorpus:** `basic + adaptive PHSS` reaches `0.2560`, improving over both fixed basic geometry (`0.2548`) and full basic PHSS (`0.2531`), but still below the best `richmmr` row (`0.2585`).
+- **FiQA:** `richmmr + PHSS` improves over fixed `richmmr` safety but does not beat `richcov + phss_gap`; the best follow-up row is `richmmr l0.50 + PHSS` at `0.2084`, still below `richcov + phss_gap` at `0.2089`.
+
+Verdict: the follow-up rows do not replace the current frontier. Adaptive PHSS is a useful latency/quality knob, especially on NFCorpus, but `LargestGap` remains the strongest fully-on PHSS row. `richmmr + PHSS` does not beat either `richmmr` on NFCorpus or `richcov + PHSS` on FiQA.
+
+## Profiling
+
+The new `simeon_profile_fragment_geometry` harness shows the main PHSS cost clearly on scifact:
+
+- **basic fixed**: `1.88 ms/query`
+- **basic PHSS**: `6.55 ms/query`
+- **basic adaptive PHSS**: `3.62 ms/query`
+
+Within the PHSS query path, the dominant cost is **scale selection itself**, not diffusion:
+
+- `phss_pairwise`: ~`0.56 ms/query`
+- `phss_select`: ~`4.38 ms/query`
+- adjacency build: ~`1.17 ms/query`
+- diffusion: ~`0.001 ms/query`
+
+After removing unnecessary persistence-point materialization from non-diagram PHSS runs, the scorer is still dominated by `phss_select_scale`, which is now the main optimization target.
+
 ## Implications
 
 PHSS is a real control surface for fragment geometry:

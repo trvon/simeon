@@ -64,6 +64,37 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
     if (n == 0)
         return result;
 
+    if (cfg.criterion == PhssConfig::Criterion::LargestGapApprox) {
+        std::vector<float> sims;
+        sims.reserve(similarities.size());
+        for (float s : similarities) {
+            if (cfg.threshold <= 0.0f || s >= cfg.threshold)
+                sims.push_back(s);
+        }
+        result.n_edges = static_cast<std::uint32_t>(sims.size());
+        if (sims.empty()) {
+            result.selected_scale = 0.0f;
+            return result;
+        }
+        std::sort(sims.begin(), sims.end());
+        result.n_pairs = static_cast<std::uint32_t>(sims.size());
+        if (sims.size() < 2) {
+            result.selected_scale = sims[0];
+            return result;
+        }
+        float max_gap = -1.0f;
+        std::size_t best_idx = 0;
+        for (std::size_t i = 0; i + 1 < sims.size(); ++i) {
+            const float gap = sims[i + 1] - sims[i];
+            if (gap > max_gap) {
+                max_gap = gap;
+                best_idx = i;
+            }
+        }
+        result.selected_scale = (sims[best_idx] + sims[best_idx + 1]) * 0.5f;
+        return result;
+    }
+
     const UpperTriangular sim{similarities, n};
 
     // Build edge list: all pairs (i < j) with similarity > threshold
@@ -107,9 +138,11 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
         PersistencePair0D pair;
         pair.birth = births[dying];
         pair.death = e.sim;
-        for (std::uint32_t p = 0; p < n; ++p) {
-            if (uf.find(p) == dying)
-                pair.points.push_back(p);
+        if (cfg.output_diagram) {
+            for (std::uint32_t p = 0; p < n; ++p) {
+                if (uf.find(p) == dying)
+                    pair.points.push_back(p);
+            }
         }
         diagram.push_back(std::move(pair));
 
@@ -122,9 +155,11 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
             PersistencePair0D pair;
             pair.birth = births[i];
             pair.death = std::numeric_limits<float>::infinity();
-            for (std::uint32_t p = 0; p < n; ++p) {
-                if (uf.find(p) == i)
-                    pair.points.push_back(p);
+            if (cfg.output_diagram) {
+                for (std::uint32_t p = 0; p < n; ++p) {
+                    if (uf.find(p) == i)
+                        pair.points.push_back(p);
+                }
             }
             diagram.push_back(std::move(pair));
         }
@@ -178,6 +213,8 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
             result.selected_scale = (deaths[best_idx] + deaths[best_idx + 1]) * 0.5f;
             break;
         }
+        case PhssConfig::Criterion::LargestGapApprox:
+            break;
         case PhssConfig::Criterion::MaxPersistence: {
             float max_persistence = -1.0f;
             float best_death = 0.0f;

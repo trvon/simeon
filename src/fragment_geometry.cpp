@@ -1,6 +1,7 @@
 #include "simeon/fragment_geometry.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -18,6 +19,12 @@
 namespace simeon {
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double elapsed_us(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<double, std::micro>(end - start).count();
+}
 
 // ---------------------------------------------------------------------------
 // Stopwords
@@ -212,13 +219,6 @@ float weighted_overlap_coeff(const SparseSignature& a, const SparseSignature& b)
         return 0.0f;
     const float inter = weighted_intersection(a, b);
     return inter / std::max(1e-6f, std::min(a.weight_sum, b.weight_sum));
-}
-
-float weighted_containment(const SparseSignature& subset, const SparseSignature& superset) {
-    if (subset.weight_sum <= 0.0f)
-        return 0.0f;
-    const float inter = weighted_intersection(subset, superset);
-    return inter / std::max(1e-6f, subset.weight_sum);
 }
 
 void merge_signature_max(SparseSignature& dst, const SparseSignature& src,
@@ -543,6 +543,18 @@ std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Ind
                                            const Encoder& enc,
                                            std::span<const std::vector<SemanticFragment>> doc_frags,
                                            const FragmentGeometryConfig& cfg) {
+    return score_fragment_geometry_profiled(query, idx, enc, doc_frags, cfg, nullptr);
+}
+
+std::vector<float>
+score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, const Encoder& enc,
+                                 std::span<const std::vector<SemanticFragment>> doc_frags,
+                                 const FragmentGeometryConfig& cfg,
+                                 FragmentGeometryProfile* profile) {
+    const auto t_total0 = profile ? Clock::now() : Clock::time_point{};
+    if (profile)
+        *profile = FragmentGeometryProfile{};
+
     const std::uint32_t nd = static_cast<std::uint32_t>(doc_frags.size());
     const std::uint32_t dim = enc.output_dim();
     const float neg_inf = -std::numeric_limits<float>::infinity();
@@ -550,9 +562,20 @@ std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Ind
     std::vector<float> qvec(dim, 0.0f);
     const QueryRouter router(idx);
 
+    const auto t_bm250 = profile ? Clock::now() : Clock::time_point{};
     idx.score(query, bm25_scores);
     auto pool = top_k(bm25_scores, cfg.pool_size);
+    const auto t_bm251 = profile ? Clock::now() : Clock::time_point{};
+    if (profile) {
+        profile->bm25_us = elapsed_us(t_bm250, t_bm251);
+        profile->pool_docs = static_cast<std::uint32_t>(pool.size());
+    }
+
+    const auto t_qenc0 = profile ? Clock::now() : Clock::time_point{};
     enc.encode(query, qvec.data());
+    const auto t_qenc1 = profile ? Clock::now() : Clock::time_point{};
+    if (profile)
+        profile->query_encode_us = elapsed_us(t_qenc0, t_qenc1);
 
     float query_alpha = cfg.alpha;
     float query_scale = cfg.attention_scale;
@@ -583,14 +606,18 @@ std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Ind
     for (const auto& [did, sc] : pool)
         scores[did] = sc;
 
-    if (pool.empty() || vector_l2_norm(qvec.data(), dim) <= 0.0f)
+    if (pool.empty() || vector_l2_norm(qvec.data(), dim) <= 0.0f) {
+        if (profile)
+            profile->total_us = elapsed_us(t_total0, Clock::now());
         return scores;
+    }
 
     struct FragRef {
         std::uint32_t pool_index = 0;
         const float* vec = nullptr;
     };
 
+    const auto t_gather0 = profile ? Clock::now() : Clock::time_point{};
     std::vector<FragRef> frags;
     frags.reserve(pool.size() * cfg.top_fragments_per_doc);
     for (std::size_t pi = 0; pi < pool.size(); ++pi) {
@@ -600,9 +627,20 @@ std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Ind
             frags.push_back(FragRef{.pool_index = static_cast<std::uint32_t>(pi),
                                     .vec = doc_frags[did][fi].vec.data()});
     }
-    if (frags.empty())
+    if (frags.empty()) {
+        if (profile) {
+            profile->gather_us = elapsed_us(t_gather0, Clock::now());
+            profile->pool_fragments = 0;
+            profile->total_us = elapsed_us(t_total0, Clock::now());
+        }
         return scores;
+    }
+    if (profile) {
+        profile->gather_us = elapsed_us(t_gather0, Clock::now());
+        profile->pool_fragments = static_cast<std::uint32_t>(frags.size());
+    }
 
+    const auto t_white0 = profile ? Clock::now() : Clock::time_point{};
     std::vector<float> mean(dim, 0.0f), var(dim, 0.0f);
     for (const auto& frag : frags) {
         for (std::uint32_t d = 0; d < dim; ++d)
@@ -624,8 +662,13 @@ std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Ind
     for (std::uint32_t d = 0; d < dim; ++d)
         wq[d] = (wq[d] - mean[d]) / var[d];
     l2_normalize_inplace(wq.data(), dim);
-    if (vector_l2_norm(wq.data(), dim) <= 0.0f)
+    if (vector_l2_norm(wq.data(), dim) <= 0.0f) {
+        if (profile) {
+            profile->whiten_us = elapsed_us(t_white0, Clock::now());
+            profile->total_us = elapsed_us(t_total0, Clock::now());
+        }
         return scores;
+    }
 
     std::vector<float> fvecs(frags.size() * dim, 0.0f);
     for (std::size_t i = 0; i < frags.size(); ++i) {
@@ -634,40 +677,66 @@ std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Ind
             dst[d] = (frags[i].vec[d] - mean[d]) / var[d];
         l2_normalize_inplace(dst, dim);
     }
+    if (profile)
+        profile->whiten_us = elapsed_us(t_white0, Clock::now());
 
-    float phss_selected_scale = 0.0f;
-    bool use_phss_for_graph = false;
-    if (cfg.use_phss) {
-        const std::uint32_t nf = static_cast<std::uint32_t>(frags.size());
-        const std::uint32_t tri_count = nf * (nf - 1) / 2;
-        std::vector<float> sims_tri;
-        sims_tri.reserve(tri_count);
-        for (std::uint32_t i = 0; i < nf; ++i) {
-            for (std::uint32_t j = i + 1; j < nf; ++j) {
-                sims_tri.push_back(dot(fvecs.data() + i * dim, fvecs.data() + j * dim, dim));
-            }
-        }
-        PhssConfig phss_cfg = cfg.phss_config;
-        phss_cfg.dim_max = 0;
-        auto phss_result = phss_select_scale(sims_tri, nf, phss_cfg);
-        phss_selected_scale = phss_result.selected_scale;
-        use_phss_for_graph = (phss_selected_scale > 0.0f);
-    }
-
+    const auto t_qatt0 = profile ? Clock::now() : Clock::time_point{};
     std::vector<float> qsim(frags.size(), 0.0f);
     for (std::size_t i = 0; i < frags.size(); ++i)
         qsim[i] = dot(wq.data(), fvecs.data() + i * dim, dim);
 
+    float phss_selected_scale = 0.0f;
+    bool use_phss_for_graph = false;
+    const float query_conf = (cfg.geometry_signal_adaptive || cfg.phss_adaptive)
+                                 ? geometry_query_confidence(qsim)
+                                 : 0.0f;
+    if (cfg.use_phss) {
+        if (profile)
+            profile->phss_enabled = true;
+        const bool should_run_phss =
+            !cfg.phss_adaptive || query_conf >= cfg.phss_confidence_threshold;
+        if (should_run_phss) {
+            const std::uint32_t nf = static_cast<std::uint32_t>(frags.size());
+            const std::uint32_t tri_count = nf * (nf - 1) / 2;
+            const auto t_pair0 = profile ? Clock::now() : Clock::time_point{};
+            std::vector<float> sims_tri;
+            sims_tri.reserve(tri_count);
+            for (std::uint32_t i = 0; i < nf; ++i) {
+                for (std::uint32_t j = i + 1; j < nf; ++j) {
+                    sims_tri.push_back(dot(fvecs.data() + i * dim, fvecs.data() + j * dim, dim));
+                }
+            }
+            const auto t_pair1 = profile ? Clock::now() : Clock::time_point{};
+            if (profile)
+                profile->phss_pairwise_us = elapsed_us(t_pair0, t_pair1);
+            PhssConfig phss_cfg = cfg.phss_config;
+            phss_cfg.dim_max = 0;
+            const auto t_sel0 = profile ? Clock::now() : Clock::time_point{};
+            auto phss_result = phss_select_scale(sims_tri, nf, phss_cfg);
+            const auto t_sel1 = profile ? Clock::now() : Clock::time_point{};
+            if (profile)
+                profile->phss_select_us = elapsed_us(t_sel0, t_sel1);
+            phss_selected_scale = phss_result.selected_scale;
+            use_phss_for_graph = (phss_selected_scale > 0.0f);
+            if (profile)
+                profile->phss_selected_scale = phss_selected_scale;
+        }
+    }
+
     if (cfg.geometry_signal_adaptive) {
-        const float conf = geometry_query_confidence(qsim);
-        query_alpha = lerp(cfg.geometry_alpha_hi, cfg.geometry_alpha_lo, conf);
-        query_scale = lerp(cfg.geometry_scale_hi, cfg.geometry_scale_lo, conf);
+        query_alpha = lerp(cfg.geometry_alpha_hi, cfg.geometry_alpha_lo, query_conf);
+        query_scale = lerp(cfg.geometry_scale_hi, cfg.geometry_scale_lo, query_conf);
         query_knn = static_cast<std::uint32_t>(
             std::lround(lerp(static_cast<float>(cfg.geometry_knn_hi),
-                             static_cast<float>(cfg.geometry_knn_lo), conf)));
+                             static_cast<float>(cfg.geometry_knn_lo), query_conf)));
         query_steps = static_cast<std::uint32_t>(
             std::lround(lerp(static_cast<float>(cfg.geometry_steps_lo),
-                             static_cast<float>(cfg.geometry_steps_hi), conf)));
+                             static_cast<float>(cfg.geometry_steps_hi), query_conf)));
+        if (profile)
+            profile->query_confidence = query_conf;
+    } else if (cfg.phss_adaptive) {
+        if (profile)
+            profile->query_confidence = query_conf;
     }
 
     float max_logit = -std::numeric_limits<float>::infinity();
@@ -680,13 +749,22 @@ std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Ind
         mass[i] = std::exp(query_scale * qsim[i] - max_logit);
         mass_sum += mass[i];
     }
-    if (mass_sum <= 0.0f)
+    if (profile) {
+        profile->query_attention_us = elapsed_us(t_qatt0, Clock::now());
+        profile->phss_used = use_phss_for_graph;
+    }
+    if (mass_sum <= 0.0f) {
+        if (profile)
+            profile->total_us = elapsed_us(t_total0, Clock::now());
         return scores;
+    }
     for (float& x : mass)
         x /= mass_sum;
 
+    const auto t_adj0 = profile ? Clock::now() : Clock::time_point{};
     std::vector<std::vector<std::pair<std::uint32_t, float>>> adj(frags.size());
     std::vector<float> ns(frags.size(), 0.0f);
+    std::uint64_t graph_edges = 0;
 
     for (std::size_t i = 0; i < frags.size(); ++i) {
         std::vector<std::pair<float, std::uint32_t>> sims;
@@ -720,6 +798,7 @@ std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Ind
                 for (auto& [j, w] : adj[i])
                     w /= row_sum;
             }
+            graph_edges += adj[i].size();
         } else {
             std::partial_sort(
                 sims.begin(), sims.begin() + std::min<std::size_t>(query_knn, sims.size()),
@@ -741,9 +820,15 @@ std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Ind
                 for (auto& [j, w] : adj[i])
                     w /= row_sum;
             }
+            graph_edges += adj[i].size();
         }
     }
+    if (profile) {
+        profile->adjacency_us = elapsed_us(t_adj0, Clock::now());
+        profile->graph_edges = graph_edges;
+    }
 
+    const auto t_diff0 = profile ? Clock::now() : Clock::time_point{};
     for (std::uint32_t step = 0; step < query_steps; ++step) {
         std::fill(ns.begin(), ns.end(), 0.0f);
         for (std::size_t i = 0; i < frags.size(); ++i) {
@@ -756,7 +841,10 @@ std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Ind
         }
         mass.swap(ns);
     }
+    if (profile)
+        profile->diffuse_us = elapsed_us(t_diff0, Clock::now());
 
+    const auto t_blend0 = profile ? Clock::now() : Clock::time_point{};
     std::vector<float> bm_pool(pool.size(), 0.0f), geom_pool(pool.size(), 0.0f);
     for (std::size_t i = 0; i < pool.size(); ++i)
         bm_pool[i] = pool[i].second;
@@ -767,6 +855,11 @@ std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Ind
     zscore_inplace(geom_pool);
     for (std::size_t i = 0; i < pool.size(); ++i)
         scores[pool[i].first] = query_alpha * bm_pool[i] + (1.0f - query_alpha) * geom_pool[i];
+
+    if (profile) {
+        profile->blend_us = elapsed_us(t_blend0, Clock::now());
+        profile->total_us = elapsed_us(t_total0, Clock::now());
+    }
 
     return scores;
 }

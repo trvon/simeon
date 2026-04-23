@@ -610,4 +610,4 @@ The next geometric/topological lever replaced the fixed `knn=8` with a data-driv
 | nfcorpus | 0.2548                | 0.2531         | 0.2542           |
 | fiqa     | 0.2028                | **0.2065**     | **0.2089**       |
 
-Verdict: PHSS is a real lever. `LargestGap` is the strongest criterion. It recovers the scifact regression, gives the best FiQA fragment-geometry score so far, and regresses NFCorpus slightly. The next step is adaptive PHSS (criterion or fallback selected per query) or larger-pool tests where the topological scale may diverge more from fixed `knn`.
+Verdict: PHSS is a real lever. `LargestGap` is the strongest criterion. It recovers the scifact regression, gives the best FiQA fragment-geometry score so far, and regresses NFCorpus slightly. Follow-up rows show that adaptive PHSS is a useful latency/quality knob, but it does not replace the full PHSS frontier, and `richmmr + PHSS` does not beat either the best `richmmr` or `richcov + PHSS` rows. Profiling shows the dominant PHSS cost is scale selection itself, not diffusion. The next step is larger-pool PHSS or a cheaper scale-selection approximation.

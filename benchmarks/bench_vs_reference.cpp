@@ -405,315 +405,6 @@ float vector_l2_norm(const float* v, std::uint32_t dim) {
     return static_cast<float>(std::sqrt(sq));
 }
 
-void l2_normalize_inplace(float* v, std::uint32_t dim) {
-    const float n = vector_l2_norm(v, dim);
-    if (n <= 0.0f)
-        return;
-    const float inv = 1.0f / n;
-    for (std::uint32_t i = 0; i < dim; ++i)
-        v[i] *= inv;
-}
-
-std::vector<SemanticFragment> legacy_build_doc_semantic_fragments(
-    const simeon::Encoder& enc, std::string_view doc, const simeon::Bm25Index& idx,
-    std::uint32_t top_fragments_per_doc, std::uint32_t fragment_signature_terms) {
-    simeon::TextRank ranker;
-    const auto dim = enc.output_dim();
-    auto ranked = ranker.rank(doc, top_fragments_per_doc);
-    std::vector<SemanticFragment> out;
-    out.reserve(ranked.empty() ? 1 : ranked.size());
-
-    auto try_encode = [&](std::string_view text) {
-        std::vector<float> vec(dim, 0.0f);
-        enc.encode(text, vec.data());
-        auto sig = build_sparse_signature(idx, text, fragment_signature_terms);
-        if (vector_l2_norm(vec.data(), dim) > 0.0f && !sig.terms.empty())
-            out.push_back(SemanticFragment{std::move(vec), std::move(sig)});
-    };
-
-    for (const auto& sent : ranked)
-        try_encode(sent.text);
-    if (out.empty())
-        try_encode(doc);
-    return out;
-}
-
-std::vector<SemanticFragment> legacy_build_doc_semantic_fragments_rich(
-    const simeon::Encoder& enc, std::string_view doc, const simeon::Bm25Index& idx,
-    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms) {
-    auto out = legacy_build_doc_semantic_fragments(enc, doc, idx, top_sentence_fragments,
-                                                   fragment_signature_terms);
-    const auto dim = enc.output_dim();
-    if (out.size() >= 2) {
-        std::vector<float> centroid(dim, 0.0f);
-        SparseSignature merged;
-        const std::uint32_t merged_terms =
-            std::max<std::uint32_t>(fragment_signature_terms * 2, fragment_signature_terms + 4);
-        for (const auto& frag : out) {
-            for (std::uint32_t d = 0; d < dim; ++d)
-                centroid[d] += frag.vec[d];
-            merge_signature_max(merged, frag.signature, merged_terms);
-        }
-        const float inv = 1.0f / static_cast<float>(out.size());
-        for (float& x : centroid)
-            x *= inv;
-        l2_normalize_inplace(centroid.data(), dim);
-        if (vector_l2_norm(centroid.data(), dim) > 0.0f && !merged.terms.empty())
-            out.push_back(SemanticFragment{std::move(centroid), std::move(merged)});
-    }
-
-    std::vector<float> doc_vec(dim, 0.0f);
-    enc.encode(doc, doc_vec.data());
-    auto doc_sig = build_sparse_signature(idx, doc, fragment_signature_terms * 2);
-    if (vector_l2_norm(doc_vec.data(), dim) > 0.0f && !doc_sig.terms.empty())
-        out.push_back(SemanticFragment{std::move(doc_vec), std::move(doc_sig)});
-    return out;
-}
-
-std::vector<SemanticFragment> legacy_build_doc_semantic_fragments_rich_covered(
-    const simeon::Encoder& enc, std::string_view doc, const simeon::Bm25Index& idx,
-    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
-    float sentence_overlap_cap, float anchor_overlap_cap) {
-    auto rich = legacy_build_doc_semantic_fragments_rich(enc, doc, idx, top_sentence_fragments,
-                                                         fragment_signature_terms);
-    if (rich.empty())
-        return rich;
-
-    std::vector<SemanticFragment> out;
-    out.reserve(rich.size());
-    const std::size_t base_count = rich.size() >= 2 ? rich.size() - 2 : rich.size();
-    auto append_if_novel = [&](SemanticFragment frag, float overlap_cap) {
-        float max_ov = 0.0f;
-        for (const auto& kept : out)
-            max_ov = std::max(max_ov, weighted_overlap_coeff(frag.signature, kept.signature));
-        if (max_ov <= overlap_cap || out.empty())
-            out.push_back(std::move(frag));
-    };
-
-    for (std::size_t i = 0; i < base_count; ++i)
-        append_if_novel(std::move(rich[i]), sentence_overlap_cap);
-    for (std::size_t i = base_count; i < rich.size(); ++i)
-        append_if_novel(std::move(rich[i]), anchor_overlap_cap);
-
-    if (out.empty()) {
-        if (base_count > 0)
-            out.push_back(std::move(rich[0]));
-        else
-            out.push_back(std::move(rich.back()));
-    }
-    return out;
-}
-
-std::vector<SemanticFragment> legacy_build_doc_semantic_fragments_rich_mmr(
-    const simeon::Encoder& enc, std::string_view doc, const simeon::Bm25Index& idx,
-    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
-    float sentence_overlap_cap, float anchor_overlap_cap, float redundancy_lambda,
-    float sentence_min_score, float anchor_min_score) {
-    struct Candidate {
-        SemanticFragment frag;
-        float salience = 0.0f;
-        float overlap_cap = 1.0f;
-        float min_score = 0.0f;
-    };
-
-    auto rich = legacy_build_doc_semantic_fragments_rich(enc, doc, idx, top_sentence_fragments,
-                                                         fragment_signature_terms);
-    if (rich.empty())
-        return rich;
-
-    std::vector<Candidate> candidates;
-    candidates.reserve(rich.size());
-    const std::size_t base_count = rich.size() >= 2 ? rich.size() - 2 : rich.size();
-    const float sent_step = base_count > 1 ? 0.35f / static_cast<float>(base_count - 1) : 0.0f;
-    for (std::size_t i = 0; i < base_count; ++i) {
-        candidates.push_back(Candidate{.frag = std::move(rich[i]),
-                                       .salience = 1.0f - sent_step * static_cast<float>(i),
-                                       .overlap_cap = sentence_overlap_cap,
-                                       .min_score = sentence_min_score});
-    }
-    if (base_count < rich.size()) {
-        candidates.push_back(Candidate{.frag = std::move(rich[base_count]),
-                                       .salience = 0.72f,
-                                       .overlap_cap = anchor_overlap_cap,
-                                       .min_score = anchor_min_score});
-    }
-    if (base_count + 1 < rich.size()) {
-        candidates.push_back(Candidate{.frag = std::move(rich[base_count + 1]),
-                                       .salience = 0.60f,
-                                       .overlap_cap = anchor_overlap_cap,
-                                       .min_score = anchor_min_score});
-    }
-
-    std::vector<SemanticFragment> out;
-    out.reserve(candidates.size());
-    while (!candidates.empty()) {
-        std::size_t best_idx = candidates.size();
-        float best_score = -std::numeric_limits<float>::infinity();
-        for (std::size_t ci = 0; ci < candidates.size(); ++ci) {
-            float max_ov = 0.0f;
-            for (const auto& kept : out)
-                max_ov = std::max(
-                    max_ov, weighted_overlap_coeff(candidates[ci].frag.signature, kept.signature));
-            float score = candidates[ci].salience - redundancy_lambda * max_ov;
-            if (max_ov > candidates[ci].overlap_cap)
-                score -= (max_ov - candidates[ci].overlap_cap);
-            if (score > best_score) {
-                best_score = score;
-                best_idx = ci;
-            }
-        }
-        if (best_idx == candidates.size() || best_score < candidates[best_idx].min_score)
-            break;
-        out.push_back(std::move(candidates[best_idx].frag));
-        candidates.erase(candidates.begin() + static_cast<std::ptrdiff_t>(best_idx));
-    }
-
-    if (out.empty() && !candidates.empty()) {
-        auto best =
-            std::max_element(candidates.begin(), candidates.end(),
-                             [](const auto& a, const auto& b) { return a.salience < b.salience; });
-        out.push_back(std::move(best->frag));
-    }
-    return out;
-}
-
-// Asymmetric two-stage fragment selection:
-//   Stage 1: hard overlap caps for sentence fragments (richcov-style safety)
-//   Stage 2: MMR selection for anchor fragments (richmmr-style upside)
-//
-// The intuition is that scifact needs strict sentence dedup (hard caps prevent
-// redundant anchor amplification), while NFCorpus/FiQA benefit from smarter
-// anchor selection via MMR.  Splitting the control surface lets each corpus
-// get the regime it needs.
-std::vector<SemanticFragment> legacy_build_doc_semantic_fragments_rich_asymmetric(
-    const simeon::Encoder& enc, std::string_view doc, const simeon::Bm25Index& idx,
-    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
-    float sentence_overlap_cap, float anchor_overlap_cap, float anchor_redundancy_lambda,
-    float anchor_min_score) {
-    auto rich = legacy_build_doc_semantic_fragments_rich(enc, doc, idx, top_sentence_fragments,
-                                                         fragment_signature_terms);
-    if (rich.empty())
-        return rich;
-
-    std::vector<SemanticFragment> out;
-    out.reserve(rich.size());
-    const std::size_t base_count = rich.size() >= 2 ? rich.size() - 2 : rich.size();
-
-    // Stage 1: hard overlap caps for sentence fragments (richcov safety)
-    auto append_if_novel = [&](SemanticFragment frag, float overlap_cap) {
-        float max_ov = 0.0f;
-        for (const auto& kept : out)
-            max_ov = std::max(max_ov, weighted_overlap_coeff(frag.signature, kept.signature));
-        if (max_ov <= overlap_cap || out.empty())
-            out.push_back(std::move(frag));
-    };
-
-    for (std::size_t i = 0; i < base_count; ++i)
-        append_if_novel(std::move(rich[i]), sentence_overlap_cap);
-
-    // Stage 2: MMR selection for anchor fragments (richmmr upside)
-    struct AnchorCandidate {
-        SemanticFragment frag;
-        float salience = 0.0f;
-    };
-    std::vector<AnchorCandidate> anchors;
-    anchors.reserve(rich.size() - base_count);
-    if (base_count < rich.size()) {
-        anchors.push_back(AnchorCandidate{std::move(rich[base_count]), 0.72f});
-    }
-    if (base_count + 1 < rich.size()) {
-        anchors.push_back(AnchorCandidate{std::move(rich[base_count + 1]), 0.60f});
-    }
-
-    while (!anchors.empty()) {
-        std::size_t best_idx = anchors.size();
-        float best_score = -std::numeric_limits<float>::infinity();
-        for (std::size_t ci = 0; ci < anchors.size(); ++ci) {
-            float max_ov = 0.0f;
-            for (const auto& kept : out)
-                max_ov = std::max(
-                    max_ov, weighted_overlap_coeff(anchors[ci].frag.signature, kept.signature));
-            float score = anchors[ci].salience - anchor_redundancy_lambda * max_ov;
-            if (max_ov > anchor_overlap_cap)
-                score -= (max_ov - anchor_overlap_cap);
-            if (score > best_score) {
-                best_score = score;
-                best_idx = ci;
-            }
-        }
-        if (best_idx == anchors.size() || best_score < anchor_min_score)
-            break;
-        out.push_back(std::move(anchors[best_idx].frag));
-        anchors.erase(anchors.begin() + static_cast<std::ptrdiff_t>(best_idx));
-    }
-
-    if (out.empty()) {
-        if (base_count > 0)
-            out.push_back(std::move(rich[0]));
-        else
-            out.push_back(std::move(rich.back()));
-    }
-    return out;
-}
-
-std::vector<SemanticFragment> legacy_build_doc_semantic_fragments_rich_budgeted(
-    const simeon::Encoder& enc, std::string_view doc, const simeon::Bm25Index& idx,
-    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
-    float sentence_overlap_cap, std::uint32_t max_sentence_keep, float anchor_overlap_cap,
-    float anchor_novelty_floor, std::uint32_t max_anchor_keep) {
-    auto rich = legacy_build_doc_semantic_fragments_rich(enc, doc, idx, top_sentence_fragments,
-                                                         fragment_signature_terms);
-    if (rich.empty())
-        return rich;
-
-    std::vector<SemanticFragment> out;
-    out.reserve(rich.size());
-    const std::size_t base_count = rich.size() >= 2 ? rich.size() - 2 : rich.size();
-
-    auto max_overlap_with_kept = [&](const SparseSignature& sig) {
-        float max_ov = 0.0f;
-        for (const auto& kept : out)
-            max_ov = std::max(max_ov, weighted_overlap_coeff(sig, kept.signature));
-        return max_ov;
-    };
-
-    std::uint32_t kept_sentences = 0;
-    for (std::size_t i = 0; i < base_count; ++i) {
-        if (kept_sentences >= max_sentence_keep)
-            break;
-        const float max_ov = max_overlap_with_kept(rich[i].signature);
-        if (out.empty() || max_ov <= sentence_overlap_cap) {
-            out.push_back(std::move(rich[i]));
-            ++kept_sentences;
-        }
-    }
-
-    struct AnchorCandidate {
-        SemanticFragment frag;
-        float novelty = 0.0f;
-    };
-    std::vector<AnchorCandidate> anchors;
-    anchors.reserve(rich.size() - base_count);
-    for (std::size_t i = base_count; i < rich.size(); ++i) {
-        const float max_ov = max_overlap_with_kept(rich[i].signature);
-        const float novelty = 1.0f - max_ov;
-        if (max_ov <= anchor_overlap_cap && novelty >= anchor_novelty_floor)
-            anchors.push_back(AnchorCandidate{std::move(rich[i]), novelty});
-    }
-    std::sort(anchors.begin(), anchors.end(),
-              [](const auto& a, const auto& b) { return a.novelty > b.novelty; });
-    for (std::size_t i = 0; i < anchors.size() && i < max_anchor_keep; ++i)
-        out.push_back(std::move(anchors[i].frag));
-
-    if (out.empty()) {
-        if (base_count > 0)
-            out.push_back(std::move(rich[0]));
-        else
-            out.push_back(std::move(rich.back()));
-    }
-    return out;
-}
-
 struct ClusterAssignment {
     std::uint32_t pool_index = 0;
     float doc_seed = 0.0f;
@@ -741,55 +432,6 @@ void zscore_inplace(std::vector<float>& v) {
     const float sd = static_cast<float>(std::sqrt(var / static_cast<double>(v.size())) + 1e-12);
     for (float& x : v)
         x = static_cast<float>((static_cast<double>(x) - mean) / sd);
-}
-
-float clamp_unit(float x) {
-    return std::clamp(x, 0.0f, 1.0f);
-}
-
-float lerp(float a, float b, float t) {
-    return a + (b - a) * t;
-}
-
-float bm25_pool_decay(std::span<const std::pair<std::uint32_t, float>> pool) {
-    if (pool.empty() || pool.front().second <= 0.0f)
-        return 0.0f;
-    const std::size_t i9 = pool.size() >= 10 ? std::size_t{9} : pool.size() - 1;
-    return clamp_unit((pool.front().second - pool[i9].second) / pool.front().second);
-}
-
-float geometry_query_confidence(std::span<const float> sims) {
-    if (sims.empty())
-        return 0.0f;
-    float top1 = -std::numeric_limits<float>::infinity();
-    float top2 = -std::numeric_limits<float>::infinity();
-    for (float x : sims) {
-        if (x > top1) {
-            top2 = top1;
-            top1 = x;
-        } else if (x > top2) {
-            top2 = x;
-        }
-    }
-    const float top_conf = clamp_unit((top1 - 0.10f) / 0.25f);
-    const float gap_conf = clamp_unit(((top1 - top2) - 0.02f) / 0.12f);
-    if (sims.size() == 1)
-        return 0.5f * (top_conf + gap_conf);
-
-    double zsum = 0.0;
-    for (float x : sims)
-        zsum += std::exp(static_cast<double>(x - top1));
-    double ent = 0.0;
-    if (zsum > 0.0) {
-        for (float x : sims) {
-            const double w = std::exp(static_cast<double>(x - top1)) / zsum;
-            if (w > 0.0)
-                ent -= w * std::log(w);
-        }
-    }
-    const float ent_norm = static_cast<float>(ent / std::log(static_cast<double>(sims.size())));
-    const float ent_conf = 1.0f - clamp_unit(ent_norm);
-    return (top_conf + gap_conf + ent_conf) / 3.0f;
 }
 
 bool is_stopword(std::string_view token) {
@@ -2878,6 +2520,17 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
                             .phss_config = simeon::PhssConfig{
                                 .criterion = simeon::PhssConfig::Criterion::LargestGap}});
     run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_k100_t4_gap", fx, idx.idx, total_build_us, enc, doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 4,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+    run_bm25_fragment_geometry(
         "bm25_fragment_geom_phss_k100_t4_persist", fx, idx.idx, total_build_us, enc, doc_frags,
         GeometryGraphConfig{.pool_size = 100,
                             .alpha = 0.8f,
@@ -2902,6 +2555,72 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
     run_bm25_fragment_geometry(
         "bm25_fragment_geom_phss_k100_t8_richcov_gap", fx, idx.idx, rich_cov_total_build_us, enc,
         rich_cov_doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 8,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGap}});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_k100_t8_richcov_gap", fx, idx.idx, rich_cov_total_build_us,
+        enc, rich_cov_doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 8,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssadapt_k100_t4_gap_c0.55", fx, idx.idx, total_build_us, enc,
+        doc_frags,
+        GeometryGraphConfig{
+            .pool_size = 100,
+            .alpha = 0.8f,
+            .top_fragments_per_doc = 4,
+            .attention_scale = 8.0f,
+            .knn = 8,
+            .steps = 2,
+            .use_phss = true,
+            .phss_config =
+                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGap},
+            .phss_adaptive = true,
+            .phss_confidence_threshold = 0.55f});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssadapt_k100_t8_richcov_gap_c0.55", fx, idx.idx,
+        rich_cov_total_build_us, enc, rich_cov_doc_frags,
+        GeometryGraphConfig{
+            .pool_size = 100,
+            .alpha = 0.8f,
+            .top_fragments_per_doc = 8,
+            .attention_scale = 8.0f,
+            .knn = 8,
+            .steps = 2,
+            .use_phss = true,
+            .phss_config =
+                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGap},
+            .phss_adaptive = true,
+            .phss_confidence_threshold = 0.55f});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_richmmr_k100_t8_l0.35_phss_gap", fx, idx.idx, rich_mmr_total_build_us,
+        enc, rich_mmr_doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 8,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGap}});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_richmmr_k100_t8_l0.50_phss_gap", fx, idx.idx,
+        rich_mmr_novel_total_build_us, enc, rich_mmr_novel_doc_frags,
         GeometryGraphConfig{.pool_size = 100,
                             .alpha = 0.8f,
                             .top_fragments_per_doc = 8,
