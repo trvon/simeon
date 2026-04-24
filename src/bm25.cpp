@@ -1,6 +1,7 @@
 #include "simeon/bm25.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -43,12 +44,92 @@ struct StringTermSink final : NGramEmitter {
     }
 };
 
+struct StringViewTermSink final : NGramEmitter {
+    std::vector<std::string_view>* strs;
+    std::vector<std::uint64_t>* hashes;
+    HashFamily family;
+    std::uint64_t seed;
+    void on_token(std::string_view tok, float) override {
+        strs->push_back(tok);
+        hashes->push_back(hash64(tok, seed, family));
+    }
+};
+
+struct UniqueTermSink final : NGramEmitter {
+    std::vector<std::uint64_t>* terms;
+    HashFamily family;
+    std::uint64_t seed;
+    void on_token(std::string_view tok, float) override {
+        const std::uint64_t h = hash64(tok, seed, family);
+        if (std::find(terms->begin(), terms->end(), h) == terms->end())
+            terms->push_back(h);
+    }
+};
+
 constexpr TokenizerConfig word_only_cfg() noexcept {
     return TokenizerConfig{0, 0, false, true};
 }
 
 inline TokenizerConfig ngram_only_cfg(std::uint32_t lo, std::uint32_t hi) noexcept {
     return TokenizerConfig{lo, hi, true, false};
+}
+
+bool is_word_char(unsigned char c) noexcept {
+    return std::isalnum(c) != 0 || c == '_';
+}
+
+void collect_field_term_stats(std::string_view text, HashFamily family, std::uint64_t seed,
+                              std::unordered_map<std::uint64_t, std::uint32_t>& word_tf,
+                              std::uint32_t& word_dl,
+                              std::unordered_map<std::uint64_t, std::uint32_t>* ngram_tf,
+                              std::uint32_t* ngram_dl, std::uint32_t k_min, std::uint32_t k_max,
+                              std::vector<std::uint64_t>* ordered_words = nullptr) {
+    word_dl = 0;
+    if (ngram_dl)
+        *ngram_dl = 0;
+    const std::size_t n = text.size();
+    std::size_t i = 0;
+    while (i < n) {
+        while (i < n && !is_word_char(static_cast<unsigned char>(text[i])))
+            ++i;
+        const std::size_t start = i;
+        while (i < n && is_word_char(static_cast<unsigned char>(text[i])))
+            ++i;
+        if (start >= i)
+            continue;
+
+        const std::string_view tok = text.substr(start, i - start);
+        const std::uint64_t wh = hash64(tok, seed, family);
+        ++word_tf[wh];
+        ++word_dl;
+        if (ordered_words)
+            ordered_words->push_back(wh);
+
+        if (ngram_tf && ngram_dl) {
+            const std::size_t tok_n = tok.size();
+            for (std::uint32_t k = k_min; k <= k_max; ++k) {
+                if (tok_n < k)
+                    break;
+                const std::size_t last = tok_n - k;
+                for (std::size_t pos = 0; pos <= last; ++pos) {
+                    ++(*ngram_tf)[hash64(tok.substr(pos, k), seed, family)];
+                    ++(*ngram_dl);
+                }
+            }
+        }
+    }
+}
+
+void collect_unique_query_ngrams(std::string_view term, HashFamily family, std::uint64_t seed,
+                                 std::uint32_t k_min, std::uint32_t k_max,
+                                 std::vector<std::uint64_t>& grams) {
+    grams.clear();
+    UniqueTermSink sink{};
+    sink.terms = &grams;
+    sink.family = family;
+    sink.seed = seed;
+    const auto ntcfg = ngram_only_cfg(k_min, k_max);
+    tokenize(term, ntcfg, sink);
 }
 
 // Per-(term, doc) Atire BM25 contribution.
@@ -277,47 +358,65 @@ void Bm25Index::score_weighted_hashes(
     const float delta = cfg_.delta;
     const float n_docs = static_cast<float>(doc_lengths_.size());
 
-    for (const auto& [h, w] : weighted_terms) {
-        if (w <= 0.0f)
-            continue;
-        const auto pit = postings_.find(h);
-        if (pit == postings_.end())
-            continue;
-        const float idf = pit->second.idf;
-        const float ttf = static_cast<float>(pit->second.total_tf);
-        for (const auto& [did, tf] : pit->second.docs) {
-            const float tff = static_cast<float>(tf);
-            const float dl = static_cast<float>(doc_lengths_[did]);
-            float contribution = 0.0f;
-            switch (cfg_.variant) {
-                case Bm25Variant::Atire:
-                    contribution = score_atire(tff, dl, idf, k1, b, avg);
-                    break;
-                case Bm25Variant::AtireLTD:
-                    contribution = score_atire_ltd(tff, dl, idf, k1, b, avg, cfg_.ltd_alpha);
-                    break;
-                case Bm25Variant::BM25Plus:
-                case Bm25Variant::SubwordAwareBackoff:
-                    contribution = score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
-                    break;
-                case Bm25Variant::BM25L:
-                    contribution = score_bm25_l(tff, dl, idf, k1, b, avg, delta);
-                    break;
-                case Bm25Variant::DLH13:
-                    contribution = score_dlh13(tff, dl, avg, n_docs, ttf);
-                    break;
-                case Bm25Variant::PL2:
-                    contribution = score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
-                    break;
-                case Bm25Variant::DPH:
-                    contribution = score_dph(tff, dl, avg, n_docs, ttf);
-                    break;
-                case Bm25Variant::Dcm:
-                    contribution = score_dcm(tff, total_tokens_, ttf, alpha_sum_);
-                    break;
+    auto accumulate = [&](auto&& scorer) {
+        for (const auto& [h, w] : weighted_terms) {
+            if (w <= 0.0f)
+                continue;
+            const auto pit = postings_.find(h);
+            if (pit == postings_.end())
+                continue;
+            const float idf = pit->second.idf;
+            const float ttf = static_cast<float>(pit->second.total_tf);
+            for (const auto& [did, tf] : pit->second.docs) {
+                const float tff = static_cast<float>(tf);
+                const float dl = static_cast<float>(doc_lengths_[did]);
+                out_scores[did] += w * scorer(tff, dl, idf, ttf);
             }
-            out_scores[did] += w * contribution;
         }
+    };
+
+    switch (cfg_.variant) {
+        case Bm25Variant::Atire:
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_atire(tff, dl, idf, k1, b, avg);
+            });
+            break;
+        case Bm25Variant::AtireLTD:
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_atire_ltd(tff, dl, idf, k1, b, avg, cfg_.ltd_alpha);
+            });
+            break;
+        case Bm25Variant::BM25Plus:
+        case Bm25Variant::SubwordAwareBackoff:
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
+            });
+            break;
+        case Bm25Variant::BM25L:
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_bm25_l(tff, dl, idf, k1, b, avg, delta);
+            });
+            break;
+        case Bm25Variant::DLH13:
+            accumulate([&](float tff, float dl, float, float ttf) {
+                return score_dlh13(tff, dl, avg, n_docs, ttf);
+            });
+            break;
+        case Bm25Variant::PL2:
+            accumulate([&](float tff, float dl, float, float ttf) {
+                return score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
+            });
+            break;
+        case Bm25Variant::DPH:
+            accumulate([&](float tff, float dl, float, float ttf) {
+                return score_dph(tff, dl, avg, n_docs, ttf);
+            });
+            break;
+        case Bm25Variant::Dcm:
+            accumulate([&](float tff, float, float, float ttf) {
+                return score_dcm(tff, total_tokens_, ttf, alpha_sum_);
+            });
+            break;
     }
 }
 
@@ -329,77 +428,47 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
     if (finalized_)
         throw std::runtime_error("Bm25Index::add_doc after finalize()");
     const std::uint32_t did = static_cast<std::uint32_t>(doc_lengths_.size());
-    auto add_word_field = [&](std::string_view field_text, std::vector<std::uint32_t>& lengths,
-                              FlatHashMapU64<TermPostings>& postings) {
-        // Reuse the per-doc tf scratch across calls. add_doc() is single-threaded
-        // (the index is built sequentially before finalize), so no synchronization
-        // is needed; clear() preserves bucket capacity which avoids the per-doc
-        // hash-table reallocation cost.
-        static thread_local std::unordered_map<std::uint64_t, std::uint32_t> tf;
+    static thread_local std::unordered_map<std::uint64_t, std::uint32_t> tf;
+    static thread_local std::unordered_map<std::uint64_t, std::uint32_t> ngram_tf;
+    static thread_local std::vector<std::uint64_t> ordered_words;
+    auto add_field = [&](std::string_view field_text, std::vector<std::uint32_t>& lengths,
+                         FlatHashMapU64<TermPostings>& postings, bool keep_ordered,
+                         std::vector<std::uint32_t>* ngram_lengths,
+                         FlatHashMapU64<TermPostings>* ngram_postings) {
         tf.clear();
-        TfSink sink{};
-        sink.tf = &tf;
-        sink.family = cfg_.hash;
-        sink.seed = cfg_.hash_seed;
-        const auto tcfg = word_only_cfg();
-        tokenize(field_text, tcfg, sink);
+        if (keep_ordered)
+            ordered_words.clear();
+        if (ngram_lengths && ngram_postings)
+            ngram_tf.clear();
 
         std::uint32_t dl = 0;
-        for (const auto& [h, c] : tf)
-            dl += c;
+        std::uint32_t ngram_dl = 0;
+        collect_field_term_stats(field_text, cfg_.hash, cfg_.hash_seed, tf, dl,
+                                 (ngram_lengths && ngram_postings) ? &ngram_tf : nullptr,
+                                 (ngram_lengths && ngram_postings) ? &ngram_dl : nullptr,
+                                 cfg_.ngram_min, cfg_.ngram_max,
+                                 keep_ordered ? &ordered_words : nullptr);
+
         lengths.push_back(dl);
         postings.reserve(postings.size() + tf.size());
         for (const auto& [h, c] : tf) {
             postings[h].docs.emplace_back(did, c);
         }
-    };
 
-    auto add_ngram_field = [&](std::string_view field_text, std::vector<std::uint32_t>& lengths,
-                               FlatHashMapU64<TermPostings>& postings) {
-        static thread_local std::unordered_map<std::uint64_t, std::uint32_t> ngram_tf;
-        ngram_tf.clear();
-        TfSink ngram_sink{};
-        ngram_sink.tf = &ngram_tf;
-        ngram_sink.family = cfg_.hash;
-        ngram_sink.seed = cfg_.hash_seed;
-        const auto ntcfg = ngram_only_cfg(cfg_.ngram_min, cfg_.ngram_max);
-        tokenize(field_text, ntcfg, ngram_sink);
-
-        std::uint32_t ngram_dl = 0;
-        for (const auto& [h, c] : ngram_tf)
-            ngram_dl += c;
-        lengths.push_back(ngram_dl);
-        postings.reserve(postings.size() + ngram_tf.size());
-        for (const auto& [h, c] : ngram_tf) {
-            postings[h].docs.emplace_back(did, c);
+        if (ngram_lengths && ngram_postings) {
+            ngram_lengths->push_back(ngram_dl);
+            ngram_postings->reserve(ngram_postings->size() + ngram_tf.size());
+            for (const auto& [h, c] : ngram_tf) {
+                (*ngram_postings)[h].docs.emplace_back(did, c);
+            }
         }
     };
 
-    add_word_field(text, doc_lengths_, postings_);
-    add_word_field(aux_text, aux_doc_lengths_, aux_postings_);
-
-    if (cfg_.variant == Bm25Variant::SubwordAwareBackoff) {
-        // Parallel char n-gram tf for the secondary index. Same hashing,
-        // same per-thread scratch pattern as the word index above. n-gram
-        // doc length is the sum of n-gram counts; differs from word dl
-        // because each word emits multiple overlapping n-grams.
-        add_ngram_field(text, ngram_doc_lengths_, ngram_postings_);
-        add_ngram_field(aux_text, aux_ngram_doc_lengths_, aux_ngram_postings_);
-    }
+    add_field(text, doc_lengths_, postings_, cfg_.build_word_bigrams,
+              cfg_.variant == Bm25Variant::SubwordAwareBackoff ? &ngram_doc_lengths_ : nullptr,
+              cfg_.variant == Bm25Variant::SubwordAwareBackoff ? &ngram_postings_ : nullptr);
 
     if (cfg_.build_word_bigrams) {
-        // Re-tokenize into an ordered word-hash stream (TfSink above loses
-        // order). This doubles the word-tokenize cost for bigram-enabled
-        // indexes — one-time at add_doc time, not on the query path.
-        static thread_local std::vector<std::uint64_t> ordered_words;
-        ordered_words.clear();
-        TermSink ord_sink{};
-        ord_sink.terms = &ordered_words;
-        ord_sink.family = cfg_.hash;
-        ord_sink.seed = cfg_.hash_seed;
-        const auto tcfg = word_only_cfg();
-        tokenize(text, tcfg, ord_sink);
-
         // Ordered bigrams: adjacent (w_i, w_{i+1}) pairs.
         static thread_local std::unordered_map<std::uint64_t, std::uint32_t> ord_bgm_tf;
         ord_bgm_tf.clear();
@@ -433,6 +502,20 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
         for (const auto& [h, c] : unord_bgm_tf) {
             unordered_bigram_postings_[h].docs.emplace_back(did, c);
         }
+    }
+
+    bool aux_active = !aux_doc_lengths_.empty();
+    if (!aux_text.empty() && !aux_active) {
+        aux_doc_lengths_.assign(did, 0u);
+        if (cfg_.variant == Bm25Variant::SubwordAwareBackoff)
+            aux_ngram_doc_lengths_.assign(did, 0u);
+        aux_active = true;
+    }
+    if (aux_active) {
+        add_field(
+            aux_text, aux_doc_lengths_, aux_postings_, false,
+            cfg_.variant == Bm25Variant::SubwordAwareBackoff ? &aux_ngram_doc_lengths_ : nullptr,
+            cfg_.variant == Bm25Variant::SubwordAwareBackoff ? &aux_ngram_postings_ : nullptr);
     }
 }
 
@@ -535,11 +618,11 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
         // Need raw query strings for the OOV n-gram fallback; store hashes
         // alongside so we still get a fast postings_ lookup for the exact
         // path. score() is const but the scratch is thread_local.
-        static thread_local std::vector<std::string> q_strs;
+        static thread_local std::vector<std::string_view> q_strs;
         static thread_local std::vector<std::uint64_t> q_hashes;
         q_strs.clear();
         q_hashes.clear();
-        StringTermSink ssink{};
+        StringViewTermSink ssink{};
         ssink.strs = &q_strs;
         ssink.hashes = &q_hashes;
         ssink.family = cfg_.hash;
@@ -549,8 +632,7 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
 
         const float gamma = cfg_.subword_gamma;
         const float ngram_avg = ngram_avg_dl_ > 0.0f ? ngram_avg_dl_ : 1.0f;
-        // Per-query reusable scratch for the n-gram tokenization of one term.
-        static thread_local std::unordered_map<std::uint64_t, std::uint32_t> term_ngram_tf;
+        static thread_local std::vector<std::uint64_t> term_ngram_hashes;
         for (std::size_t qi = 0; qi < q_hashes.size(); ++qi) {
             const std::uint64_t h = q_hashes[qi];
             const auto pit = postings_.find(h);
@@ -572,15 +654,10 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
             // n-grams, look each up in ngram_postings_, sum BM25+ scoring
             // weighted by (1-α). Skips entirely if α==1 (γ=0 + df>0).
             if (alpha < 1.0f) {
-                term_ngram_tf.clear();
-                TfSink ng_sink{};
-                ng_sink.tf = &term_ngram_tf;
-                ng_sink.family = cfg_.hash;
-                ng_sink.seed = cfg_.hash_seed;
-                const auto ntcfg = ngram_only_cfg(cfg_.ngram_min, cfg_.ngram_max);
-                tokenize(q_strs[qi], ntcfg, ng_sink);
+                collect_unique_query_ngrams(q_strs[qi], cfg_.hash, cfg_.hash_seed, cfg_.ngram_min,
+                                            cfg_.ngram_max, term_ngram_hashes);
                 const float w = 1.0f - alpha;
-                for (const auto& [gh, _qcount] : term_ngram_tf) {
+                for (const auto gh : term_ngram_hashes) {
                     const auto git = ngram_postings_.find(gh);
                     if (git == ngram_postings_.end())
                         continue;
@@ -608,47 +685,64 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
     const auto tcfg = word_only_cfg();
     tokenize(query, tcfg, sink);
 
-    for (std::uint64_t h : q_terms) {
-        const auto pit = postings_.find(h);
-        if (pit == postings_.end())
-            continue;
-        const float idf = pit->second.idf;
-        const float ttf = static_cast<float>(pit->second.total_tf);
-        for (const auto& [did, tf] : pit->second.docs) {
-            const float tff = static_cast<float>(tf);
-            const float dl = static_cast<float>(doc_lengths_[did]);
-            float contribution = 0.0f;
-            switch (cfg_.variant) {
-                case Bm25Variant::Atire:
-                    contribution = score_atire(tff, dl, idf, k1, b, avg);
-                    break;
-                case Bm25Variant::AtireLTD:
-                    contribution = score_atire_ltd(tff, dl, idf, k1, b, avg, cfg_.ltd_alpha);
-                    break;
-                case Bm25Variant::BM25Plus:
-                    contribution = score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
-                    break;
-                case Bm25Variant::BM25L:
-                    contribution = score_bm25_l(tff, dl, idf, k1, b, avg, delta);
-                    break;
-                case Bm25Variant::DLH13:
-                    contribution = score_dlh13(tff, dl, avg, n_docs, ttf);
-                    break;
-                case Bm25Variant::PL2:
-                    contribution = score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
-                    break;
-                case Bm25Variant::DPH:
-                    contribution = score_dph(tff, dl, avg, n_docs, ttf);
-                    break;
-                case Bm25Variant::Dcm:
-                    contribution = score_dcm(tff, total_tokens_, ttf, alpha_sum_);
-                    break;
-                case Bm25Variant::SubwordAwareBackoff:
-                    // Unreachable: handled by the early return above.
-                    break;
+    auto accumulate = [&](auto&& scorer) {
+        for (std::uint64_t h : q_terms) {
+            const auto pit = postings_.find(h);
+            if (pit == postings_.end())
+                continue;
+            const float idf = pit->second.idf;
+            const float ttf = static_cast<float>(pit->second.total_tf);
+            for (const auto& [did, tf] : pit->second.docs) {
+                const float tff = static_cast<float>(tf);
+                const float dl = static_cast<float>(doc_lengths_[did]);
+                out_scores[did] += scorer(tff, dl, idf, ttf);
             }
-            out_scores[did] += contribution;
         }
+    };
+
+    switch (cfg_.variant) {
+        case Bm25Variant::Atire:
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_atire(tff, dl, idf, k1, b, avg);
+            });
+            break;
+        case Bm25Variant::AtireLTD:
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_atire_ltd(tff, dl, idf, k1, b, avg, cfg_.ltd_alpha);
+            });
+            break;
+        case Bm25Variant::BM25Plus:
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
+            });
+            break;
+        case Bm25Variant::BM25L:
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_bm25_l(tff, dl, idf, k1, b, avg, delta);
+            });
+            break;
+        case Bm25Variant::DLH13:
+            accumulate([&](float tff, float dl, float, float ttf) {
+                return score_dlh13(tff, dl, avg, n_docs, ttf);
+            });
+            break;
+        case Bm25Variant::PL2:
+            accumulate([&](float tff, float dl, float, float ttf) {
+                return score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
+            });
+            break;
+        case Bm25Variant::DPH:
+            accumulate([&](float tff, float dl, float, float ttf) {
+                return score_dph(tff, dl, avg, n_docs, ttf);
+            });
+            break;
+        case Bm25Variant::Dcm:
+            accumulate([&](float tff, float, float, float ttf) {
+                return score_dcm(tff, total_tokens_, ttf, alpha_sum_);
+            });
+            break;
+        case Bm25Variant::SubwordAwareBackoff:
+            break;
     }
 }
 
@@ -693,11 +787,11 @@ void Bm25Index::score_bm25f(std::string_view body_query, std::string_view aux_qu
     const float n_docs = static_cast<float>(aux_doc_lengths_.size());
 
     if (cfg_.variant == Bm25Variant::SubwordAwareBackoff) {
-        static thread_local std::vector<std::string> q_strs;
+        static thread_local std::vector<std::string_view> q_strs;
         static thread_local std::vector<std::uint64_t> q_hashes;
         q_strs.clear();
         q_hashes.clear();
-        StringTermSink ssink{};
+        StringViewTermSink ssink{};
         ssink.strs = &q_strs;
         ssink.hashes = &q_hashes;
         ssink.family = cfg_.hash;
@@ -707,7 +801,7 @@ void Bm25Index::score_bm25f(std::string_view body_query, std::string_view aux_qu
 
         const float gamma = cfg_.subword_gamma;
         const float aux_ngram_avg = aux_ngram_avg_dl_ > 0.0f ? aux_ngram_avg_dl_ : 1.0f;
-        static thread_local std::unordered_map<std::uint64_t, std::uint32_t> term_ngram_tf;
+        static thread_local std::vector<std::uint64_t> term_ngram_hashes;
         for (std::size_t qi = 0; qi < q_hashes.size(); ++qi) {
             const std::uint64_t h = q_hashes[qi];
             const auto pit = aux_postings_.find(h);
@@ -726,15 +820,10 @@ void Bm25Index::score_bm25f(std::string_view body_query, std::string_view aux_qu
             }
 
             if (alpha < 1.0f) {
-                term_ngram_tf.clear();
-                TfSink ng_sink{};
-                ng_sink.tf = &term_ngram_tf;
-                ng_sink.family = cfg_.hash;
-                ng_sink.seed = cfg_.hash_seed;
-                const auto ntcfg = ngram_only_cfg(cfg_.ngram_min, cfg_.ngram_max);
-                tokenize(q_strs[qi], ntcfg, ng_sink);
+                collect_unique_query_ngrams(q_strs[qi], cfg_.hash, cfg_.hash_seed, cfg_.ngram_min,
+                                            cfg_.ngram_max, term_ngram_hashes);
                 const float w = 1.0f - alpha;
-                for (const auto& [gh, _qcount] : term_ngram_tf) {
+                for (const auto gh : term_ngram_hashes) {
                     const auto git = aux_ngram_postings_.find(gh);
                     if (git == aux_ngram_postings_.end())
                         continue;
@@ -761,46 +850,64 @@ void Bm25Index::score_bm25f(std::string_view body_query, std::string_view aux_qu
     const auto tcfg = word_only_cfg();
     tokenize(aux_query, tcfg, sink);
 
-    for (std::uint64_t h : q_terms) {
-        const auto pit = aux_postings_.find(h);
-        if (pit == aux_postings_.end())
-            continue;
-        const float idf = pit->second.idf;
-        const float ttf = static_cast<float>(pit->second.total_tf);
-        for (const auto& [did, tf] : pit->second.docs) {
-            const float tff = static_cast<float>(tf);
-            const float dl = static_cast<float>(aux_doc_lengths_[did]);
-            float contribution = 0.0f;
-            switch (cfg_.variant) {
-                case Bm25Variant::Atire:
-                    contribution = score_atire(tff, dl, idf, k1, b, avg);
-                    break;
-                case Bm25Variant::AtireLTD:
-                    contribution = score_atire_ltd(tff, dl, idf, k1, b, avg, cfg_.ltd_alpha);
-                    break;
-                case Bm25Variant::BM25Plus:
-                    contribution = score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
-                    break;
-                case Bm25Variant::BM25L:
-                    contribution = score_bm25_l(tff, dl, idf, k1, b, avg, delta);
-                    break;
-                case Bm25Variant::DLH13:
-                    contribution = score_dlh13(tff, dl, avg, n_docs, ttf);
-                    break;
-                case Bm25Variant::PL2:
-                    contribution = score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
-                    break;
-                case Bm25Variant::DPH:
-                    contribution = score_dph(tff, dl, avg, n_docs, ttf);
-                    break;
-                case Bm25Variant::Dcm:
-                    contribution = score_dcm(tff, aux_total_tokens_, ttf, aux_alpha_sum_);
-                    break;
-                case Bm25Variant::SubwordAwareBackoff:
-                    break;
+    auto accumulate = [&](auto&& scorer) {
+        for (std::uint64_t h : q_terms) {
+            const auto pit = aux_postings_.find(h);
+            if (pit == aux_postings_.end())
+                continue;
+            const float idf = pit->second.idf;
+            const float ttf = static_cast<float>(pit->second.total_tf);
+            for (const auto& [did, tf] : pit->second.docs) {
+                const float tff = static_cast<float>(tf);
+                const float dl = static_cast<float>(aux_doc_lengths_[did]);
+                out_scores[did] += weight_aux * scorer(tff, dl, idf, ttf);
             }
-            out_scores[did] += weight_aux * contribution;
         }
+    };
+
+    switch (cfg_.variant) {
+        case Bm25Variant::Atire:
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_atire(tff, dl, idf, k1, b, avg);
+            });
+            break;
+        case Bm25Variant::AtireLTD:
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_atire_ltd(tff, dl, idf, k1, b, avg, cfg_.ltd_alpha);
+            });
+            break;
+        case Bm25Variant::BM25Plus:
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
+            });
+            break;
+        case Bm25Variant::BM25L:
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_bm25_l(tff, dl, idf, k1, b, avg, delta);
+            });
+            break;
+        case Bm25Variant::DLH13:
+            accumulate([&](float tff, float dl, float, float ttf) {
+                return score_dlh13(tff, dl, avg, n_docs, ttf);
+            });
+            break;
+        case Bm25Variant::PL2:
+            accumulate([&](float tff, float dl, float, float ttf) {
+                return score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
+            });
+            break;
+        case Bm25Variant::DPH:
+            accumulate([&](float tff, float dl, float, float ttf) {
+                return score_dph(tff, dl, avg, n_docs, ttf);
+            });
+            break;
+        case Bm25Variant::Dcm:
+            accumulate([&](float tff, float, float, float ttf) {
+                return score_dcm(tff, aux_total_tokens_, ttf, aux_alpha_sum_);
+            });
+            break;
+        case Bm25Variant::SubwordAwareBackoff:
+            break;
     }
 }
 
@@ -821,11 +928,11 @@ void Bm25Index::score_sdm(std::string_view query, std::span<float> out_scores,
 
     // Ordered query tokenization (same path as score()). Keep the strings too
     // so the SAB unigram leg can do its OOV n-gram fallback per term.
-    static thread_local std::vector<std::string> q_strs;
+    static thread_local std::vector<std::string_view> q_strs;
     static thread_local std::vector<std::uint64_t> q_hashes;
     q_strs.clear();
     q_hashes.clear();
-    StringTermSink ssink{};
+    StringViewTermSink ssink{};
     ssink.strs = &q_strs;
     ssink.hashes = &q_hashes;
     ssink.family = cfg_.hash;
@@ -838,7 +945,7 @@ void Bm25Index::score_sdm(std::string_view query, std::span<float> out_scores,
         if (cfg_.variant == Bm25Variant::SubwordAwareBackoff) {
             const float gamma = cfg_.subword_gamma;
             const float ngram_avg = ngram_avg_dl_ > 0.0f ? ngram_avg_dl_ : 1.0f;
-            static thread_local std::unordered_map<std::uint64_t, std::uint32_t> term_ngram_tf;
+            static thread_local std::vector<std::uint64_t> term_ngram_hashes;
             for (std::size_t qi = 0; qi < q_hashes.size(); ++qi) {
                 const std::uint64_t h = q_hashes[qi];
                 const auto pit = postings_.find(h);
@@ -855,15 +962,10 @@ void Bm25Index::score_sdm(std::string_view query, std::span<float> out_scores,
                     }
                 }
                 if (alpha < 1.0f) {
-                    term_ngram_tf.clear();
-                    TfSink ng_sink{};
-                    ng_sink.tf = &term_ngram_tf;
-                    ng_sink.family = cfg_.hash;
-                    ng_sink.seed = cfg_.hash_seed;
-                    const auto ntcfg = ngram_only_cfg(cfg_.ngram_min, cfg_.ngram_max);
-                    tokenize(q_strs[qi], ntcfg, ng_sink);
+                    collect_unique_query_ngrams(q_strs[qi], cfg_.hash, cfg_.hash_seed,
+                                                cfg_.ngram_min, cfg_.ngram_max, term_ngram_hashes);
                     const float w = 1.0f - alpha;
-                    for (const auto& [gh, _qcount] : term_ngram_tf) {
+                    for (const auto gh : term_ngram_hashes) {
                         const auto git = ngram_postings_.find(gh);
                         if (git == ngram_postings_.end())
                             continue;
@@ -879,48 +981,63 @@ void Bm25Index::score_sdm(std::string_view query, std::span<float> out_scores,
                 }
             }
         } else {
-            for (std::uint64_t h : q_hashes) {
-                const auto pit = postings_.find(h);
-                if (pit == postings_.end())
-                    continue;
-                const float idf = pit->second.idf;
-                const float ttf = static_cast<float>(pit->second.total_tf);
-                for (const auto& [did, tf] : pit->second.docs) {
-                    const float tff = static_cast<float>(tf);
-                    const float dl = static_cast<float>(doc_lengths_[did]);
-                    float contribution = 0.0f;
-                    switch (cfg_.variant) {
-                        case Bm25Variant::Atire:
-                            contribution = score_atire(tff, dl, idf, k1, b, avg);
-                            break;
-                        case Bm25Variant::AtireLTD:
-                            contribution =
-                                score_atire_ltd(tff, dl, idf, k1, b, avg, cfg_.ltd_alpha);
-                            break;
-                        case Bm25Variant::BM25Plus:
-                            contribution = score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
-                            break;
-                        case Bm25Variant::BM25L:
-                            contribution = score_bm25_l(tff, dl, idf, k1, b, avg, delta);
-                            break;
-                        case Bm25Variant::DLH13:
-                            contribution = score_dlh13(tff, dl, avg, n_docs, ttf);
-                            break;
-                        case Bm25Variant::PL2:
-                            contribution = score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
-                            break;
-                        case Bm25Variant::DPH:
-                            contribution = score_dph(tff, dl, avg, n_docs, ttf);
-                            break;
-                        case Bm25Variant::Dcm:
-                            contribution = score_dcm(tff, total_tokens_, ttf, alpha_sum_);
-                            break;
-                        case Bm25Variant::SubwordAwareBackoff:
-                            // Unreachable: handled above.
-                            break;
+            auto accumulate_unigram = [&](auto&& scorer) {
+                for (std::uint64_t h : q_hashes) {
+                    const auto pit = postings_.find(h);
+                    if (pit == postings_.end())
+                        continue;
+                    const float idf = pit->second.idf;
+                    const float ttf = static_cast<float>(pit->second.total_tf);
+                    for (const auto& [did, tf] : pit->second.docs) {
+                        const float tff = static_cast<float>(tf);
+                        const float dl = static_cast<float>(doc_lengths_[did]);
+                        out_scores[did] += cfg.lambda_unigram * scorer(tff, dl, idf, ttf);
                     }
-                    out_scores[did] += cfg.lambda_unigram * contribution;
                 }
+            };
+            switch (cfg_.variant) {
+                case Bm25Variant::Atire:
+                    accumulate_unigram([&](float tff, float dl, float idf, float) {
+                        return score_atire(tff, dl, idf, k1, b, avg);
+                    });
+                    break;
+                case Bm25Variant::AtireLTD:
+                    accumulate_unigram([&](float tff, float dl, float idf, float) {
+                        return score_atire_ltd(tff, dl, idf, k1, b, avg, cfg_.ltd_alpha);
+                    });
+                    break;
+                case Bm25Variant::BM25Plus:
+                    accumulate_unigram([&](float tff, float dl, float idf, float) {
+                        return score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
+                    });
+                    break;
+                case Bm25Variant::BM25L:
+                    accumulate_unigram([&](float tff, float dl, float idf, float) {
+                        return score_bm25_l(tff, dl, idf, k1, b, avg, delta);
+                    });
+                    break;
+                case Bm25Variant::DLH13:
+                    accumulate_unigram([&](float tff, float dl, float, float ttf) {
+                        return score_dlh13(tff, dl, avg, n_docs, ttf);
+                    });
+                    break;
+                case Bm25Variant::PL2:
+                    accumulate_unigram([&](float tff, float dl, float, float ttf) {
+                        return score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
+                    });
+                    break;
+                case Bm25Variant::DPH:
+                    accumulate_unigram([&](float tff, float dl, float, float ttf) {
+                        return score_dph(tff, dl, avg, n_docs, ttf);
+                    });
+                    break;
+                case Bm25Variant::Dcm:
+                    accumulate_unigram([&](float tff, float, float, float ttf) {
+                        return score_dcm(tff, total_tokens_, ttf, alpha_sum_);
+                    });
+                    break;
+                case Bm25Variant::SubwordAwareBackoff:
+                    break;
             }
         }
     }
@@ -992,11 +1109,11 @@ void Bm25Index::score_wsdm(std::string_view query, std::span<float> out_scores,
     const float delta = cfg_.delta;
     const float n_docs = static_cast<float>(doc_lengths_.size());
 
-    static thread_local std::vector<std::string> q_strs;
+    static thread_local std::vector<std::string_view> q_strs;
     static thread_local std::vector<std::uint64_t> q_hashes;
     q_strs.clear();
     q_hashes.clear();
-    StringTermSink ssink{};
+    StringViewTermSink ssink{};
     ssink.strs = &q_strs;
     ssink.hashes = &q_hashes;
     ssink.family = cfg_.hash;
@@ -1010,7 +1127,7 @@ void Bm25Index::score_wsdm(std::string_view query, std::span<float> out_scores,
         if (cfg_.variant == Bm25Variant::SubwordAwareBackoff) {
             const float gamma = cfg_.subword_gamma;
             const float ngram_avg = ngram_avg_dl_ > 0.0f ? ngram_avg_dl_ : 1.0f;
-            static thread_local std::unordered_map<std::uint64_t, std::uint32_t> term_ngram_tf;
+            static thread_local std::vector<std::uint64_t> term_ngram_hashes;
             for (std::size_t qi = 0; qi < q_hashes.size(); ++qi) {
                 const std::uint64_t h = q_hashes[qi];
                 const auto pit = postings_.find(h);
@@ -1027,15 +1144,10 @@ void Bm25Index::score_wsdm(std::string_view query, std::span<float> out_scores,
                     }
                 }
                 if (alpha < 1.0f) {
-                    term_ngram_tf.clear();
-                    TfSink ng_sink{};
-                    ng_sink.tf = &term_ngram_tf;
-                    ng_sink.family = cfg_.hash;
-                    ng_sink.seed = cfg_.hash_seed;
-                    const auto ntcfg = ngram_only_cfg(cfg_.ngram_min, cfg_.ngram_max);
-                    tokenize(q_strs[qi], ntcfg, ng_sink);
+                    collect_unique_query_ngrams(q_strs[qi], cfg_.hash, cfg_.hash_seed,
+                                                cfg_.ngram_min, cfg_.ngram_max, term_ngram_hashes);
                     const float w = 1.0f - alpha;
-                    for (const auto& [gh, _qcount] : term_ngram_tf) {
+                    for (const auto gh : term_ngram_hashes) {
                         const auto git = ngram_postings_.find(gh);
                         if (git == ngram_postings_.end())
                             continue;
@@ -1051,47 +1163,63 @@ void Bm25Index::score_wsdm(std::string_view query, std::span<float> out_scores,
                 }
             }
         } else {
-            for (std::uint64_t h : q_hashes) {
-                const auto pit = postings_.find(h);
-                if (pit == postings_.end())
-                    continue;
-                const float idf = pit->second.idf;
-                const float ttf = static_cast<float>(pit->second.total_tf);
-                for (const auto& [did, tf] : pit->second.docs) {
-                    const float tff = static_cast<float>(tf);
-                    const float dl = static_cast<float>(doc_lengths_[did]);
-                    float contribution = 0.0f;
-                    switch (cfg_.variant) {
-                        case Bm25Variant::Atire:
-                            contribution = score_atire(tff, dl, idf, k1, b, avg);
-                            break;
-                        case Bm25Variant::AtireLTD:
-                            contribution =
-                                score_atire_ltd(tff, dl, idf, k1, b, avg, cfg_.ltd_alpha);
-                            break;
-                        case Bm25Variant::BM25Plus:
-                            contribution = score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
-                            break;
-                        case Bm25Variant::BM25L:
-                            contribution = score_bm25_l(tff, dl, idf, k1, b, avg, delta);
-                            break;
-                        case Bm25Variant::DLH13:
-                            contribution = score_dlh13(tff, dl, avg, n_docs, ttf);
-                            break;
-                        case Bm25Variant::PL2:
-                            contribution = score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
-                            break;
-                        case Bm25Variant::DPH:
-                            contribution = score_dph(tff, dl, avg, n_docs, ttf);
-                            break;
-                        case Bm25Variant::Dcm:
-                            contribution = score_dcm(tff, total_tokens_, ttf, alpha_sum_);
-                            break;
-                        case Bm25Variant::SubwordAwareBackoff:
-                            break;
+            auto accumulate_unigram = [&](auto&& scorer) {
+                for (std::uint64_t h : q_hashes) {
+                    const auto pit = postings_.find(h);
+                    if (pit == postings_.end())
+                        continue;
+                    const float idf = pit->second.idf;
+                    const float ttf = static_cast<float>(pit->second.total_tf);
+                    for (const auto& [did, tf] : pit->second.docs) {
+                        const float tff = static_cast<float>(tf);
+                        const float dl = static_cast<float>(doc_lengths_[did]);
+                        out_scores[did] += cfg.lambda_unigram * scorer(tff, dl, idf, ttf);
                     }
-                    out_scores[did] += cfg.lambda_unigram * contribution;
                 }
+            };
+            switch (cfg_.variant) {
+                case Bm25Variant::Atire:
+                    accumulate_unigram([&](float tff, float dl, float idf, float) {
+                        return score_atire(tff, dl, idf, k1, b, avg);
+                    });
+                    break;
+                case Bm25Variant::AtireLTD:
+                    accumulate_unigram([&](float tff, float dl, float idf, float) {
+                        return score_atire_ltd(tff, dl, idf, k1, b, avg, cfg_.ltd_alpha);
+                    });
+                    break;
+                case Bm25Variant::BM25Plus:
+                    accumulate_unigram([&](float tff, float dl, float idf, float) {
+                        return score_bm25_plus(tff, dl, idf, k1, b, avg, delta);
+                    });
+                    break;
+                case Bm25Variant::BM25L:
+                    accumulate_unigram([&](float tff, float dl, float idf, float) {
+                        return score_bm25_l(tff, dl, idf, k1, b, avg, delta);
+                    });
+                    break;
+                case Bm25Variant::DLH13:
+                    accumulate_unigram([&](float tff, float dl, float, float ttf) {
+                        return score_dlh13(tff, dl, avg, n_docs, ttf);
+                    });
+                    break;
+                case Bm25Variant::PL2:
+                    accumulate_unigram([&](float tff, float dl, float, float ttf) {
+                        return score_pl2(tff, dl, avg, n_docs, ttf, cfg_.pl2_c);
+                    });
+                    break;
+                case Bm25Variant::DPH:
+                    accumulate_unigram([&](float tff, float dl, float, float ttf) {
+                        return score_dph(tff, dl, avg, n_docs, ttf);
+                    });
+                    break;
+                case Bm25Variant::Dcm:
+                    accumulate_unigram([&](float tff, float, float, float ttf) {
+                        return score_dcm(tff, total_tokens_, ttf, alpha_sum_);
+                    });
+                    break;
+                case Bm25Variant::SubwordAwareBackoff:
+                    break;
             }
         }
     }

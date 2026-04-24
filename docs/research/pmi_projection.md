@@ -1,8 +1,7 @@
 # PMI / co-occurrence projection
 
 Training-free word embeddings via shifted positive PMI, factored with
-randomized SVD. Caller-owned seed corpus, deterministic given
-`(seed_corpus, PmiConfig)`.
+randomized SVD. Deterministic given `(seed_corpus, PmiConfig)`.
 
 ## Math
 
@@ -30,10 +29,9 @@ iteration):
 `M` is symmetric (co-occurrence is symmetric), so this reduces to the
 eigendecomposition branch of Halko §5 rather than the general SVD.
 
-Levy & Goldberg (NeurIPS 2014) proved word2vec-SGNS is implicit
-factorization of this same SPPMI matrix — the factorization is closed-form;
-only the SGD optimizer is “trained.” A direct SPPMI + randomized SVD
-pipeline is a strict subset of word2vec: same math, deterministic optimizer.
+Levy & Goldberg (NeurIPS 2014) showed that word2vec-SGNS implicitly factors
+this same SPPMI matrix. A direct SPPMI + randomized SVD pipeline keeps the same
+math with a deterministic optimizer.
 
 ## Encoder integration
 
@@ -63,15 +61,15 @@ Every benchmark row should name its provenance tier in the config string.
 
 Even with the leakage-positive `_incorpus` ceiling, unigram static PMI
 undershoots the target quality band on scifact and makes the cascade reranker
-worse, not better. The gap appears to come from two limits:
+worse, not better. The main limits are:
 
 - **Contextual vs static.** MiniLM-L6 produces context-sensitive token
   representations; PMI rows are static per-type.
 - **Multi-word terminology.** Scientific relevance often lives in phrases
   (“T cell”, “reverse transcriptase”), while the current learner is unigram.
 
-Decision: keep PMI as a documented experimental head, but do not present it as
-a production-quality improvement on scifact.
+Decision: keep PMI as a documented experimental head, but not as a
+production-quality improvement on scifact.
 
 ## References
 

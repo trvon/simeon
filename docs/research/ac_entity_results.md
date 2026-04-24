@@ -22,7 +22,10 @@ Validation bar: lift nDCG@10 by at least `+0.005` on at least two corpora or `+0
 
 **Disproved.** The best gain is FiQA `w=0.2` at `+0.0026`, below the promote threshold, and the other corpora are flat-to-negative.
 
-Interpretation: the self-bootstrapped dictionary does produce a tiny lexical signal on FiQA once queries are transformed into the entity-token space, but not enough to claim a meaningful retrieval lever on BEIR body-only fixtures. The next honest test of the GLiNER-replacement hypothesis needs either:
+Interpretation: the self-bootstrapped dictionary does produce a tiny lexical
+signal on FiQA once queries are transformed into the entity-token space, but it
+is not enough to claim a meaningful retrieval lever on BEIR body-only fixtures.
+The next honest test of the GLiNER-replacement hypothesis needs either:
 
 - external domain dictionaries (for example UMLS / Wikidata subsets), or
 - a structured-document corpus where entity tags are not just another view of the same short body text.

@@ -1,10 +1,8 @@
 # SDM (Sequential Dependence Model) — negative result
 
 Training-free adjacent-term co-occurrence scoring via Metzler & Croft 2005.
-Implemented as a composable re-scorer on `Bm25Index` (`score_sdm()`) with
-parallel ordered/unordered word-bigram postings, gated behind
-`Bm25Config::build_word_bigrams = false` (default off; zero runtime cost
-for callers that do not opt in).
+Implemented as a composable rescoring path on `Bm25Index` (`score_sdm()`),
+gated behind `Bm25Config::build_word_bigrams = false` by default.
 
 ## Math
 
@@ -28,29 +26,19 @@ word-length `dl`.
 | FiQA     | SAB-sm 0.198 | 0.206         | +0.008  | —                    | —       |
 | NFCorpus | SAB-sm 0.298 | 0.298         | +0.000  | —                    | —       |
 
-Plan target for promotion: FiQA Atire-SDM lift ≥ +0.010. Measured +0.006 —
-below threshold. Metzler's defaults beat the unigram-heavier weights on
-FiQA (+0.006 vs +0.003), confirming the ordered-bigram leg is
-load-bearing; the magnitude is just too small to justify cascade/router
-promotion.
+Plan target for promotion: FiQA Atire-SDM lift ≥ +0.010. Measured +0.006, so
+the row stays below threshold. The ordered-bigram leg is real, but too small to
+justify promotion.
 
 ## Mechanism — why FiQA undershoots
 
-SDM rewards query-document **adjacency** of fixed multi-word terms. FiQA's
-semantic-paraphrase failure mode is different: a query "cash flow
-statement" against a doc that says "statement of operating cash flows"
-lifts on unigram IDF sharing, not on bigram adjacency (the words are
-reordered and split by prepositions). The wins SDM does deliver on FiQA
-come from the small fraction of queries that contain a genuinely fixed
-term ("interest rate", "mortgage-backed"). That subset isn't large enough
-to move the corpus-wide nDCG past the promote threshold.
+SDM rewards adjacency of fixed multi-word terms. FiQA's failure mode is more
+often paraphrase and reordering, so SDM only helps on the minority of queries
+that contain genuinely fixed phrases.
 
-Scifact and NFCorpus undershoot for the opposite reason: scientific
-abstracts *do* contain multi-word terminology ("T cell", "cystic
-fibrosis"), but SAB-smooth's char-n-gram backoff already captures the
-morphological signal these bigrams carry. Adding bigrams on top of SAB
-double-counts the same information; SAB-SDM on scifact ties SAB-smooth
-exactly.
+Scifact and NFCorpus undershoot for the opposite reason: SAB-smooth already
+captures much of the useful signal that those bigrams carry, so SDM mostly
+double-counts it.
 
 ## Infrastructure disposition
 
@@ -64,10 +52,8 @@ exactly.
 
 ## Next lever
 
-Weighted Sequential Dependence (Bendersky & Croft 2010, WSDM) replaces
-fixed λ with per-bigram corpus-statistic weights. Requires a tuner —
-deferred unless a corpus lands where fixed SDM shows a promote-threshold
-lift and the weight-sensitivity row disagrees with Metzler's defaults.
+Weighted Sequential Dependence (Bendersky & Croft 2010) is the natural follow-up
+if a corpus ever shows a stronger fixed-SDM lift.
 
 ## References
 

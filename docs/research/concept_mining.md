@@ -60,41 +60,25 @@ SAB-smooth base stays inside the regression gate on scifact (+0.002) and
 NFCorpus (−0.003) but breaks it on FiQA (−0.016); promote gate (FiQA lift
 ≥ +0.010) is missed on every config.
 
-Step 1n closes as a documented null result. Infrastructure ships in
-`simeon::` namespace with no routing wire-up and no default-on flag, so
-existing callers are byte-identical to pre-Step-1n behavior.
+Step 1n closes as a documented null result. The infrastructure ships opt-in in
+`simeon::`, with no router integration or default-on path.
 
 ## Mechanism — why concept expansion regresses the Atire base
 
-The concept score magnitude significantly exceeds the base BM25 magnitude.
-A single matched bigram contributes `PMI × BM25_bigram_term`, typically 5–25
-score units (PMI 2–10 nats × BM25 term 1–5). Base BM25 for a 4-word query is
-typically 10–30. At `concept_weight=0.5`, one matched concept can rival the
-entire base score; a query with 3+ matched concepts can reorder the top-100
-around exact-phrase hits.
+The concept score magnitude significantly exceeds the base BM25 magnitude. At
+`concept_weight=0.5`, one matched concept can rival the whole base score, so a
+few matched concepts can reorder the top-100 around exact-phrase hits.
 
-Exact-phrase reward is the wrong signal on scifact: queries are scientific
-claims that correct-answer papers routinely paraphrase. Docs containing the
-*exact phrase* in the query are often not the most relevant — rewarding them
-outweighs the paraphrase-tolerant base BM25.
-
-SAB-smooth's char-n-gram backoff already rewards morphological variants of
-query terms, which subsumes most of the high-PMI bigrams a human would flag
-as "concepts." Adding a second exact-phrase signal on top either replays the
-same match (neutral on scifact: +0.002), or double-counts (mild regression
-on NFCorpus: −0.003, and moderate regression on FiQA: −0.016). On FiQA,
-the finance-Q&A register makes this worse: question bigrams rarely co-occur
-verbatim in paraphrased answers, so concepts fire on spurious matches more
-often than on the paraphrase the query intended to express.
+Exact-phrase reward is the wrong signal on scifact, where relevant abstracts
+often paraphrase the claim. SAB-smooth already captures much of the useful
+morphological signal, so the concept leg either duplicates it or amplifies the
+wrong phrase matches, especially on FiQA.
 
 ## Why the fix isn't just "lower the weight"
 
-On scifact with Atire, `weight=0.50 → −0.108`, `weight=0.25 → −0.055`. A
-weight of 0.05 would plausibly zero out the regression but also zero out
-any hypothetical FiQA lift. The scale mismatch is structural: base BM25 and
-PMI-weighted concept BM25 don't live on the same scale, and the per-query
-number of matched concepts is highly variable (some queries match 0, some
-match 10+). No fixed scalar weight normalizes across queries.
+Lowering the blend weight is not enough. The mismatch is structural: base BM25
+and PMI-weighted concept BM25 do not live on the same scale, and the number of
+matched concepts varies too much across queries for one fixed scalar to work.
 
 Training-free fixes worth exploring in a follow-on step:
 
@@ -107,9 +91,8 @@ Training-free fixes worth exploring in a follow-on step:
 3. **Corpus-wide PMI max normalization**: precompute `max_pmi` across all
    mined concepts; divide PMI by `max_pmi` so the weight PMI ∈ [0, 1].
 
-Each is a small re-ship (tens of LOC) but doesn't change the infrastructure
-under test — it calibrates the blend. Deferred until we have evidence that
-calibration would close the FiQA gap.
+Each is a small calibration change, but none is justified yet by the current
+three-corpus evidence.
 
 ## Infrastructure disposition
 
@@ -120,9 +103,7 @@ calibration would close the FiQA gap.
 - Bench rows `bm25_atire_concepts_l0.50`, `bm25_atire_concepts_l0.25`,
   `bm25_sab_smooth_concepts_l0.50` stay in the three-corpus `*_full.jsonl`
   files for regression tracking.
-- Not wired into `QueryRouter::choose()` recipes. The pre-declared regression
-  gate is violated; shipping a routed version would need at least one of
-  the training-free calibrations above.
+- Not wired into `QueryRouter::choose()` because the regression gate is clearly violated.
 
 ## References
 

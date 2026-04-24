@@ -65,7 +65,8 @@ simeon::FragmentGeometryConfig make_geom_cfg(const RunConfig& run) {
                                     : simeon::PhssConfig::Criterion::LargestGap;
     cfg.phss_adaptive = std::string_view(run.mode) == "adaptive";
     cfg.phss_confidence_threshold = 0.55f;
-    cfg.top_fragments_per_doc = std::string_view(run.builder) == "basic" ? 4u : 8u;
+    const std::string_view builder = run.builder;
+    cfg.top_fragments_per_doc = (builder == "basic" || builder == "basicpos") ? 4u : 8u;
     return cfg;
 }
 
@@ -77,6 +78,8 @@ build_doc_frags(const RunConfig& run, const simeon::Encoder& enc, const simeon::
     for (const auto& doc : docs) {
         if (std::string_view(run.builder) == "basic") {
             out.push_back(simeon::build_doc_semantic_fragments(enc, doc, idx, 6, 8));
+        } else if (std::string_view(run.builder) == "basicpos") {
+            out.push_back(simeon::build_doc_semantic_fragments(enc, doc, idx, 6, 8, 0.20f));
         } else if (std::string_view(run.builder) == "richcov") {
             out.push_back(simeon::build_doc_semantic_fragments_rich_covered(enc, doc, idx, 6, 8,
                                                                             0.60f, 0.80f));
@@ -87,6 +90,7 @@ build_doc_frags(const RunConfig& run, const simeon::Encoder& enc, const simeon::
             throw std::runtime_error("unknown builder: " + std::string(run.builder));
         }
     }
+    simeon::compress_fragments_to_bf16(out, enc.output_dim());
     return out;
 }
 
@@ -104,10 +108,9 @@ double mean_of(const std::vector<simeon::FragmentGeometryProfile>& rows, F&& fie
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::fprintf(
-            stderr,
-            "usage: profile_fragment_geometry <fixture_dir> "
-            "<builder:basic|richcov|richmmr> <mode:fixed|phss|adaptive|approx> [iters=5]\n");
+        std::fprintf(stderr, "usage: profile_fragment_geometry <fixture_dir> "
+                             "<builder:basic|basicpos|richcov|richmmr> "
+                             "<mode:fixed|phss|adaptive|approx> [iters=5]\n");
         return 2;
     }
 
@@ -172,6 +175,14 @@ int main(int argc, char** argv) {
     auto doc_frags = build_doc_frags(run, enc, idx, doc_texts);
     const auto t_frag1 = Clock::now();
 
+    std::size_t total_fragments = 0;
+    for (const auto& doc : doc_frags)
+        total_fragments += doc.size();
+    const std::size_t f32_fragment_bytes =
+        total_fragments * static_cast<std::size_t>(enc.output_dim()) * sizeof(float);
+    const std::size_t bf16_fragment_bytes =
+        total_fragments * static_cast<std::size_t>(enc.output_dim()) * sizeof(std::uint16_t);
+
     const auto cfg = make_geom_cfg(run);
     std::vector<simeon::FragmentGeometryProfile> profiles;
     profiles.reserve(static_cast<std::size_t>(iters) * query_texts.size());
@@ -190,10 +201,15 @@ int main(int argc, char** argv) {
 
     std::printf("metric\tvalue\n");
     std::printf("builder\t%s\n", run.builder);
+    std::printf("fragment_storage\tbf16\n");
     std::printf("mode\t%s\n", run.mode);
     std::printf("docs\t%zu\n", doc_texts.size());
     std::printf("queries\t%zu\n", query_texts.size());
     std::printf("iters\t%d\n", iters);
+    std::printf("fragment_dim\t%u\n", enc.output_dim());
+    std::printf("fragment_count\t%zu\n", total_fragments);
+    std::printf("fragment_bytes_f32\t%zu\n", f32_fragment_bytes);
+    std::printf("fragment_bytes_bf16\t%zu\n", bf16_fragment_bytes);
     std::printf("bm25_add_docs_us\t%.3f\n", us(t_add0, t_add1));
     std::printf("bm25_finalize_us\t%.3f\n", us(t_add1, t_bm251));
     std::printf("pmi_learn_us\t%.3f\n", us(t_pmi0, t_pmi1));
@@ -212,6 +228,23 @@ int main(int argc, char** argv) {
                 mean_of(profiles, [](const auto& p) { return p.phss_pairwise_us; }));
     std::printf("phss_select_mean_us\t%.3f\n",
                 mean_of(profiles, [](const auto& p) { return p.phss_select_us; }));
+    std::printf("phss_select_edge_gather_mean_us\t%.3f\n",
+                mean_of(profiles, [](const auto& p) { return p.phss_select_edge_gather_us; }));
+    std::printf("phss_select_edge_sort_mean_us\t%.3f\n",
+                mean_of(profiles, [](const auto& p) { return p.phss_select_edge_sort_us; }));
+    std::printf("phss_select_uf_mean_us\t%.3f\n",
+                mean_of(profiles, [](const auto& p) { return p.phss_select_uf_us; }));
+    std::printf("phss_select_survivor_mean_us\t%.3f\n",
+                mean_of(profiles, [](const auto& p) { return p.phss_select_survivor_us; }));
+    std::printf("phss_select_death_sort_mean_us\t%.3f\n",
+                mean_of(profiles, [](const auto& p) { return p.phss_select_death_sort_us; }));
+    std::printf("phss_select_criterion_mean_us\t%.3f\n",
+                mean_of(profiles, [](const auto& p) { return p.phss_select_criterion_us; }));
+    std::printf("triangle_count_mean_us\t%.3f\n",
+                mean_of(profiles, [](const auto& p) { return p.triangle_count_us; }));
+    std::printf("triangle_count_total_mean\t%.3f\n", mean_of(profiles, [](const auto& p) {
+                    return static_cast<double>(p.triangle_count_total);
+                }));
     std::printf("query_attention_mean_us\t%.3f\n",
                 mean_of(profiles, [](const auto& p) { return p.query_attention_us; }));
     std::printf("adjacency_mean_us\t%.3f\n",

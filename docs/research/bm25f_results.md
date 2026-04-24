@@ -1,6 +1,7 @@
 # BM25F auxiliary-field plumbing
 
-`Bm25Index` now supports an optional auxiliary text field at ingest and a BM25F-style scorer:
+`Bm25Index` now supports an optional auxiliary text field at ingest and a
+BM25F-style scorer:
 
 - `add_doc(body, aux)` indexes a parallel aux posting list with its own length statistics.
 - `score_bm25f(body_query, aux_query, ...)` linearly combines body and aux scores, and the one-query overload reuses the same query text for both fields.
@@ -23,5 +24,7 @@ Result: **passed on all six runs** (`scifact`, `nfcorpus`, `fiqa` × `textrank`,
 
 Notes:
 
-- The entity-field path required a distinct auxiliary query string: the aux field stores matched pattern IDs (`entNNN`), so AC must transform queries into the same token space before BM25F can score them.
-- The core plumbing is validated even though the structural experiments below do not meet their promote thresholds.
+- The entity-field path requires a distinct auxiliary query string because the
+  aux field stores matched pattern IDs (`entNNN`).
+- The plumbing itself is sound even though the downstream structural experiments
+  do not meet their promote thresholds.

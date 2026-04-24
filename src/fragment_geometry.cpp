@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <unordered_map>
@@ -70,18 +71,47 @@ float vector_l2_norm(const float* v, std::uint32_t dim) {
     return static_cast<float>(std::sqrt(sq));
 }
 
-void l2_normalize_inplace(float* v, std::uint32_t dim) {
-    const float n = vector_l2_norm(v, dim);
-    if (n <= 0.0f)
-        return;
-    const float inv = 1.0f / n;
-    for (std::uint32_t i = 0; i < dim; ++i)
-        v[i] *= inv;
-}
-
 // Routes through the SIMD-dispatched dot kernel.
 inline float dot(const float* a, const float* b, std::size_t n) {
     return simd::dot(a, b, static_cast<std::uint32_t>(n));
+}
+
+// BF16 (bfloat16) compression helpers.
+// Truncates the lower 16 bits of a float32 mantissa; preserves exponent exactly.
+inline std::uint16_t float_to_bf16(float f) noexcept {
+    std::uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    return static_cast<std::uint16_t>(bits >> 16);
+}
+
+inline float bf16_to_float(std::uint16_t bf) noexcept {
+    std::uint32_t bits = static_cast<std::uint32_t>(bf) << 16;
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+void store_vec_bf16(const float* src, std::uint32_t dim, std::vector<std::uint16_t>& dst) {
+    dst.resize(dim);
+    for (std::uint32_t i = 0; i < dim; ++i)
+        dst[i] = float_to_bf16(src[i]);
+}
+
+void decompress_bf16(const std::uint16_t* src, std::uint32_t dim, float* dst) {
+    for (std::uint32_t i = 0; i < dim; ++i)
+        dst[i] = bf16_to_float(src[i]);
+}
+
+// Read a fragment's vector, decompressing from BF16 if vec is empty.
+void read_frag_vec(const SemanticFragment& frag, std::uint32_t dim, float* dst) {
+    if (!frag.vec.empty()) {
+        for (std::uint32_t i = 0; i < dim; ++i)
+            dst[i] = frag.vec[i];
+    } else if (!frag.vec_bf16.empty()) {
+        decompress_bf16(frag.vec_bf16.data(), dim, dst);
+    } else {
+        std::memset(dst, 0, dim * sizeof(float));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,10 +285,21 @@ void merge_signature_max(SparseSignature& dst, const SparseSignature& src,
 std::vector<SemanticFragment> build_doc_semantic_fragments(const Encoder& enc, std::string_view doc,
                                                            const Bm25Index& idx,
                                                            std::uint32_t top_sentence_fragments,
-                                                           std::uint32_t fragment_signature_terms) {
+                                                           std::uint32_t fragment_signature_terms,
+                                                           float position_weight) {
     TextRank ranker;
     const auto dim = enc.output_dim();
-    auto ranked = ranker.rank(doc, top_sentence_fragments);
+    auto ranked = ranker.rank(doc, 4 * top_sentence_fragments);
+    if (position_weight > 0.0f && !ranked.empty()) {
+        for (auto& s : ranked)
+            s.score = (1.0f - position_weight) * s.score + position_weight / (1.0f + s.index);
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto& a, const auto& b) { return a.score > b.score; });
+        if (ranked.size() > top_sentence_fragments)
+            ranked.resize(top_sentence_fragments);
+    } else if (ranked.size() > top_sentence_fragments) {
+        ranked.resize(top_sentence_fragments);
+    }
     std::vector<SemanticFragment> out;
     out.reserve(ranked.empty() ? 1 : ranked.size());
 
@@ -267,7 +308,7 @@ std::vector<SemanticFragment> build_doc_semantic_fragments(const Encoder& enc, s
         enc.encode(text, vec.data());
         auto sig = build_sparse_signature(idx, text, fragment_signature_terms);
         if (vector_l2_norm(vec.data(), dim) > 0.0f && !sig.terms.empty())
-            out.push_back(SemanticFragment{std::move(vec), std::move(sig)});
+            out.push_back(SemanticFragment{std::move(vec), {}, std::move(sig)});
     };
 
     for (const auto& sent : ranked)
@@ -297,16 +338,15 @@ build_doc_semantic_fragments_rich(const Encoder& enc, std::string_view doc, cons
         const float inv = 1.0f / static_cast<float>(out.size());
         for (float& x : centroid)
             x *= inv;
-        l2_normalize_inplace(centroid.data(), dim);
-        if (vector_l2_norm(centroid.data(), dim) > 0.0f && !merged.terms.empty())
-            out.push_back(SemanticFragment{std::move(centroid), std::move(merged)});
+        if (simd::l2_normalize(centroid.data(), dim) > 0.0f && !merged.terms.empty())
+            out.push_back(SemanticFragment{std::move(centroid), {}, std::move(merged)});
     }
 
     std::vector<float> doc_vec(dim, 0.0f);
     enc.encode(doc, doc_vec.data());
     auto doc_sig = build_sparse_signature(idx, doc, fragment_signature_terms * 2);
     if (vector_l2_norm(doc_vec.data(), dim) > 0.0f && !doc_sig.terms.empty())
-        out.push_back(SemanticFragment{std::move(doc_vec), std::move(doc_sig)});
+        out.push_back(SemanticFragment{std::move(doc_vec), {}, std::move(doc_sig)});
     return out;
 }
 
@@ -565,6 +605,44 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     const auto t_bm250 = profile ? Clock::now() : Clock::time_point{};
     idx.score(query, bm25_scores);
     auto pool = top_k(bm25_scores, cfg.pool_size);
+
+    // Plan 2 self-KB expansion: union pool with precomputed doc-doc neighbors
+    // of each pool member. Phase B adds: per-doc neighbor cap,
+    // BM25-relevance filter, topology (score-decay) gate.
+    if (!cfg.doc_doc_neighbors.empty()) {
+        bool apply_expansion = true;
+        if (cfg.selfkb_gate_score_decay_min > 0.0f) {
+            const float decay = bm25_pool_decay(pool);
+            apply_expansion = (decay >= cfg.selfkb_gate_score_decay_min);
+        }
+        if (apply_expansion) {
+            std::vector<std::uint8_t> in_pool(static_cast<std::size_t>(nd), 0);
+            for (const auto& [did, _sc] : pool)
+                in_pool[did] = 1;
+            const std::size_t orig_pool_size = pool.size();
+            const std::uint32_t n_cap = cfg.selfkb_neighbors_per_pool_doc;
+            for (std::size_t i = 0; i < orig_pool_size; ++i) {
+                const auto did = pool[i].first;
+                if (did >= cfg.doc_doc_neighbors.size())
+                    continue;
+                const auto& neighbors = cfg.doc_doc_neighbors[did];
+                const std::size_t limit = (n_cap == 0)
+                                              ? neighbors.size()
+                                              : std::min<std::size_t>(n_cap, neighbors.size());
+                for (std::size_t k = 0; k < limit; ++k) {
+                    const auto nid = neighbors[k];
+                    if (nid >= nd || in_pool[nid])
+                        continue;
+                    const float nscore = bm25_scores[nid];
+                    if (nscore <= cfg.selfkb_min_bm25_score)
+                        continue;
+                    pool.emplace_back(nid, nscore);
+                    in_pool[nid] = 1;
+                }
+            }
+        }
+    }
+
     const auto t_bm251 = profile ? Clock::now() : Clock::time_point{};
     if (profile) {
         profile->bm25_us = elapsed_us(t_bm250, t_bm251);
@@ -614,6 +692,7 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
 
     struct FragRef {
         std::uint32_t pool_index = 0;
+        std::uint32_t frag_index = 0;
         const float* vec = nullptr;
     };
 
@@ -623,9 +702,11 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     for (std::size_t pi = 0; pi < pool.size(); ++pi) {
         const auto did = pool[pi].first;
         const auto limit = std::min<std::size_t>(cfg.top_fragments_per_doc, doc_frags[did].size());
-        for (std::size_t fi = 0; fi < limit; ++fi)
+        for (std::size_t fi = 0; fi < limit; ++fi) {
             frags.push_back(FragRef{.pool_index = static_cast<std::uint32_t>(pi),
-                                    .vec = doc_frags[did][fi].vec.data()});
+                                    .frag_index = static_cast<std::uint32_t>(fi),
+                                    .vec = nullptr});
+        }
     }
     if (frags.empty()) {
         if (profile) {
@@ -635,34 +716,42 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
         }
         return scores;
     }
+
     if (profile) {
         profile->gather_us = elapsed_us(t_gather0, Clock::now());
         profile->pool_fragments = static_cast<std::uint32_t>(frags.size());
     }
 
     const auto t_white0 = profile ? Clock::now() : Clock::time_point{};
-    std::vector<float> mean(dim, 0.0f), var(dim, 0.0f);
-    for (const auto& frag : frags) {
-        for (std::uint32_t d = 0; d < dim; ++d)
-            mean[d] += frag.vec[d];
+    std::vector<float> fvecs_raw(frags.size() * dim, 0.0f);
+    std::vector<float> mean(dim, 0.0f), m2(dim, 0.0f), var(dim, 0.0f);
+    std::size_t seen = 0;
+    for (std::size_t i = 0; i < frags.size(); ++i) {
+        const auto did = pool[frags[i].pool_index].first;
+        const auto& src_frag = doc_frags[did][frags[i].frag_index];
+        float* dst = fvecs_raw.data() + i * dim;
+        read_frag_vec(src_frag, dim, dst);
+        frags[i].vec = dst;
+
+        ++seen;
+        const float inv_seen = 1.0f / static_cast<float>(seen);
+        for (std::uint32_t d = 0; d < dim; ++d) {
+            const float x = dst[d];
+            const float delta = x - mean[d];
+            mean[d] += delta * inv_seen;
+            const float delta2 = x - mean[d];
+            m2[d] += delta * delta2;
+        }
     }
     const float inv_n = 1.0f / static_cast<float>(frags.size());
     for (std::uint32_t d = 0; d < dim; ++d)
-        mean[d] *= inv_n;
-    for (const auto& frag : frags) {
-        for (std::uint32_t d = 0; d < dim; ++d) {
-            const float x = frag.vec[d] - mean[d];
-            var[d] += x * x;
-        }
-    }
-    for (std::uint32_t d = 0; d < dim; ++d)
-        var[d] = std::sqrt(var[d] * inv_n + 1e-6f);
+        var[d] = std::sqrt(m2[d] * inv_n + 1e-6f);
 
     std::vector<float> wq = qvec;
     for (std::uint32_t d = 0; d < dim; ++d)
         wq[d] = (wq[d] - mean[d]) / var[d];
-    l2_normalize_inplace(wq.data(), dim);
-    if (vector_l2_norm(wq.data(), dim) <= 0.0f) {
+    const float wq_inv = simd::l2_normalize(wq.data(), dim);
+    if (wq_inv <= 0.0f) {
         if (profile) {
             profile->whiten_us = elapsed_us(t_white0, Clock::now());
             profile->total_us = elapsed_us(t_total0, Clock::now());
@@ -672,10 +761,11 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
 
     std::vector<float> fvecs(frags.size() * dim, 0.0f);
     for (std::size_t i = 0; i < frags.size(); ++i) {
+        const float* raw = fvecs_raw.data() + i * dim;
         float* dst = fvecs.data() + i * dim;
         for (std::uint32_t d = 0; d < dim; ++d)
-            dst[d] = (frags[i].vec[d] - mean[d]) / var[d];
-        l2_normalize_inplace(dst, dim);
+            dst[d] = (raw[d] - mean[d]) / var[d];
+        simd::l2_normalize(dst, dim);
     }
     if (profile)
         profile->whiten_us = elapsed_us(t_white0, Clock::now());
@@ -684,6 +774,29 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     std::vector<float> qsim(frags.size(), 0.0f);
     for (std::size_t i = 0; i < frags.size(); ++i)
         qsim[i] = dot(wq.data(), fvecs.data() + i * dim, dim);
+
+    const std::uint32_t nf = static_cast<std::uint32_t>(frags.size());
+    const std::uint32_t tri_count = nf * (nf - 1) / 2;
+    const auto t_pair0 = profile ? Clock::now() : Clock::time_point{};
+    std::vector<float> sims_tri;
+    sims_tri.reserve(tri_count);
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        for (std::uint32_t j = i + 1; j < nf; ++j) {
+            sims_tri.push_back(dot(fvecs.data() + i * dim, fvecs.data() + j * dim, dim));
+        }
+    }
+    const auto t_pair1 = profile ? Clock::now() : Clock::time_point{};
+    if (profile)
+        profile->phss_pairwise_us = elapsed_us(t_pair0, t_pair1);
+
+    auto sim_at = [&sims_tri, nf](std::uint32_t a, std::uint32_t b) -> float {
+        if (a == b)
+            return 1.0f;
+        if (a > b)
+            std::swap(a, b);
+        const std::uint32_t offset = a * (2 * nf - a - 1) / 2 + (b - a - 1);
+        return sims_tri[offset];
+    };
 
     float phss_selected_scale = 0.0f;
     bool use_phss_for_graph = false;
@@ -696,26 +809,20 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
         const bool should_run_phss =
             !cfg.phss_adaptive || query_conf >= cfg.phss_confidence_threshold;
         if (should_run_phss) {
-            const std::uint32_t nf = static_cast<std::uint32_t>(frags.size());
-            const std::uint32_t tri_count = nf * (nf - 1) / 2;
-            const auto t_pair0 = profile ? Clock::now() : Clock::time_point{};
-            std::vector<float> sims_tri;
-            sims_tri.reserve(tri_count);
-            for (std::uint32_t i = 0; i < nf; ++i) {
-                for (std::uint32_t j = i + 1; j < nf; ++j) {
-                    sims_tri.push_back(dot(fvecs.data() + i * dim, fvecs.data() + j * dim, dim));
-                }
-            }
-            const auto t_pair1 = profile ? Clock::now() : Clock::time_point{};
-            if (profile)
-                profile->phss_pairwise_us = elapsed_us(t_pair0, t_pair1);
             PhssConfig phss_cfg = cfg.phss_config;
             phss_cfg.dim_max = 0;
             const auto t_sel0 = profile ? Clock::now() : Clock::time_point{};
             auto phss_result = phss_select_scale(sims_tri, nf, phss_cfg);
             const auto t_sel1 = profile ? Clock::now() : Clock::time_point{};
-            if (profile)
+            if (profile) {
                 profile->phss_select_us = elapsed_us(t_sel0, t_sel1);
+                profile->phss_select_edge_gather_us = phss_result.edge_gather_us;
+                profile->phss_select_edge_sort_us = phss_result.edge_sort_us;
+                profile->phss_select_uf_us = phss_result.uf_traversal_us;
+                profile->phss_select_survivor_us = phss_result.survivor_scan_us;
+                profile->phss_select_death_sort_us = phss_result.death_sort_us;
+                profile->phss_select_criterion_us = phss_result.criterion_us;
+            }
             phss_selected_scale = phss_result.selected_scale;
             use_phss_for_graph = (phss_selected_scale > 0.0f);
             if (profile)
@@ -737,6 +844,26 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     } else if (cfg.phss_adaptive) {
         if (profile)
             profile->query_confidence = query_conf;
+    }
+
+    // Plan 4 — single-fragment-per-doc filter. Per pool_index (doc), keep
+    // only the argmax-qsim fragment; suppress others to -inf so the softmax
+    // assigns them zero mass. Breaks multi-fragment averaging at the source.
+    if (cfg.single_fragment_per_doc) {
+        std::vector<std::uint32_t> best_per_pool(pool.size(),
+                                                 std::numeric_limits<std::uint32_t>::max());
+        std::vector<float> best_sim_per_pool(pool.size(), -std::numeric_limits<float>::infinity());
+        for (std::size_t i = 0; i < frags.size(); ++i) {
+            const auto pi = frags[i].pool_index;
+            if (qsim[i] > best_sim_per_pool[pi]) {
+                best_sim_per_pool[pi] = qsim[i];
+                best_per_pool[pi] = static_cast<std::uint32_t>(i);
+            }
+        }
+        for (std::size_t i = 0; i < frags.size(); ++i) {
+            if (best_per_pool[frags[i].pool_index] != i)
+                qsim[i] = -std::numeric_limits<float>::infinity();
+        }
     }
 
     float max_logit = -std::numeric_limits<float>::infinity();
@@ -772,7 +899,7 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
         for (std::size_t j = 0; j < frags.size(); ++j) {
             if (i == j)
                 continue;
-            const float sim = dot(fvecs.data() + i * dim, fvecs.data() + j * dim, dim);
+            const float sim = sim_at(static_cast<std::uint32_t>(i), static_cast<std::uint32_t>(j));
             if (use_phss_for_graph) {
                 if (sim >= phss_selected_scale)
                     sims.emplace_back(sim, static_cast<std::uint32_t>(j));
@@ -828,6 +955,51 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
         profile->graph_edges = graph_edges;
     }
 
+    // PHSS-1D Phase A — triangle counter + per-fragment importance weight.
+    // Counts triangles per node in the kNN graph: for each i, count pairs
+    // (j, k) of i's neighbors where j and k are also adjacent. Each triangle
+    // (i, j, k) is counted three times (once per node). Cost O(N * d^2) where
+    // d is the average degree; tiny compared to phss_select edge sort.
+    std::vector<float> tri_weight;
+    if (cfg.use_triangle_weight && cfg.triangle_alpha != 0.0f) {
+        const auto t_tri0 = profile ? Clock::now() : Clock::time_point{};
+        tri_weight.assign(frags.size(), 1.0f);
+        std::vector<std::uint8_t> in_adj(frags.size(), 0);
+        std::uint64_t tri_total = 0;
+        for (std::size_t i = 0; i < frags.size(); ++i) {
+            for (const auto& [j, _w] : adj[i])
+                in_adj[j] = 1;
+            std::uint32_t tc = 0;
+            for (const auto& [j, _wj] : adj[i]) {
+                for (const auto& [k, _wk] : adj[j]) {
+                    if (k != i && in_adj[k])
+                        ++tc;
+                }
+            }
+            // adj[j] traversal counts each (i,j,k) twice (once via j and once
+            // via k); divide by 2 for the actual per-i triangle count.
+            tri_weight[i] = 1.0f + cfg.triangle_alpha * std::log1p(static_cast<float>(tc / 2));
+            tri_total += tc / 2;
+            for (const auto& [j, _w] : adj[i])
+                in_adj[j] = 0;
+        }
+        if (profile) {
+            profile->triangle_count_us = elapsed_us(t_tri0, Clock::now());
+            profile->triangle_count_total = tri_total;
+        }
+        if (cfg.triangle_placement == FragmentGeometryConfig::TrianglePlacement::QueryAttention) {
+            float renorm_sum = 0.0f;
+            for (std::size_t i = 0; i < frags.size(); ++i) {
+                mass[i] *= tri_weight[i];
+                renorm_sum += mass[i];
+            }
+            if (renorm_sum > 0.0f) {
+                for (float& x : mass)
+                    x /= renorm_sum;
+            }
+        }
+    }
+
     const auto t_diff0 = profile ? Clock::now() : Clock::time_point{};
     for (std::uint32_t step = 0; step < query_steps; ++step) {
         std::fill(ns.begin(), ns.end(), 0.0f);
@@ -845,11 +1017,32 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
         profile->diffuse_us = elapsed_us(t_diff0, Clock::now());
 
     const auto t_blend0 = profile ? Clock::now() : Clock::time_point{};
+    if (cfg.use_triangle_weight && cfg.triangle_alpha != 0.0f &&
+        cfg.triangle_placement == FragmentGeometryConfig::TrianglePlacement::Diffusion &&
+        !tri_weight.empty()) {
+        float renorm_sum = 0.0f;
+        for (std::size_t i = 0; i < frags.size(); ++i) {
+            mass[i] *= tri_weight[i];
+            renorm_sum += mass[i];
+        }
+        if (renorm_sum > 0.0f) {
+            for (float& x : mass)
+                x /= renorm_sum;
+        }
+    }
     std::vector<float> bm_pool(pool.size(), 0.0f), geom_pool(pool.size(), 0.0f);
     for (std::size_t i = 0; i < pool.size(); ++i)
         bm_pool[i] = pool[i].second;
-    for (std::size_t i = 0; i < frags.size(); ++i)
-        geom_pool[frags[i].pool_index] += mass[i];
+    if (cfg.doc_aggregator == FragmentGeometryConfig::DocAggregator::Max) {
+        for (std::size_t i = 0; i < frags.size(); ++i) {
+            float& slot = geom_pool[frags[i].pool_index];
+            if (mass[i] > slot)
+                slot = mass[i];
+        }
+    } else {
+        for (std::size_t i = 0; i < frags.size(); ++i)
+            geom_pool[frags[i].pool_index] += mass[i];
+    }
 
     zscore_inplace(bm_pool);
     zscore_inplace(geom_pool);
@@ -862,6 +1055,19 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     }
 
     return scores;
+}
+
+void compress_fragments_to_bf16(std::span<std::vector<SemanticFragment>> doc_frags,
+                                std::uint32_t dim) {
+    for (auto& doc : doc_frags) {
+        for (auto& frag : doc) {
+            if (frag.vec.empty() || !frag.vec_bf16.empty())
+                continue;
+            store_vec_bf16(frag.vec.data(), dim, frag.vec_bf16);
+            frag.vec.clear();
+            frag.vec.shrink_to_fit();
+        }
+    }
 }
 
 } // namespace simeon

@@ -1,6 +1,7 @@
 #include "simeon/persistent_homology.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -36,9 +37,15 @@ struct UnionFind {
     }
 
     std::uint32_t find(std::uint32_t x) {
-        if (parent[x] != x)
-            parent[x] = find(parent[x]);
-        return parent[x];
+        std::uint32_t root = x;
+        while (parent[root] != root)
+            root = parent[root];
+        while (x != root) {
+            const std::uint32_t next = parent[x];
+            parent[x] = root;
+            x = next;
+        }
+        return root;
     }
 
     bool unite(std::uint32_t a, std::uint32_t b) {
@@ -60,11 +67,17 @@ struct UnionFind {
 
 PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t n,
                              const PhssConfig& cfg) {
+    using Clock = std::chrono::steady_clock;
+    const auto elapsed_us = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::micro>(b - a).count();
+    };
+
     PhssResult result;
     if (n == 0)
         return result;
 
     if (cfg.criterion == PhssConfig::Criterion::LargestGapApprox) {
+        const auto t_gather0 = Clock::now();
         std::vector<float> sims;
         sims.reserve(similarities.size());
         for (float s : similarities) {
@@ -72,16 +85,24 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
                 sims.push_back(s);
         }
         result.n_edges = static_cast<std::uint32_t>(sims.size());
+        const auto t_gather1 = Clock::now();
+        result.edge_gather_us = elapsed_us(t_gather0, t_gather1);
+
         if (sims.empty()) {
             result.selected_scale = 0.0f;
             return result;
         }
+        const auto t_sort0 = Clock::now();
         std::sort(sims.begin(), sims.end());
+        const auto t_sort1 = Clock::now();
+        result.edge_sort_us = elapsed_us(t_sort0, t_sort1);
+
         result.n_pairs = static_cast<std::uint32_t>(sims.size());
         if (sims.size() < 2) {
             result.selected_scale = sims[0];
             return result;
         }
+        const auto t_crit0 = Clock::now();
         float max_gap = -1.0f;
         std::size_t best_idx = 0;
         for (std::size_t i = 0; i + 1 < sims.size(); ++i) {
@@ -92,12 +113,15 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
             }
         }
         result.selected_scale = (sims[best_idx] + sims[best_idx + 1]) * 0.5f;
+        const auto t_crit1 = Clock::now();
+        result.criterion_us = elapsed_us(t_crit0, t_crit1);
         return result;
     }
 
     const UpperTriangular sim{similarities, n};
 
-    // Build edge list: all pairs (i < j) with similarity > threshold
+    // Phase 1: edge materialization
+    const auto t_gather0 = Clock::now();
     struct Edge {
         std::uint32_t i, j;
         float sim;
@@ -112,14 +136,19 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
             }
         }
     }
-
-    // Sort by decreasing similarity
-    std::sort(edges.begin(), edges.end(),
-              [](const Edge& a, const Edge& b) { return a.sim > b.sim; });
-
+    const auto t_gather1 = Clock::now();
+    result.edge_gather_us = elapsed_us(t_gather0, t_gather1);
     result.n_edges = static_cast<std::uint32_t>(edges.size());
 
-    // 0D persistent homology via Union-Find
+    // Phase 2: sort edges by decreasing similarity
+    const auto t_sort0 = Clock::now();
+    std::sort(edges.begin(), edges.end(),
+              [](const Edge& a, const Edge& b) { return a.sim > b.sim; });
+    const auto t_sort1 = Clock::now();
+    result.edge_sort_us = elapsed_us(t_sort0, t_sort1);
+
+    // Phase 3: UF traversal — 0D persistent homology
+    const auto t_uf0 = Clock::now();
     UnionFind uf(n);
     std::vector<float> births(n, 1.0f);
     std::vector<PersistencePair0D> diagram;
@@ -148,8 +177,11 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
 
         uf.unite(dying, surviving);
     }
+    const auto t_uf1 = Clock::now();
+    result.uf_traversal_us = elapsed_us(t_uf0, t_uf1);
 
-    // Components that survive to the end
+    // Phase 4: survivor scan
+    const auto t_surv0 = Clock::now();
     for (std::uint32_t i = 0; i < n; ++i) {
         if (uf.find(i) == i) {
             PersistencePair0D pair;
@@ -164,6 +196,8 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
             diagram.push_back(std::move(pair));
         }
     }
+    const auto t_surv1 = Clock::now();
+    result.survivor_scan_us = elapsed_us(t_surv0, t_surv1);
 
     result.n_pairs = static_cast<std::uint32_t>(diagram.size());
     if (cfg.output_diagram) {
@@ -176,9 +210,8 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
         return result;
     }
 
-    // Collect death similarities for finite-lifetime pairs
-    // Use the local diagram reference; result.diagram may be empty
-    // when output_diagram is false.
+    // Phase 5: death collection + sort
+    const auto t_death0 = Clock::now();
     const auto& diagram_ref = cfg.output_diagram ? result.diagram : diagram;
     std::vector<float> deaths;
     deaths.reserve(result.n_pairs);
@@ -190,10 +223,17 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
 
     if (deaths.empty()) {
         result.selected_scale = 0.0f;
+        const auto t_death1 = Clock::now();
+        result.death_sort_us = elapsed_us(t_death0, t_death1);
         return result;
     }
 
     std::sort(deaths.begin(), deaths.end());
+    const auto t_death1 = Clock::now();
+    result.death_sort_us = elapsed_us(t_death0, t_death1);
+
+    // Phase 6: criterion selection
+    const auto t_crit0 = Clock::now();
 
     switch (cfg.criterion) {
         case PhssConfig::Criterion::LargestGap: {
@@ -250,6 +290,8 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
             break;
         }
     }
+    const auto t_crit1 = Clock::now();
+    result.criterion_us = elapsed_us(t_crit0, t_crit1);
 
     return result;
 }

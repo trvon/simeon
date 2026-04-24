@@ -237,6 +237,32 @@ Recipe QueryRouter::choose(const QueryFeatures& f) const noexcept {
     return Recipe::Bm25SabSmooth;
 }
 
+QualityRecipe QueryRouter::choose_quality(std::string_view query) const {
+    return choose_quality(features(query));
+}
+
+QualityRecipe QueryRouter::choose_quality(const QueryFeatures& f) const noexcept {
+    if (f.n_terms == 0)
+        return QualityRecipe::Bm25Only;
+    if (f.oov_rate > cfg_.oov_threshold)
+        return QualityRecipe::Bm25Only;
+
+    const bool bm25_ceiling =
+        f.avg_idf > cfg_.high_idf_threshold && f.n_terms >= cfg_.atire_min_terms &&
+        f.min_idf >= cfg_.atire_min_idf_floor &&
+        f.pool_overlap_jaccard <= cfg_.atire_max_pool_jaccard &&
+        f.score_decay_rate >= cfg_.atire_min_score_decay && f.scq_sum >= cfg_.atire_min_scq &&
+        f.simplified_clarity <= cfg_.atire_max_clarity;
+    if (bm25_ceiling)
+        return QualityRecipe::Bm25Only;
+
+    if (f.n_terms < cfg_.quality_geometry_min_terms || f.avg_idf > cfg_.cascade_max_idf)
+        return QualityRecipe::Bm25Only;
+    if (f.n_terms >= cfg_.quality_max_min_terms && f.avg_idf <= cfg_.quality_max_max_idf)
+        return QualityRecipe::FragmentRichCovPhssApproxMax;
+    return QualityRecipe::FragmentRichCovPhssApprox;
+}
+
 const char* recipe_name(Recipe r) noexcept {
     switch (r) {
         case Recipe::Bm25Atire:
@@ -245,6 +271,18 @@ const char* recipe_name(Recipe r) noexcept {
             return "Bm25SabSmooth";
         case Recipe::CascadeLinearAlpha:
             return "CascadeLinearAlpha";
+    }
+    return "unknown";
+}
+
+const char* quality_recipe_name(QualityRecipe r) noexcept {
+    switch (r) {
+        case QualityRecipe::Bm25Only:
+            return "Bm25Only";
+        case QualityRecipe::FragmentRichCovPhssApprox:
+            return "FragmentRichCovPhssApprox";
+        case QualityRecipe::FragmentRichCovPhssApproxMax:
+            return "FragmentRichCovPhssApproxMax";
     }
     return "unknown";
 }

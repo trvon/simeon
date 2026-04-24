@@ -2,7 +2,9 @@
 
 ## Experiment
 
-Implemented 0D persistent homology (Union-Find) on the fragment similarity graph within each BM25 pool. Three scale-selection criteria were evaluated against fixed `knn=8` baselines on BEIR-3:
+Implemented 0D persistent homology (Union-Find) on the fragment similarity
+graph within each BM25 pool. Three scale-selection criteria were compared to
+fixed `knn=8` baselines on BEIR-3:
 
 - **LargestGap**: selects the scale at the largest gap in the sorted death similarities.
 - **MaxPersistence**: selects the scale at the most persistent pair (longest interval).
@@ -52,7 +54,8 @@ Two fragment sets were tested:
 
 ## Verdict
 
-**Mixed positive.** PHSS is not a universal win, but it improves two of the three BEIR corpora we tested:
+**Mixed positive.** PHSS is not universal, but it improves two of the three
+BEIR corpora:
 
 - **Scifact:** `LargestGap` and `Elbow` recover the fixed-geometry regression and tie BM25 at `0.6188`.
 - **FiQA:** `LargestGap` improves over both BM25 and fixed geometry; `richcov + LargestGap` is the best fragment-geometry row so far at `0.2089`.
@@ -60,14 +63,16 @@ Two fragment sets were tested:
 
 ## Interpretation
 
-1. **LargestGap is the strongest criterion.** It is the best or tied-best PHSS row on all three corpora.
-2. **The main win is safety plus FiQA upside.** PHSS removes the scifact regression of fixed geometry and sets the best FiQA fragment-geometry score.
-3. **NFCorpus remains the tradeoff.** The persistence-selected threshold is slightly too conservative there.
-4. **Latency is the cost.** PHSS pays the expected O(N^2) similarity cost and is consistently slower than fixed `knn`.
+1. **LargestGap is the strongest criterion.** It is best or tied-best on all
+   three corpora.
+2. **The main win is safety plus FiQA upside.** PHSS removes the scifact
+   regression of fixed geometry and sets the best FiQA fragment-geometry row.
+3. **NFCorpus remains the tradeoff.** PHSS is slightly too conservative there.
+4. **Latency is the cost.** PHSS is consistently slower than fixed `knn`.
 
 ## Follow-up Rows
 
-Two follow-up branches were tested after the initial PHSS pass:
+Two follow-up branches were tested:
 
 - **adaptive PHSS**: run PHSS only on higher-confidence queries and fall back to fixed `knn` otherwise;
 - **richmmr + PHSS**: combine the best upside-seeking fragment selector with PHSS graph construction.
@@ -78,11 +83,14 @@ Headline results:
 - **NFCorpus:** `basic + adaptive PHSS` reaches `0.2560`, improving over both fixed basic geometry (`0.2548`) and full basic PHSS (`0.2531`), but still below the best `richmmr` row (`0.2585`).
 - **FiQA:** `richmmr + PHSS` improves over fixed `richmmr` safety but does not beat `richcov + phss_gap`; the best follow-up row is `richmmr l0.50 + PHSS` at `0.2084`, still below `richcov + phss_gap` at `0.2089`.
 
-Verdict: the follow-up rows do not replace the current frontier. Adaptive PHSS is a useful latency/quality knob, especially on NFCorpus, but `LargestGap` remains the strongest fully-on PHSS row. `richmmr + PHSS` does not beat either `richmmr` on NFCorpus or `richcov + PHSS` on FiQA.
+Verdict: the follow-up rows do not replace the current frontier. Adaptive PHSS
+is a useful latency/quality knob, especially on NFCorpus, but `LargestGap`
+remains the strongest fully-on row.
 
 ## Profiling
 
-The new `simeon_profile_fragment_geometry` harness shows the main PHSS cost clearly on scifact:
+The `simeon_profile_fragment_geometry` harness shows the PHSS cost clearly on
+scifact:
 
 - **basic fixed**: `1.88 ms/query`
 - **basic PHSS**: `6.55 ms/query`
@@ -95,20 +103,55 @@ Within the PHSS query path, the dominant cost is **scale selection itself**, not
 - adjacency build: ~`1.17 ms/query`
 - diffusion: ~`0.001 ms/query`
 
-After removing unnecessary persistence-point materialization from non-diagram PHSS runs, the scorer is still dominated by `phss_select_scale`, which is now the main optimization target.
+Even after cleanup, the scorer is still dominated by `phss_select_scale`.
 
 ## Implications
 
-PHSS is a real control surface for fragment geometry:
-- it recovers scifact,
-- it produces the best FiQA fragment-geometry score,
-- and it regresses NFCorpus slightly.
+PHSS is a real control surface for fragment geometry: it recovers scifact,
+produces the best FiQA row, and regresses NFCorpus slightly.
 
 ## Next move
 
-1. Add adaptive PHSS: let the router pick the criterion or fall back to fixed `knn` based on query features.
-2. Test on larger pools (`pool_size=500`) where the O(N²) cost is higher but the topological structure may diverge more from `knn=8`.
-3. Explore 1D persistent homology (cycles) to capture document-level manifold structure beyond fragment clustering.
+1. ~~Add adaptive PHSS~~ — done (`phssadapt_*` rows in this doc).
+2. ~~Test on larger pools (`pool_size=500`)~~ — closed by Phase C
+   (`phss_pool_scaling.md`). pool=100 is the optimum; larger pools
+   regress 2/3 corpora on nDCG@10 within latency budget.
+3. ~~1D persistent homology (cycles)~~ — closed by Phase A cheap
+   probe (`phss_1d_triangle_results.md`). Triangle-count importance
+   weighting is inert (Δ range [−0.0005, +0.0004] across 18 cells;
+   R@10/R@100 byte-identical). Mechanism: multi-fragment per-doc
+   averaging washes out per-fragment topological weighting on this
+   fixture set. Phases B/C cancelled per disprove gate.
+
+Subfinding from Phase C: nfcorpus pool=500 richcov shows **+0.0122 R@100** over
+pool=100. It is too slow for a default, but remains a real recall-targeted
+lever.
+
+## 2026-04-23 update — `LargestGapApprox` validated as richcov default
+
+Phase B6 of the engineering pass (see `phss_largest_gap_approx_results.md`)
+benched the already-shipped `PhssConfig::Criterion::LargestGapApprox`
+head-to-head against `LargestGap` on both builders. Result: on the
+**richcov** builder approx is **strictly equal-or-better** on all three
+corpora (scifact +0.0021, nfcorpus +0.0002, fiqa 0.0000) at **~2× QPS**.
+On the **basic** builder approx regresses scifact by −0.0039 and is kept
+on `LargestGap`.
+
+**New richcov-builder frontier**:
+
+| Corpus   | `phssapprox_k100_t8_richcov_gap` nDCG@10 | Δ vs BM25 | QPS    |
+|----------|-----------------------------------------:|----------:|-------:|
+| scifact  | 0.6188                                   |  0.0000   |  112.6 |
+| nfcorpus | 0.2544                                   | +0.0023   |  127.6 |
+| fiqa     | **0.2089**                               | **+0.0036** | 119.4 |
+
+Same quality as the prior `phss_k100_t8_richcov_gap` row at about 2× the
+throughput. The engineering target `phss_select_mean_us < 1500 µs` is met on
+all three corpora.
+
+The bench keeps both `phss_*` and `phssapprox_*` recipes for regression
+tracking. Production pointer for the richcov frontier is now
+`phssapprox_k100_t8_richcov_gap`.
 
 ---
 

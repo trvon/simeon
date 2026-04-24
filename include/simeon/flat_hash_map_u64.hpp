@@ -17,7 +17,9 @@ namespace simeon {
 //   - Identity hash. Keys come from hash64() which produces high-entropy
 //     uint64_t values; re-hashing would waste cycles.
 //   - Linear probing with power-of-two capacity so bucket index is key & mask_.
-//   - Parallel occupancy + key arrays for the slot directory.
+//   - Parallel key + entry-index arrays for the slot directory; an entry index
+//     of kEmptyEntry denotes an empty slot, so no separate occupancy bitmap is
+//     needed.
 //   - Dense entries array that stores actual (key, value) pairs only for
 //     occupied buckets. This avoids paying for a full V in every empty slot.
 //   - Insert-only API. No erase(). Bm25Index never removes postings.
@@ -61,7 +63,7 @@ public:
     private:
         void advance() noexcept {
             const std::size_t cap = m_ ? m_->capacity() : 0;
-            while (idx_ < cap && !m_->occupied_[idx_])
+            while (idx_ < cap && m_->entry_indices_[idx_] == kEmptyEntry)
                 ++idx_;
         }
         FlatHashMapU64* m_ = nullptr;
@@ -96,7 +98,7 @@ public:
     private:
         void advance() noexcept {
             const std::size_t cap = m_ ? m_->capacity() : 0;
-            while (idx_ < cap && !m_->occupied_[idx_])
+            while (idx_ < cap && m_->entry_indices_[idx_] == kEmptyEntry)
                 ++idx_;
         }
         const FlatHashMapU64* m_ = nullptr;
@@ -112,7 +114,7 @@ public:
         if (capacity() == 0)
             return end();
         std::size_t idx = key & mask_;
-        while (occupied_[idx]) {
+        while (entry_indices_[idx] != kEmptyEntry) {
             if (keys_[idx] == key)
                 return iterator(this, idx);
             idx = (idx + 1) & mask_;
@@ -124,7 +126,7 @@ public:
         if (capacity() == 0)
             return end();
         std::size_t idx = key & mask_;
-        while (occupied_[idx]) {
+        while (entry_indices_[idx] != kEmptyEntry) {
             if (keys_[idx] == key)
                 return const_iterator(this, idx);
             idx = (idx + 1) & mask_;
@@ -139,13 +141,12 @@ public:
             rehash(capacity() * 2);
 
         std::size_t idx = key & mask_;
-        while (occupied_[idx]) {
+        while (entry_indices_[idx] != kEmptyEntry) {
             if (keys_[idx] == key)
                 return entries_[entry_indices_[idx]].second;
             idx = (idx + 1) & mask_;
         }
 
-        occupied_[idx] = 1;
         keys_[idx] = key;
         entry_indices_[idx] = static_cast<std::uint32_t>(entries_.size());
         entries_.emplace_back(key, V{});
@@ -169,8 +170,6 @@ public:
             keys_.shrink_to_fit();
             entry_indices_.clear();
             entry_indices_.shrink_to_fit();
-            occupied_.clear();
-            occupied_.shrink_to_fit();
             mask_ = 0;
             return;
         }
@@ -187,13 +186,11 @@ public:
         }
         keys_.shrink_to_fit();
         entry_indices_.shrink_to_fit();
-        occupied_.shrink_to_fit();
     }
 
 private:
     void rehash(std::size_t new_cap) {
         keys_.assign(new_cap, 0);
-        occupied_.assign(new_cap, 0);
         entry_indices_.assign(new_cap, kEmptyEntry);
         mask_ = new_cap - 1;
 
@@ -202,9 +199,8 @@ private:
             const auto& entry = entries_[entry_idx];
             const std::uint64_t key = entry.first;
             std::size_t idx = key & mask_;
-            while (occupied_[idx])
+            while (entry_indices_[idx] != kEmptyEntry)
                 idx = (idx + 1) & mask_;
-            occupied_[idx] = 1;
             keys_[idx] = key;
             entry_indices_[idx] = entry_idx;
         }
@@ -213,7 +209,6 @@ private:
     std::vector<value_type> entries_;
     std::vector<key_type> keys_;
     std::vector<std::uint32_t> entry_indices_;
-    std::vector<std::uint8_t> occupied_;
     std::size_t mask_ = 0;
 };
 

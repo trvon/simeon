@@ -1,17 +1,10 @@
 # Axiomatic LTD correction (Fang-Zhai 2005) — negative result with inversion
 
 Tests Fang-Zhai 2005's axiomatic Length Term-Discrimination (LTD)
-correction: replace BM25's linear length normalization
-`L(dl) = 1 - b + b · (dl/avg_dl)` with a sublinear power form
-`L(dl) = 1 - b + b · (dl/avg_dl)^α`, where α ∈ (0, 1] gates how
-aggressively the long-doc penalty is reduced. Implemented as
-`Bm25Variant::AtireLTD` with `Bm25Config::ltd_alpha`. Result: on the
-three BEIR fixtures the **prediction is inverted** — the plan's
-"long-doc corpus benefits" hypothesis fails because FiQA (where the
-plan placed its validate gate) is the **shortest-doc corpus** of the
-three, not the longest. LTD correction helps recall on the actual
-long-doc corpora (scifact, nfcorpus) but the plan's expected nDCG
-lift on FiQA materializes as a major regression instead.
+correction. On the three BEIR fixtures the original prediction is inverted:
+FiQA, where the plan expected a long-doc benefit, is actually the **shortest**
+corpus. LTD helps recall on the actual longer corpora (scifact, nfcorpus) and
+regresses FiQA instead.
 
 ## Math
 
@@ -53,11 +46,8 @@ on short-doc corpora."
 - nfcorpus actually *improves* (+0.0018 at α=0.3, +0.0006 at α=0.7).
   Disprove gate not met.
 
-Result type: **third category** — neither the plan's validate nor its
-disprove gate fires; the experiment is invalidated by the **plan's
-wrong premise about which corpus is long**. T5 is functionally
-disproved (no useful α setting exists) but for a different reason
-than the plan anticipated.
+Result type: **third category** — the experiment does not satisfy either gate,
+because the plan's premise about which corpus was long was wrong.
 
 ## Mechanism — the inversion
 
@@ -67,29 +57,17 @@ actual measurement shows FiQA is the **shortest** corpus by avg_dl
 (132.9 words/doc), with nfcorpus longest (233.8) and scifact
 intermediate (214.6).
 
-LTD's effect, looking at the data side-by-side:
+LTD's effect in the data is straightforward:
 
-- On the **long-doc corpora** (scifact, nfcorpus) LTD α<1 *helps
-  R@100*: scifact +0.0049, nfcorpus +0.0029. The long-doc penalty
-  reduction lifts recall by retrieving longer docs that BM25's
-  default `b=0.75` was suppressing. nDCG@10 stays roughly flat —
-  LTD trades top-10 ranking precision for deeper recall.
-- On the **short-doc corpus** (fiqa) LTD α<1 *hurts both*: nDCG@10
-  −0.0171 at α=0.5, R@100 −0.0223. With docs already shorter than
-  avg_dl, reducing the penalty on a few outlier-long docs amplifies
-  their score and pushes them above the genuinely relevant short
-  matches. Topic drift wins.
+- On the longer corpora (scifact, nfcorpus), LTD α<1 helps R@100 and mostly
+  trades top-10 precision for deeper recall.
+- On the shorter corpus (fiqa), LTD α<1 hurts both nDCG and R@100 by promoting
+  relatively longer but less relevant docs.
 
-In short: LTD does what it's supposed to do — reduce the long-doc
-penalty — but the BEIR-3 fixture set positions FiQA on the **wrong
-side** of the corpus length distribution to benefit. The Fang-Zhai
-prediction is consistent with the data once the plan's avg_dl claim
-is corrected.
+So LTD does what it is supposed to do, but the BEIR-3 fixture set puts FiQA on
+the wrong side of the length distribution to benefit.
 
-This matches the recurring "corpus-bound, not query-bound" finding
-from T3 (WSDM) and T4 (RM3 adaptive K): per-corpus optimal length
-treatment is real and observable, but no single universal recipe
-wins across short-doc + long-doc corpora simultaneously.
+This is another corpus-bound, not query-bound, result.
 
 ## Subfinding — recall-precision split for long-doc corpora
 
@@ -106,9 +84,8 @@ even though it doesn't satisfy the plan's nDCG-targeted gate.
 | 0.5  | +0.0049        | −0.0037          | +0.0024         |  0.0000           |
 | 0.3  | +0.0049        | −0.0105          | +0.0029         | +0.0018           |
 
-scifact's R@100 saturates at α=0.7 (no extra recall from going
-deeper); nfcorpus's R@100 grows monotonically through α=0.3. The
-saturation point is itself corpus-bound.
+Scifact's R@100 saturates at α=0.7, while nfcorpus continues to improve through
+α=0.3. Even the recall-optimal α is corpus-bound.
 
 ## Infrastructure disposition
 
@@ -126,15 +103,9 @@ saturation point is itself corpus-bound.
 
 ## Next lever
 
-- **Recall-targeted scifact/nfcorpus path**: the +0.005 R@100 lift
-  on scifact at α=0.7 is a real (if narrow) improvement and could be
-  routed via the existing passE recipe gating on `avg_dl_corpus >
-  150`. Cost: one router branch, no new variant. Worth ~30 minutes
-  of router code + one bench rerun.
-- **The plan's premise assumed a corpus mix simeon doesn't have**.
-  Adding a genuinely long-doc corpus (e.g., trec-covid, avg_dl ~290)
-  would be the principled way to test the Fang-Zhai prediction at
-  the long end. Out of scope for the current 3-fixture set.
+- **Recall-targeted scifact/nfcorpus path** remains plausible if a future
+  router wants a long-doc-specific lever.
+- **A genuinely long-doc corpus** would be the principled next test for LTD.
 
 ## References
 

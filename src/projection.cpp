@@ -49,7 +49,16 @@ float gaussian_entry(std::uint32_t row, std::uint32_t col, std::uint64_t seed) n
 void fwht_inplace(float* data, std::uint32_t n) noexcept {
     for (std::uint32_t h = 1; h < n; h <<= 1) {
         for (std::uint32_t i = 0; i < n; i += h << 1) {
-            for (std::uint32_t j = i; j < i + h; ++j) {
+            std::uint32_t j = i;
+#if defined(SIMEON_HAS_NEON)
+            for (; j + 4 <= i + h; j += 4) {
+                const float32x4_t x = vld1q_f32(data + j);
+                const float32x4_t y = vld1q_f32(data + j + h);
+                vst1q_f32(data + j, vaddq_f32(x, y));
+                vst1q_f32(data + j + h, vsubq_f32(x, y));
+            }
+#endif
+            for (; j < i + h; ++j) {
                 const float x = data[j];
                 const float y = data[j + h];
                 data[j] = x + y;
@@ -122,9 +131,13 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
     }
 
     // Still materialize the dense view so Projection::entry(row, col) works
-    // for tests and callers that probe the matrix. The hot path in apply()
-    // uses the specialized per-mode cache below.
-    dense_.assign(static_cast<std::size_t>(output_dim_) * sketch_dim_, 0.0f);
+    // for tests and callers that probe the matrix. For sparse modes the hot
+    // path in apply() uses the specialized per-mode cache; dense_ is only
+    // kept for DenseGaussian (required) and None (identity). Other modes
+    // compute entry() on demand to save ~100 MB of redundant storage.
+    if (mode_ == ProjectionMode::DenseGaussian) {
+        dense_.assign(static_cast<std::size_t>(output_dim_) * sketch_dim_, 0.0f);
+    }
     if (mode_ == ProjectionMode::AchlioptasSparse)
         achlioptas_.resize(output_dim_);
     if (mode_ == ProjectionMode::VerySparse)
@@ -166,19 +179,6 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
             std::swap(idx[i], idx[pick]);
         }
         sample_.assign(idx.begin(), idx.begin() + output_dim_);
-
-        // Materialize dense_ for entry()/test parity. Closed form:
-        //   P[r, c] = D[c] * (-1)^popcount(sample_[r] & c) / sqrt(output_dim_)
-        // for c in [0, sketch_dim_); padded columns don't enter dense_
-        // because the input sketch is zero in those columns.
-        for (std::uint32_t r = 0; r < output_dim_; ++r) {
-            const std::uint32_t s = sample_[r];
-            float* row_ptr = dense_.data() + static_cast<std::size_t>(r) * sketch_dim_;
-            for (std::uint32_t c = 0; c < sketch_dim_; ++c) {
-                const float sign = static_cast<float>(hadamard_sign(s, c));
-                row_ptr[c] = signs_[c] * sign * fwht_scale_;
-            }
-        }
         return;
     }
 
@@ -210,7 +210,6 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
                 const float w = (sign_h & 1ULL) ? -sparse_jl_value : +sparse_jl_value;
                 sparse_[row].cols.push_back(col);
                 sparse_[row].weights.push_back(w);
-                dense_[static_cast<std::size_t>(row) * sketch_dim_ + col] = w;
             }
         }
         // Sort each row's gather by column index for sequential sketch
@@ -232,7 +231,9 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
     }
 
     for (std::uint32_t row = 0; row < output_dim_; ++row) {
-        auto* row_ptr = dense_.data() + static_cast<std::size_t>(row) * sketch_dim_;
+        float* row_ptr = (mode_ == ProjectionMode::DenseGaussian)
+                             ? dense_.data() + static_cast<std::size_t>(row) * sketch_dim_
+                             : nullptr;
         for (std::uint32_t col = 0; col < sketch_dim_; ++col) {
             float w = 0.0f;
             switch (mode_) {
@@ -256,7 +257,8 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
                 default:
                     w = 0.0f;
             }
-            row_ptr[col] = w;
+            if (row_ptr)
+                row_ptr[col] = w;
         }
     }
 }
@@ -266,7 +268,28 @@ Projection::~Projection() = default;
 float Projection::entry(std::uint32_t row, std::uint32_t col) const {
     if (mode_ == ProjectionMode::None)
         return (row == col) ? 1.0f : 0.0f;
-    return dense_[static_cast<std::size_t>(row) * sketch_dim_ + col];
+    if (mode_ == ProjectionMode::DenseGaussian) {
+        return dense_[static_cast<std::size_t>(row) * sketch_dim_ + col];
+    }
+    if (mode_ == ProjectionMode::AchlioptasSparse) {
+        return achlioptas_entry(row, col, seed_);
+    }
+    if (mode_ == ProjectionMode::VerySparse) {
+        return very_sparse_entry(row, col, seed_, sketch_dim_);
+    }
+    if (mode_ == ProjectionMode::Fwht) {
+        if (row >= output_dim_ || col >= sketch_dim_)
+            return 0.0f;
+        return signs_[col] * static_cast<float>(hadamard_sign(sample_[row], col)) * fwht_scale_;
+    }
+    if (mode_ == ProjectionMode::SparseJL) {
+        for (std::size_t i = 0; i < sparse_[row].cols.size(); ++i) {
+            if (sparse_[row].cols[i] == col)
+                return sparse_[row].weights[i];
+        }
+        return 0.0f;
+    }
+    return 0.0f;
 }
 
 void Projection::apply(const std::int32_t* sketch, float* out) const {

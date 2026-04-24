@@ -2,9 +2,13 @@
 
 ## Motivation
 
-The fragment-geometry experiments (transport_results.md) show that the current fixed-threshold kNN graph is corpus-sensitive. `richcov` is safe on scifact but leaves upside on NFCorpus; `richmmr` captures NFCorpus upside but hurts scifact. The missing lever is **data-driven scale selection**: letting the fragment space itself tell us what similarity threshold defines a meaningful neighborhood.
+The fragment-geometry experiments showed that the fixed-threshold kNN graph is
+corpus-sensitive. The missing lever looked like **data-driven scale selection**:
+letting the fragment space itself determine what similarity threshold defines a
+meaningful neighborhood.
 
-Persistent homology provides exactly this: a topological invariant that identifies robust clusters independent of hand-tuned thresholds.
+Persistent homology looked like the cleanest way to do that without another
+hand-tuned threshold.
 
 ## Literature Foundation
 
@@ -28,7 +32,8 @@ Cost: O(N² dim) — N is small (pool_size × top_fragments_per_doc ≤ 100 × 6
 
 ### Phase 2: 0-dimensional persistent homology via Union-Find
 
-0D persistence tracks connected components as the similarity threshold decreases. It requires only Union-Find (disjoint-set union).
+0D persistence tracks connected components as the similarity threshold
+decreases. It requires only Union-Find.
 
 ```python
 def compute_0d_persistence(S, N):
@@ -89,7 +94,8 @@ def select_scale_from_persistence(persistence):
     return selected_scale
 ```
 
-This selects the scale where the persistence diagram has the clearest separation between robust clusters and noise.
+This selects the scale with the clearest separation between robust clusters and
+noise.
 
 ### Phase 4: Build kNN graph at selected scale and diffuse
 
@@ -109,9 +115,9 @@ def build_graph_at_scale(S, N, scale):
 ## Integration with simeon
 
 ### Files to modify
-- `benchmarks/bench_vs_reference.cpp` — add PHSS variant to `run_bm25_fragment_geometry_grid`
-- New file: `include/simeon/persistent_homology.hpp` — Union-Find + scale selection
-- New file: `src/persistent_homology.cpp` — implementation
+- `benchmarks/bench_vs_reference.cpp`
+- `include/simeon/persistent_homology.hpp`
+- `src/persistent_homology.cpp`
 
 ### Implementation priority
 1. Union-Find + 0D persistence (1-2 hours)
@@ -121,19 +127,14 @@ def build_graph_at_scale(S, N, scale):
 
 Total estimated time: 1-2 days.
 
-## Why this should work
+## Why this looked promising
 
-The current fragment geometry fails because:
-- Fixed `knn=8` and `min_fragment_sim=0.35` are hand-tuned on scifact
-- On NFCorpus, fragments may need a coarser scale (larger neighborhoods)
-- On scifact, fragments may need a finer scale (smaller neighborhoods)
+- fixed `knn=8` and `min_fragment_sim=0.35` were tuned on scifact
+- nfcorpus appeared to want coarser neighborhoods
+- scifact appeared to want finer ones
 
-Persistent homology solves this by:
-- Letting the data determine the natural cluster scale
-- Identifying robust clusters that persist over a range of thresholds
-- Suppressing noise by focusing on persistent features
-
-The 0D persistence computation is trivial with Union-Find (O(N² log N) for sorting edges, N ≤ 600), so it adds negligible overhead to the geometry pass.
+Persistent homology promised a data-driven way to choose that scale. At the time
+the expected extra cost looked small enough to justify the experiment.
 
 ## Open questions
 

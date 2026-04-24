@@ -8,12 +8,15 @@
 - Synthetic corpus: 8 topical clusters × 50 documents × 60 words. Cluster-description query, same-cluster docs are relevant.
 - R@K denominator caps at `min(K, |relevant|)` (saturating-recall convention).
 - Separation = mean intra-cluster cosine − mean inter-cluster cosine.
-- The tables below are the publishable summary. Detailed design notes live in
+- This page is the publishable summary. Design notes live in
   [router_design.md](router_design.md) and [pmi_projection.md](pmi_projection.md).
 
 ## Headline (BEIR scifact)
 
-`router_default_4096_768` **matches MiniLM-L6 on nDCG@10** (0.654 vs 0.654) and **beats MiniLM on MRR@10** (0.626 vs 0.607), training-free, no GPU, no model weights. The router picks among `Bm25Atire` / `Bm25SabSmooth` / `CascadeLinearAlpha` per query using pre-retrieval predictors (avg IDF, OOV rate, query length); design and literature in [router_design.md](router_design.md). The `high_idf_threshold` default (3.0) came from a 36-spec dev sweep.
+`router_default_4096_768` **matches MiniLM-L6 on nDCG@10** (0.654 vs 0.654)
+and **beats it on MRR@10** (0.626 vs 0.607), training-free, with no GPU or
+model weights. The router picks among `Bm25Atire`, `Bm25SabSmooth`, and
+`CascadeLinearAlpha`; details are in [router_design.md](router_design.md).
 
 | Configuration                                       | nDCG@10 | R@10  | R@100 | MRR@10 | code B/doc |
 |-----------------------------------------------------|--------:|------:|------:|-------:|-----------:|
@@ -26,9 +29,9 @@
 | `bm25_only` (Atire baseline)                        |   0.633 | 0.756 | 0.865 |  0.605 |          — |
 | `router_oracle_4096_768` (per-query argmax, ceiling)|   0.713 | 0.834 | 0.931 |  0.684 |       3072 |
 
-The remaining gap to MiniLM is concentrated in R@10 (0.768 vs 0.808). The
-oracle row shows that some router headroom remains, but cheap pre-retrieval
-predictors do not fully recover it.
+The remaining gap to MiniLM is concentrated in R@10. The oracle row shows that
+router headroom remains, but cheap pre-retrieval predictors do not recover it
+fully.
 
 ## scifact — BM25 formulation ablation
 
@@ -46,7 +49,10 @@ Eight BM25 variants standalone on the same fixture. δ=1.0 for BM25+/L; γ=5.0 f
 | SubwordAwareBackoff strict (γ=0)          |   0.596 | 0.700 | 0.871 |  0.570 | 17,828 |
 | **SubwordAwareBackoff smooth (γ=5)**      | **0.612** | **0.723** | **0.881** | **0.587** |  2,961 |
 
-Smooth SAB is the strongest standalone BM25 we have and the best pool source for cascade. The +0.7-point R@100 lift (0.874 → 0.881) is where n-gram fallback surfaces morphological matches that exact BM25 misses. BM25+/L underperform on scifact (short abstracts; the long-doc floor doesn't apply) — reproduces Lv & Zhai 2011's corpus-dependent finding. DLH13's parameter-free score loses to tunable Atire by 2.9 nDCG points — the price of zero hyperparameters. PL2 and DPH land between DLH13 and Atire (0.598 / 0.600) — the DFR family is internally consistent but caps below tuned Robertson on short abstracts. DCM trails the Robertson family by ~5 points because the Dirichlet-LM contribution is not IDF-weighted (rarity enters through `ttf`, which is a weaker signal on short-abstract corpora).
+Smooth SAB is the strongest standalone BM25 here and the best cascade pool
+source. The main effect is a small R@100 lift from morphological recovery.
+BM25+/L underperform on scifact, the DFR family sits below tuned Atire, and
+DCM trails more clearly because its rarity signal is weaker on short abstracts.
 
 ## scifact — RM3 pseudo-relevance feedback
 
@@ -59,7 +65,9 @@ Lavrenko & Croft 2001 relevance model RM3: first-pass BM25 → top-K=10 pseudo-r
 | `bm25_sab_smooth_gamma5` (baseline)           |   0.612 | 0.723 | 0.881 |  0.587 |  3,672 |
 | `bm25_sab_smooth_rm3_k10_a0.5`                |   0.630 | 0.760 | 0.888 |  0.602 |    182 |
 
-Negative-result on BM25-Atire: expansion slightly regresses top-10 ranking (−1.5 points nDCG) while lifting R@100 (+1.0 point) — expansion introduces noise on short abstract queries with already-informative terms. **Positive result on SAB-smooth** (+1.8 points nDCG, +3.7 points R@10): SAB's n-gram backoff already captures morphological variants, and RM3's term expansion is additive on top without competing with it. Per-query latency drops ~2 orders of magnitude because RM3 requires two scoring passes plus the relevance-model build.
+RM3 is a negative result on Atire and a positive result on SAB-smooth. On this
+fixture, expansion helps only when it stacks on top of SAB's morphological
+backoff rather than competing with already-strong exact matching.
 
 ## scifact — SDM (Sequential Dependence Model)
 
@@ -73,7 +81,8 @@ Metzler & Croft 2005: three-leg blend (λ_u · BM25 + λ_o · ordered-bigram BM2
 | `bm25_sab_smooth_gamma5` (baseline)                     |   0.612 | 0.723 | 0.881 |  0.587 |
 | `bm25_sab_smooth_sdm_l0.85_0.10_0.05`                   |   0.612 | 0.718 | 0.881 |  0.587 |
 
-Near-no-op on scifact: Metzler defaults cost 0.7 nDCG points on Atire because short scientific abstracts have few adjacent-term signals that BM25 misses. Unigram-heavier weights (0.90/0.05/0.05) recover baseline exactly. SAB-smooth is tied either way.
+Near-no-op on scifact: default SDM slightly hurts Atire, unigram-heavier
+weights recover baseline, and SAB-smooth is effectively unchanged.
 
 ## scifact — concept mining (Step 1n)
 
@@ -87,7 +96,8 @@ Bendersky 2008 latent concept model: corpus-PMI word-bigram mining + PMI-weighte
 | `bm25_sab_smooth_gamma5` (baseline)          |   0.612 | 0.723 | 0.881 |  0.587 |
 | `bm25_sab_smooth_concepts_l0.50`             |   0.614 | 0.733 | 0.871 |  0.587 |
 
-Null result: pre-declared regression gate (<0.005) violated on Atire at every weight. See [concept_mining.md](concept_mining.md) for scale-mismatch mechanism.
+Null result: concept mining violates the predeclared regression gate on Atire at
+every tested weight. See [concept_mining.md](concept_mining.md).
 
 ## scifact — cascade and fusion
 
@@ -223,7 +233,8 @@ Negative result on scifact — even with the in-corpus leakage ceiling, standalo
 
 ## BEIR-3 — structural BM25F primitives
 
-Simeon's shipped GLiNER-replacement primitives were wired into a BM25F-style auxiliary field and evaluated on the three frozen reference fixtures. `bm25_*_w0.0` rows are byte-identical to `bm25_only`, so the field plumbing itself is sound; the question is whether the auxiliary signal helps.
+Simeon's shipped GLiNER-replacement primitives were wired into a BM25F-style
+auxiliary field and evaluated on the three frozen reference fixtures.
 
 | Corpus | Baseline | Best TextRank row | Δ | Best AC row | Δ |
 |--------|---------:|------------------:|--:|------------:|--:|
@@ -231,11 +242,17 @@ Simeon's shipped GLiNER-replacement primitives were wired into a BM25F-style aux
 | nfcorpus | 0.2521 | 0.2471 (`w=0.2`) | -0.0050 | 0.2521 (`w=0.2`) | +0.0000 |
 | fiqa | 0.2053 | 0.2024 (`w=0.2`) | -0.0029 | 0.2079 (`w=0.2`) | +0.0026 |
 
-Headline verdict: **both structural experiments disprove on the body-only fixtures.** TextRank-as-title regresses everywhere, and the self-bootstrapped Aho-Corasick entity field shows only a tiny FiQA bump (`+0.0026` nDCG@10) once queries are transformed into the entity-token space. That misses the predeclared promote bars (`+0.005` for TextRank; `+0.005` on two corpora or `+0.010` on one corpus for AC). Detailed writeups: [bm25f_results.md](bm25f_results.md), [textrank_title_results.md](textrank_title_results.md), and [ac_entity_results.md](ac_entity_results.md).
+Headline verdict: **both structural experiments disprove on the body-only
+fixtures.** TextRank regresses everywhere, and the Aho-Corasick entity field
+shows only a tiny FiQA bump. See [bm25f_results.md](bm25f_results.md),
+[textrank_title_results.md](textrank_title_results.md), and
+[ac_entity_results.md](ac_entity_results.md).
 
 ## BEIR-3 — portable PMI soft matching
 
-To test the user's portability constraint, the next experiment stayed dictionary-free: learn PMI embeddings from the corpus itself, expand each query token with nearest lexical neighbors, and score the weighted query with BM25's existing weighted-hash path. This is the lightest transport-style approximation available in-tree.
+To test portability, the next experiment stayed dictionary-free: learn PMI
+embeddings from the corpus itself, expand each query token with nearest lexical
+neighbors, and score the weighted query with BM25's weighted-hash path.
 
 | Corpus | Baseline | Best soft-match row | Δ |
 |--------|---------:|--------------------:|--:|
@@ -243,11 +260,15 @@ To test the user's portability constraint, the next experiment stayed dictionary
 | nfcorpus | 0.2521 | 0.2521 (`k=3/8`, `lambda=0.2/0.5`) | +0.0000 |
 | fiqa | 0.2053 | 0.2053 (`k=3/8`, `lambda=0.2/0.5`) | +0.0000 |
 
-Headline verdict: **portable soft matching also disproves on the shipped fixtures.** Conservative blends are inert at 4 decimal places across all three corpora, while letting the semantic-neighbor leg dominate (`lambda=1.0`) collapses ranking quality. Widening the neighborhood (`k=3 -> 8`) and lowering the similarity floor (`0.35 -> 0.20`) does not change that result. Detailed writeup: [softmatch_results.md](softmatch_results.md).
+Headline verdict: **portable soft matching also disproves on the shipped
+fixtures.** Conservative blends are inert; letting the neighbor leg dominate
+collapses ranking quality. See [softmatch_results.md](softmatch_results.md).
 
 ## BEIR-3 — phrase/document transport
 
-The next ablation moves one level up in structure: instead of transporting query mass across unigram neighbors, it transports mass through **phrase nodes** inside a BM25 top-K pool. The current transport leg reuses simeon's sparse retrieval primitives: SDM ordered/unordered bigram postings plus optional PMI-mined concepts, all fused with BM25 after per-query normalization.
+The next ablation moves one level up in structure: instead of transporting
+query mass across unigram neighbors, it transports mass through **phrase nodes**
+inside a BM25 top-K pool.
 
 | Corpus | Baseline | Best FiQA-seeking row | Δ | Best safe row | Δ |
 |--------|---------:|----------------------:|--:|--------------:|--:|
@@ -255,7 +276,9 @@ The next ablation moves one level up in structure: instead of transporting query
 | nfcorpus | 0.2521 | 0.2531 (`ordered k100 a0.8`) | +0.0010 | 0.2511 (`phrase k100 a0.8 gate0.2`) | -0.0010 |
 | fiqa | 0.2053 | 0.2101 (`phrase k100 a0.8`) | +0.0048 | 0.2055 (`phrase k100 a0.8 gate0.5`) | +0.0002 |
 
-Headline verdict: **near-miss, not a promote.** Phrase transport is the first portable transport-like family to show a clear FiQA lift (`+0.0048`), which is materially better than unigram soft matching. But the same row regresses scifact by `-0.0073`, missing the regression gate. Adding concept nodes still hurts, and diffuse-mass gating trades away almost all of the FiQA gain to recover cross-corpus safety. Detailed writeup: [transport_results.md](transport_results.md).
+Headline verdict: **near-miss, not a promote.** Phrase transport is the first
+portable transport-like family to show a clear FiQA lift, but the same row
+regresses scifact. See [transport_results.md](transport_results.md).
 
 ## BEIR-3 — graph transport
 
@@ -267,7 +290,9 @@ The graph follow-up swaps the direct phrase bonus for a pool-restricted personal
 | nfcorpus | 0.2521 | 0.2512 (`phrase_ppr k100 d0.85`) | -0.0009 |
 | fiqa | 0.2053 | 0.2072 (`phrase_docdoc_ppr k100 d0.70`) | +0.0019 |
 
-Headline verdict: **graph transport also disproves in the first pass.** The best FiQA row is only a small bump over BM25 and still weaker than the earlier direct phrase transport result (`+0.0019` vs `+0.0048`). Scifact remains meaningfully negative, which suggests the current PPR graph is still diffusing local phrase overlap rather than discovering stronger document-level support paths. Detailed writeup: [transport_results.md](transport_results.md).
+Headline verdict: **graph transport also disproves in the first pass.** The
+best FiQA row is only a small bump over BM25 and still weaker than direct
+phrase transport. See [transport_results.md](transport_results.md).
 
 ## BEIR-3 — cluster topology
 
@@ -279,7 +304,10 @@ The next follow-up keeps the document-anchored idea but swaps graph diffusion fo
 | nfcorpus | 0.2521 | 0.2494 (`k100 o0.50 q0.35`) | -0.0027 |
 | fiqa | 0.2053 | 0.2025 (`k100 o0.50 q0.35`) | -0.0028 |
 
-Headline verdict: **cluster topology also disproves in the first pass.** The cover/containment shape is a bit safer than the earlier phrase graph on scifact, but it regresses all three corpora and never produces a FiQA lift. That suggests the cluster construction is still operating as a lexical salience filter rather than discovering broader semantic neighborhoods. Detailed writeup: [transport_results.md](transport_results.md).
+Headline verdict: **cluster topology also disproves in the first pass.** The
+cover/containment shape is a bit safer than the earlier phrase graph on
+scifact, but it still regresses all three corpora. See
+[transport_results.md](transport_results.md).
 
 ## BEIR-3 — semantic fragment graph
 
@@ -291,7 +319,9 @@ The next follow-up keeps the fragment-anchored shape but replaces lexical overla
 | nfcorpus | 0.2521 | 0.2525 (`k100 d0.85 q0.10 f0.20`) | +0.0004 |
 | fiqa | 0.2053 | 0.2055 (`k100 d0.70 q0.20 f0.35`) | +0.0002 |
 
-Headline verdict: **semantic fragment graphs are much safer but still inert.** This is the first topology follow-up that stops hurting the corpora materially, which means the fragment relation got better. But the improvements are still well below the promote bar, so PMI fragment similarity is not strong enough by itself to move top-10 retrieval meaningfully. Detailed writeup: [transport_results.md](transport_results.md).
+Headline verdict: **semantic fragment graphs are much safer but still inert.**
+The fragment relation got better, but PMI fragment similarity alone is still too
+weak to move top-10 retrieval. See [transport_results.md](transport_results.md).
 
 ## BEIR-3 — hybrid fragment graph
 
@@ -303,7 +333,9 @@ The hybrid follow-up keeps the PMI fragment graph backbone but adds two stronger
 | nfcorpus | 0.2521 | 0.2546 (`k100 t6 d0.85 q0.10 f0.20 b0.35`) | +0.0025 |
 | fiqa | 0.2053 | 0.2034 (`k100 t6 d0.70 q0.20 f0.35 b0.20`) | -0.0019 |
 
-Headline verdict: **the lexical scaffold reintroduces the old tradeoff.** NFCorpus gets the largest fragment-graph gain so far, but scifact and fiqa both regress again. That suggests the PMI fragment graph was safe because it removed lexical bias, and reintroducing overlap-based bridges pulls the method back toward corpus-local lexical behavior. Detailed writeup: [transport_results.md](transport_results.md).
+Headline verdict: **the lexical scaffold reintroduces the old tradeoff.**
+NFCorpus improves, but scifact and fiqa regress again. See
+[transport_results.md](transport_results.md).
 
 ## BEIR-3 — geometric fragment graph
 
@@ -315,7 +347,8 @@ The geometric follow-up keeps the PMI fragment backbone but replaces fixed-thres
 | nfcorpus | 0.2521 | 0.2548 (`k100 t4 s8 k8 p2`) | +0.0027 |
 | fiqa | 0.2053 | 0.2053 (`k100 t6 s8 k8 p3`) | +0.0000 |
 
-Headline verdict: **geometry is stronger than plain PMI diffusion, but still not robust across corpora.** NFCorpus gets the best non-lexical fragment-graph gain so far, but scifact regresses materially and fiqa stays neutral. That suggests query-centered geometry is a real lever, but a fixed neighborhood shape is still too corpus-sensitive. Detailed writeup: [transport_results.md](transport_results.md).
+Headline verdict: **geometry is stronger than plain PMI diffusion, but still
+not robust across corpora.** See [transport_results.md](transport_results.md).
 
 ## BEIR-3 — adaptive geometric fragment graph
 
@@ -327,7 +360,9 @@ The next follow-up tried to fix the corpus-sensitivity directly: keep the PMI fr
 | nfcorpus | 0.2521 | 0.2557 (`k100 t6 a0.65_0.95 s3_8 k8_20 p2_4`) | +0.0036 |
 | fiqa | 0.2053 | 0.2024 (`k100 t4 a0.70_0.98 s4_10 k4_16 p1_3`) | -0.0029 |
 
-Headline verdict: **the first adaptive/gated geometry pass also disproves.** It pushes NFCorpus a bit higher than the fixed geometric rows, but it makes scifact materially worse and turns fiqa negative. That means the regime sensitivity is real, but simple BM25-side gating features are not the right control surface for fragment geometry. Detailed writeup: [transport_results.md](transport_results.md).
+Headline verdict: **the first adaptive/gated geometry pass also disproves.** It
+pushes NFCorpus a bit higher, but makes scifact worse and turns fiqa negative.
+See [transport_results.md](transport_results.md).
 
 ## BEIR-3 — rich-fragment vs geometry-signal ablation
 
@@ -339,7 +374,10 @@ The next pass separated **better fragment state** from **better geometry control
 | nfcorpus | 0.2521 | 0.2578 (`rich`) | +0.0057 |
 | fiqa | 0.2053 | 0.2060 (`rich_gsig`) | +0.0007 |
 
-Headline verdict: **richer fragment representations are the first fragment-geometry branch that clearly helps on two corpora, while geometry-native gating alone underdelivers.** The rich row sets the best fragment-geometry gain so far on NFCorpus and nudges FiQA positive, but scifact still regresses. That makes richer fragment state the leading direction, with geometry control now secondary. Detailed writeup: [transport_results.md](transport_results.md).
+Headline verdict: **richer fragment representations are the first
+fragment-geometry branch that clearly helps on two corpora, while
+geometry-native gating alone underdelivers.** See
+[transport_results.md](transport_results.md).
 
 ## BEIR-3 — rich-fragment coverage / dedup controls
 
@@ -351,7 +389,10 @@ The next follow-up kept the richer multi-scale fragment state, but added overlap
 | nfcorpus | 0.2521 | 0.2550 (`richcov`) | +0.0029 |
 | fiqa | 0.2053 | 0.2064 (`richcov_gsig`) | +0.0011 |
 
-Headline verdict: **coverage/dedup is the first real safety lever for rich fragments.** It materially reduces the scifact regression and gives FiQA its best fragment-geometry score so far, but it also gives back part of the NFCorpus gain. That makes rich fragment state + coverage control the current frontier, with the next problem now being how to recover more of the NFCorpus upside without reintroducing the scifact failure mode. Detailed writeup: [transport_results.md](transport_results.md).
+Headline verdict: **coverage/dedup is the first real safety lever for rich
+fragments.** It reduces the scifact regression and gives FiQA its best
+fragment-geometry score so far, but gives back part of the NFCorpus gain. See
+[transport_results.md](transport_results.md).
 
 ## BEIR-3 — budgeted rich fragments
 
@@ -363,7 +404,9 @@ The next follow-up made the coverage controls stricter by capping the retained s
 | nfcorpus | 0.2521 | 0.2533 (`richbud_gsig`) | +0.0012 |
 | fiqa | 0.2053 | 0.2042 (`richbud_gsig`) | -0.0011 |
 
-Headline verdict: **hard sentence/anchor budgets are too aggressive.** They speed the geometry pass up, but they give back too much of the richcov gains and do not improve safety. That keeps rich fragments + coverage control as the best frontier, and pushes the next control work toward softer anchor retention rather than hard fragment caps. Detailed writeup: [transport_results.md](transport_results.md).
+Headline verdict: **hard sentence/anchor budgets are too aggressive.** They
+speed the geometry pass up, but give back too much of the `richcov` gain. See
+[transport_results.md](transport_results.md).
 
 ## BEIR-3 — MMR-style rich-fragment selection
 
@@ -378,13 +421,14 @@ sentence/anchor overlap caps as penalties rather than fixed count limits.
 | nfcorpus | 0.2521 | 0.2585 (`richmmr l0.35`) | +0.0064 |
 | fiqa | 0.2053 | 0.2079 (`richmmr l0.35`) | +0.0026 |
 
-Headline verdict: **soft novelty-aware selection is clearly better than hard fragment budgets, but it still misses the scifact safety gate.** The balanced MMR row is the first post-`richcov` control surface that improves both NFCorpus and FiQA at once, while the novelty-heavier row trades some of that upside back for partial scifact recovery. That leaves `richcov` as the safest frontier and `richmmr` as the best upside-seeking selector, with the next likely move being asymmetric anchor control rather than a single global MMR setting. Detailed writeup: [transport_results.md](transport_results.md).
+Headline verdict: **soft novelty-aware selection is clearly better than hard
+fragment budgets, but it still misses the scifact safety gate.** See
+[transport_results.md](transport_results.md).
 
 ## FiQA — transfer check
 
 Second BEIR fixture: `fiqa` — 57,638 docs / 444 test queries / 204 dev queries.
-Finance is much more semantic/paraphrase-heavy than scifact, so this section
-acts as a transfer check rather than a headline claim.
+This section is a transfer check rather than a headline claim.
 
 | Configuration                                       | nDCG@10 | R@10  | R@100 | MRR@10 |
 |-----------------------------------------------------|--------:|------:|------:|-------:|
@@ -420,21 +464,21 @@ acts as a transfer check rather than a headline claim.
 
 Takeaways:
 
-- scifact-specific “near-parity to MiniLM” headlines do **not** transfer to FiQA
-- **Step 1l SDM lifts FiQA by +0.006 on Atire** (`bm25_atire_sdm_l0.85_0.10_0.05` 0.212 vs `bm25_atire` 0.205) — the adjacent-bigram signal is real on finance text but below the plan's +0.010 promote threshold. SDM on SAB-smooth (+0.008) similarly underdelivers; unigram-heavier weights (0.90/0.05/0.05, 0.208) confirm Metzler's defaults are the right fixed point. Infrastructure stays behind `build_word_bigrams=false` default at zero runtime cost.
-- **Step 1m entropy-α regresses by −0.006 vs matched static α=0.75** on FiQA (`bm25_pool500_entropy_alpha_4096_768` 0.205 vs `bm25_pool500_linear_alpha075_4096_768` 0.211). The cosine head's flatter top-K shifts per-query α toward 1.0 (BM25-only). Same pattern across scifact (−0.006) and NFCorpus (−0.010). Counterpoint: entropy-α rescues +0.081 on FiQA over `bm25_sab_pool500_simeon_cos_4096_768` 0.117 — a self-correcting safety floor when the dense leg would tank alone. Documented null-with-safety-property: see `docs/fusion_entropy_alpha.md`.
-- **Step 1n concept mining regresses across all three corpora** (FiQA: −0.068 Atire l=0.50, −0.039 Atire l=0.25, −0.016 SAB-smooth l=0.50). PMI × BM25-bigram score-scale dominates base BM25 on matched queries, reordering around exact-phrase hits — actively harmful on finance paraphrase. Null result; infrastructure ships opt-in in `simeon::` namespace (no `Bm25Config` coupling), not wired into the router. See [concept_mining.md](concept_mining.md).
-- **Step 1k clarity gate adds +0.006 nDCG on FiQA** (`passE_scq0_clar3.0` 0.208 vs `router_default` 0.202). Any `clar ≤ 5.0` ceiling produces the same 0.208; SCQ floor is a no-op since FiQA's high-IDF queries already clear it.
-- **RM3 is near-flat on FiQA** (−0.005 on Atire, −0.002 on SAB-smooth vs the base variants; router+RM3 0.202 matches plain router). FiQA's semantic-paraphrase queries don't lift from corpus-statistic query expansion — expansion amplifies lexical matches the BM25 base already finds.
-- PL2 (0.189) and DPH (0.200) slot *below* Atire (0.205) on FiQA; DFR family caps below tuned Robertson.
-- linear-α fusion is still the only consistent way simeon beats BM25 alone
-- router thresholds are corpus-sensitive and should be tuned per corpus
+- Scifact-specific “near-parity to MiniLM” headlines do **not** transfer to FiQA.
+- **SDM gives a small FiQA lift**, but still misses the promote bar.
+- **Entropy-α regresses by −0.006 vs static α=0.75**, though it still serves as
+  a useful safety floor against pure-cosine collapse.
+- **Concept mining regresses clearly** and stays out of the router.
+- **Step 1k clarity adds +0.006 nDCG** on FiQA.
+- **RM3 is near-flat** and DFR variants stay below Atire.
+- Linear-α fusion is still the only consistent way simeon beats BM25 alone.
 
 The full transfer discussion is preserved in [router_design.md](router_design.md).
 
 ## NFCorpus — headline rows
 
-Third BEIR fixture: `nfcorpus` — 3,633 docs / 224 test queries / 99 dev queries (`--dev-fraction 0.33`). Medical abstracts with dense morphological terminology; matches scifact on domain character (science) but has different vocabulary.
+Third BEIR fixture: `nfcorpus` — 3,633 docs / 224 test queries / 99 dev queries.
+Medical abstracts with dense morphological terminology.
 
 | Configuration                                       | nDCG@10 | R@10  | R@100 | MRR@10 |
 |-----------------------------------------------------|--------:|------:|------:|-------:|
@@ -469,14 +513,12 @@ Third BEIR fixture: `nfcorpus` — 3,633 docs / 224 test queries / 99 dev querie
 
 Takeaways:
 
-- **Step 1l SDM is a no-op on NFCorpus** (`bm25_atire_sdm` 0.253 vs `bm25_atire` 0.252 = +0.001, noise; SAB-SDM 0.298 ties SAB-smooth exactly). Medical abstracts are terminology-heavy but not phrase-heavy — adjacent-bigram signal doesn't add beyond unigram IDF. Matches Step 1l's predicted 0–0.005 lift on scientific text.
-- **Step 1m entropy-α regresses by −0.010 vs matched static α=0.75 on Atire pool** (`bm25_pool500_entropy_alpha_4096_768` 0.252 vs `bm25_pool500_linear_alpha075_4096_768` 0.261) — largest undershoot of the three corpora. SAB-pool entropy-α ties `bm25_sab_smooth_gamma5` at 0.298 (cosine weight collapses to ~0 when BM25 already solves the query). Safety rescue holds: +0.074 vs pure cosine. Documented null-with-safety-property: see `docs/fusion_entropy_alpha.md`.
-- **Step 1k clarity ceiling matches MiniLM** (`passE_scq0_clar3.0` 0.298 vs MiniLM 0.297). The AND-gate forces Atire on low-clarity queries only, and on NFCorpus that corresponds to the subset where SAB-smooth is already the right pick — effectively routing the entire fixture to the stronger BM25 variant without losing the scifact cascade route on the rest. Any `clar ≤ 5.0` ceiling produces the same 0.298; clarity floor threshold is insensitive at 3.0–5.0.
-- **RM3 is the second NFCorpus lift** (+1.9 points nDCG on Atire, +0.8 on SAB-smooth). Morphology-heavy medical queries benefit from term-expansion when the base variant is already subword-aware; compounding them is the Step 1k "cheap RM3 + better router" story.
-- **SAB-smooth matches MiniLM without the gate** (0.298). Medical morphology is even richer than scifact's; n-gram backoff remains the primary corpus-agnostic lever.
-- PL2 and DPH slot into the DFR cluster at 0.249 — DFR-family scores collapse on NFCorpus to within noise of DLH13.
-- The SAB→simeon cosine cascade still collapses (0.190 vs BM25-alone 0.252), same pattern as on FiQA. Simeon cosine rerank is a scifact-specific win.
-- Three-corpus verdict: **SAB as a standalone scorer is corpus-agnostic on morphology-heavy text; Step 1k's clarity ceiling generalizes where scifact router tuning does not.**
+- **SAB-smooth matches MiniLM without routing.**
+- **Step 1k clarity ceiling also reaches MiniLM parity.**
+- **Step 1l SDM is basically a no-op.**
+- **Step 1m entropy-α clearly regresses vs static α=0.75** on the Atire pool.
+- **RM3 is the second real lift** on this corpus.
+- The SAB→simeon cosine cascade still collapses, just as it does on FiQA.
 
 ## Microbench — synthetic corpus
 
@@ -509,7 +551,8 @@ Takeaways:
 | `scale_vec`  |         8.12 |
 | `saxpy`      |         7.31 |
 
-All three are memory-bandwidth-bound; the three-way spread (<11%) confirms the dispatch is hitting SIMD. Dispatched from `include/simeon/simd.hpp`; used by the PMI-sum encode path and matryoshka weighting (`src/simeon.cpp`).
+All three are memory-bandwidth-bound. The small spread confirms the SIMD
+dispatch is working.
 
 ### Projection sweep, n-gram width, n-gram mode
 
@@ -533,7 +576,7 @@ All three are memory-bandwidth-bound; the three-way spread (<11%) confirms the d
 | char+word | 1.000 | 0.978 |      0.540 |
 | word      | 1.000 | 0.983 |  **0.646** |
 
-3–5 is a good default. On real text with morphological variation, char-only is more robust; `char+word` is the safe default.
+3–5 remains a good default. On real text, `char+word` is the safe default.
 
 ### Matryoshka prefix queryability (synthetic)
 
@@ -546,7 +589,9 @@ All three are memory-bandwidth-bound; the three-way spread (<11%) confirms the d
 | 128          | 0.963 | 0.930 | 1/3 storage                            |
 | 64           | 0.938 | 0.870 | 1/6 storage                            |
 
-Use this when downstream consumers want to pick a quality / cost point per query — store one 384-d vector, query at 64-d for a coarse first pass and re-rank survivors with the full vector. Quality on real text is dramatically lower with the analytic schedule; see scifact matryoshka rows above.
+Use this when downstream consumers want a query-time quality / cost tradeoff.
+Quality on real text is still much lower with the analytic schedule; see the
+scifact matryoshka rows above.
 
 ## Microbench — SAB-smooth perf audit
 
@@ -594,7 +639,11 @@ Dense-goto table memory ≈ nodes × 1,024 bytes (256 slots × 4 B). At 500k pat
 | Sharded, 8 partitions | 6.8 | 4.8 | both regress |
 | Sharded, 16 partitions | 3.7 | 3.0 | both regress |
 
-CSR's `if (state == root)` dispatch introduces a data-dependency serialization on the hot load that the branchless `next_[state*256 + c]` avoids. Sharding scales throughput as ≈1/N since each shard rescans the full input; the per-shard automaton shrink doesn't compensate. For GLiNER-scale tech dictionaries (≤100k surface forms) the dense table fits in ≈550 MB and clears the ≥50 MB/s noise-input target. Scaling past 500k patterns needs a compressed representation with branchless lookup (double-array trie, compressed-sparse-fail) — prototyped on branch `ac-da-trie-wip`.
+CSR's `if (state == root)` dispatch introduces a hot-path dependency that the
+branchless dense table avoids. Sharding also regresses because each shard rescans
+the full input. For GLiNER-scale dictionaries (≤100k surface forms), the dense
+table still clears the noise-input target. Past 500k patterns, a compressed but
+still branchless representation is needed.
 
 ## TextRank sentence ranker
 
@@ -608,7 +657,9 @@ Synthetic doc-count=200 sweep, damping=0.85, max_iters=30, ε=1e-4, min_sentence
 |            32 |  0.081 |  0.096 |            0.050 |
 |            64 |  0.284 |  0.319 |            0.035 |
 
-Latency scales as O(n²) in sentence count (graph build dominates). p99 stays under 1 ms through 64 sentences; the yams title path caps at `max_sentences=256` (worst-case ≈5 ms). Lead-1 agreement dropping as n grows confirms TextRank diverges from lead bias as documents gain internal structure — the signal the yams title extractor will rely on for long-form plain text.
+Latency scales as O(n²) in sentence count because graph build dominates. p99
+stays under 1 ms through 64 sentences, and lead-1 agreement falls as documents
+gain more internal structure.
 
 ## Out of scope
 

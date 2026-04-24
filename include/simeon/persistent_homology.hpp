@@ -64,7 +64,10 @@ struct PhssConfig {
         // (sorted deaths vs. rank). Uses the point of maximum curvature.
         Elbow,
     };
-    Criterion criterion = Criterion::LargestGap;
+    // Default promoted to LargestGapApprox per docs/research/
+    // phss_largest_gap_approx_results.md (B6): equal-or-better nDCG@10 on
+    // richcov across 3/3 corpora at ~2× QPS vs the heavy LargestGap path.
+    Criterion criterion = Criterion::LargestGapApprox;
 
     // When true, also return the full persistence diagram for telemetry.
     bool output_diagram = false;
@@ -83,6 +86,16 @@ struct PhssResult {
 
     // Diagnostic: number of persistence pairs.
     std::uint32_t n_pairs = 0;
+
+    // Sub-phase wall-clock timers (µs). Always populated by
+    // phss_select_scale(); zero on the LargestGapApprox fast path for
+    // phases that don't run (uf_traversal, survivor_scan).
+    double edge_gather_us = 0.0;
+    double edge_sort_us = 0.0;
+    double uf_traversal_us = 0.0;
+    double survivor_scan_us = 0.0;
+    double death_sort_us = 0.0;
+    double criterion_us = 0.0;
 };
 
 // Compute 0-dimensional persistent homology on a complete similarity graph

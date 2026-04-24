@@ -1,10 +1,7 @@
 # Entropy-weighted runtime fusion α — negative result with safety property
 
 Per-query α for linear-α fusion derived from each leg's score-distribution
-entropy. Strict generalization of fixed α: when both legs have equal
-softmax-confidence the formula returns 0.5 exactly, and when pool-overlap
-Jaccard exceeds the agreement threshold the weighting collapses to equal
-blend. No hyperparameter tuning, no labeled data, no per-corpus fit.
+entropy. No tuning, no labels, and no per-corpus fit.
 
 Implementation lives in `src/fusion.cpp`
 (`entropy_alpha`, `linear_alpha_entropy_fuse`); the public API is in
@@ -40,46 +37,30 @@ configuration shipped before Step 1m.
 | FiQA     | SAB-500     | 0.117       | —             | 0.198     | —             | **+0.081**       |
 | NFCorpus | SAB-500     | 0.190       | —             | 0.298     | —             | **+0.108**       |
 
-Plan target for promotion: FiQA Δ vs static-α ≥ +0.005. Measured −0.006 —
-below threshold on all three corpora. Step 1m closes as a documented null
-result against the matched fixed-α baseline.
+Plan target for promotion: FiQA Δ vs static-α ≥ +0.005. Measured −0.006.
+Step 1m closes as a documented null result against the matched fixed-α baseline.
 
 ## Mechanism — why entropy-α undershoots fixed α=0.75 here
 
-Entropy-α derives weight from how peaked each leg's top-K is. On these three
-corpora the cosine head's top-K is consistently flatter than BM25's — the
-sketch+projection signal disperses mass across more pool entries. The
-formula reads that as low confidence and shifts α upward toward 1.0
-(BM25-only). At the corpus mean, α(q) ≈ 0.95–1.0, so the fused score is
-nearly the BM25-only ranking — which matches the `bm25_only` row to two
-decimals (0.619 vs 0.619 on scifact; 0.205 vs 0.205 on FiQA; 0.252 vs 0.252
-on NFCorpus).
+Entropy-α reads the cosine leg as low-confidence because its top-K is flatter
+than BM25's on all three corpora. That pushes α toward 1.0, so the fused score
+collapses toward BM25-only.
 
-Static α=0.75 wins by *less* aggressively trusting BM25, leaving 25% room for
-the cosine leg's contribution on a few queries where it actually helps. The
-entropy estimator is too quick to discount cosine because flatness ≠
-unhelpfulness — a cosine leg with a long thin tail of correct rerankings
-still looks high-entropy on the top-50, even when the right answer is
-ranked there.
+Static α=0.75 wins by leaving some room for cosine on the small set of queries
+where it helps. Entropy-α discounts that leg too aggressively because flatness
+does not mean uselessness.
 
 ## Safety property — entropy-α as a regression rail
 
-The other half of the picture: against the *pure cosine* baseline (no BM25
-weight), entropy-α delivers +0.07 to +0.21 nDCG on all three corpora, in
-both pool variants. When the dense leg would catastrophically regress on its
-own (e.g. SAB-pool + pure cosine on scifact = 0.41 vs SAB alone 0.61),
-entropy-α automatically discovers that BM25 is the more confident source
-and defers to it. Static α requires a human to know which value won't
-regress; entropy-α is *self-correcting* against a bad fusion partner.
+The useful result is safety: against pure cosine, entropy-α delivers +0.07 to
++0.21 nDCG on all three corpora. It is self-correcting against a bad fusion
+partner even though it loses to the best fixed α.
 
-This is the property that justifies leaving the infrastructure shipped:
+That safety property is why the infrastructure stays shipped:
 
-- A caller building an arbitrary linear-α cascade with an untested dense
-  source no longer has to tune α on a dev set to avoid regression below the
-  BM25 baseline. Entropy-α gives a "no-worse-than-best-leg" floor.
-- Composes with the existing `linear_alpha` path — the matched static-α
-  call site can swap in `linear_alpha_entropy_fuse` without API changes.
-- Zero hyperparameter footprint: no λ, no per-corpus fit, no labeled data.
+- it provides a practical "no-worse-than-best-leg" floor for untested dense sources
+- it swaps into the existing `linear_alpha` call path without API changes
+- it has zero tuning footprint
 
 ## Infrastructure disposition
 
@@ -96,18 +77,9 @@ This is the property that justifies leaving the infrastructure shipped:
 
 ## Next lever
 
-The undershoot mechanism suggests the formula needs *correlation-aware*
-confidence, not just per-leg entropy. Concretely: if cosine's flatness
-correlates with BM25's flatness on the same query, both legs are uncertain
-and the equal-weight blend is right; if cosine is flat *while* BM25 is
-peaked, BM25 is the right answer (current behavior); but if cosine is
-peaked *while* BM25 is flat, the current formula overweights BM25 because
-the absolute confidence comparison ignores BM25's own reliability. A
-joint-confidence formula (e.g. mutual-information-weighted α, or
-Aslam-Pavlu-style JS divergence between the two top-K distributions used as
-an *agreement* term rather than a confidence term) is the next research
-target. Deferred unless a dense leg lands where the asymmetric-flatness
-case dominates.
+The next plausible formula is correlation-aware rather than entropy-only. A
+joint-confidence or agreement-aware α could preserve the same safety property
+without collapsing so hard toward BM25.
 
 ## References
 

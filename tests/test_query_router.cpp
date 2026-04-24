@@ -7,6 +7,7 @@
 
 using simeon::Bm25Config;
 using simeon::Bm25Index;
+using simeon::QualityRecipe;
 using simeon::QueryFeatures;
 using simeon::QueryRouter;
 using simeon::Recipe;
@@ -257,6 +258,54 @@ void test_recipe_name_round_trip() {
     assert(std::string(recipe_name(Recipe::CascadeLinearAlpha)) == "CascadeLinearAlpha");
 }
 
+void test_quality_router_keeps_oov_queries_on_bm25() {
+    auto idx = build_idx();
+    QueryRouter r(idx);
+    assert(r.choose_quality("blockchain quantum") == QualityRecipe::Bm25Only);
+}
+
+void test_quality_router_keeps_high_idf_queries_on_bm25() {
+    auto idx = build_idx();
+    RouterConfig cfg;
+    cfg.high_idf_threshold = 1.5f;
+    QueryRouter r(idx, cfg);
+    assert(r.choose_quality("apoptosis") == QualityRecipe::Bm25Only);
+}
+
+void test_quality_router_picks_richcov_for_medium_semantic_queries() {
+    auto idx = build_idx();
+    RouterConfig cfg;
+    cfg.high_idf_threshold = 100.0f;
+    cfg.cascade_max_idf = 100.0f;
+    cfg.quality_geometry_min_terms = 4u;
+    cfg.quality_max_min_terms = 7u;
+    cfg.quality_max_max_idf = 100.0f;
+    QueryRouter r(idx, cfg);
+    assert(r.choose_quality("the cat dog ran") == QualityRecipe::FragmentRichCovPhssApprox);
+}
+
+void test_quality_router_picks_max_for_long_semantic_queries() {
+    auto idx = build_idx();
+    RouterConfig cfg;
+    cfg.high_idf_threshold = 100.0f;
+    cfg.cascade_max_idf = 100.0f;
+    cfg.quality_geometry_min_terms = 4u;
+    cfg.quality_max_min_terms = 7u;
+    cfg.quality_max_max_idf = 100.0f;
+    QueryRouter r(idx, cfg);
+    assert(r.choose_quality("the cat dog ran after the squirrel daily quickly") ==
+           QualityRecipe::FragmentRichCovPhssApproxMax);
+}
+
+void test_quality_recipe_name_round_trip() {
+    using simeon::quality_recipe_name;
+    assert(std::string(quality_recipe_name(QualityRecipe::Bm25Only)) == "Bm25Only");
+    assert(std::string(quality_recipe_name(QualityRecipe::FragmentRichCovPhssApprox)) ==
+           "FragmentRichCovPhssApprox");
+    assert(std::string(quality_recipe_name(QualityRecipe::FragmentRichCovPhssApproxMax)) ==
+           "FragmentRichCovPhssApproxMax");
+}
+
 } // namespace
 
 int main() {
@@ -281,5 +330,10 @@ int main() {
     test_atire_max_clarity_blocks_high_clarity_query();
     test_default_router_unchanged_by_step1k_gates();
     test_recipe_name_round_trip();
+    test_quality_router_keeps_oov_queries_on_bm25();
+    test_quality_router_keeps_high_idf_queries_on_bm25();
+    test_quality_router_picks_richcov_for_medium_semantic_queries();
+    test_quality_router_picks_max_for_long_semantic_queries();
+    test_quality_recipe_name_round_trip();
     return 0;
 }

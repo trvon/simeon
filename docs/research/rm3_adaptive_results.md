@@ -1,14 +1,8 @@
 # Adaptive RM3 expansion-K — negative result
 
-Tests Bendersky-Metzler-Croft 2011's claim that the RM3 expansion-term
-count K should scale with query clarity (high-clarity queries support
-more expansion). Implemented as
-`simeon::n_terms_for_clarity(clarity, n_min=5, n_max=50,
-clarity_lo=0.5, clarity_hi=5.0)` consumed by a new
-`run_bm25_prf_adaptive()` bench recipe. Result: adaptive K does not
-beat fixed K=20 on any of the three BEIR fixtures, and the per-corpus
-optimal K disagrees in opposite directions across corpora — no single
-clarity-driven mapping can win.
+Tests Bendersky-Metzler-Croft 2011's claim that RM3 expansion-term count K
+should scale with query clarity. Adaptive K does not beat fixed K=20 on any of
+the three fixtures, and the preferred K direction disagrees across corpora.
 
 ## Math
 
@@ -35,12 +29,12 @@ Plan target for promotion: **R@100 +1.5pp on ≥2/3 corpora** vs the
 n=20 (k10) baseline at fixed compute budget. Plan disprove threshold:
 **|ΔR@100| < 0.5pp in any direction**, indicating saturation.
 
-Observed: ΔR@100 = {−0.24, −0.09, −0.45} pp. **3/3 corpora land within
-disprove bound.** T4 disproved.
+Observed: ΔR@100 = {−0.24, −0.09, −0.45} pp. **3/3 corpora land within the
+disprove bound.** T4 is disproved.
 
 ## Mechanism — why adaptive K can't win
 
-Two independent failures:
+Two failures explain the result:
 
 ### 1. Clarity distribution saturates the n_max anchor
 
@@ -52,16 +46,10 @@ Per-query `simplified_clarity` distribution on the oracle-router rows:
 | nfcorpus | 0.00 | 5.77 | 8.02   | 9.93 | 13.70 | 7.55 |
 | fiqa     | 2.97 | 4.35 | 5.05   | 5.79 | 12.80 | 5.27 |
 
-With `clarity_hi = 5.0`, the median query on every corpus already
-clips to `n_max = 50`. On nfcorpus the p25 is 5.77 — three quarters of
-queries are saturated. The "adaptive" recipe therefore degenerates
-toward fixed K=50 on nfcorpus (R@100 0.2714 ≈ n=50's 0.2765) and on
-fiqa (0.4555 ≈ n=50's 0.4561). It is barely a function of clarity at
-all; it is effectively the n=50 baseline with a small fraction of
-queries pulled down to mid-range K.
+With `clarity_hi = 5.0`, the median query on every corpus already clips to
+`n_max = 50`. So the adaptive recipe mostly degenerates toward fixed K=50.
 
-Raising `clarity_hi` to ~9 would unsaturate nfcorpus, but does nothing
-for the second failure.
+Raising `clarity_hi` would help saturation, but not the deeper failure below.
 
 ### 2. Optimal K direction is corpus-dependent
 
@@ -76,19 +64,12 @@ optima:
   0.4561. **Larger expansion drifts off-topic.** Even the no-RM3
   baseline (0.4674) beats every RM3 setting.
 
-A single clarity-driven mapping cannot satisfy nfcorpus (wants more
-terms) and fiqa (wants fewer or none) simultaneously, regardless of
-the (lo, hi) anchors. Bendersky-Metzler-Croft 2011's claim assumes a
-monotone clarity → K relationship; on this corpus mix the relationship
-inverts between domains.
+A single clarity-driven mapping cannot satisfy nfcorpus (wants more terms) and
+fiqa (wants fewer or none) simultaneously.
 
-The deeper finding: per-corpus expansion-term policy isn't
-clarity-bound — it's **corpus-bound**. Topic-drift risk is a function
-of the average semantic distance between feedback docs and the query
-intent, not of pre-retrieval query clarity. fiqa's RM3 hurts because
-fiqa has long, conversational queries whose top-K docs share lots of
-generic financial vocabulary (interest, fund, rate) — expansion pulls
-those terms in and re-ranks toward the corpus centroid.
+The deeper finding is that expansion-term policy is corpus-bound, not
+clarity-bound. FiQA hurts because its feedback docs share too much generic
+financial vocabulary, so expansion drifts toward the corpus centroid.
 
 ## Infrastructure disposition
 
@@ -102,17 +83,9 @@ those terms in and re-ranks toward the corpus centroid.
 
 ## Next lever
 
-- **Per-corpus K policy**: cheap and effective if the harness ever
-  serves a single corpus per index — pick K from a one-shot tuning
-  pass on a held-out fold. Out of scope for the current
-  general-corpus router.
-- **Topic-drift gate** instead of clarity gate: estimate feedback-doc
-  centrality (e.g., mean pairwise BM25 score among top-K) and refuse
-  expansion when feedback docs disagree. This addresses fiqa's
-  failure mode directly and is the natural follow-up to T4's disproof.
-- **α-adaptive instead of K-adaptive**: keep K fixed at 20–30 but
-  shrink α toward 0 when query-feedback overlap is low. Would also
-  benefit fiqa-class queries; cheaper to implement than centrality.
+- **Per-corpus K policy** is still viable for single-corpus deployments.
+- **Topic-drift gating** is the natural follow-up if this family is revisited.
+- **α-adaptive instead of K-adaptive** is another cheaper follow-up option.
 
 ## References
 

@@ -159,6 +159,9 @@ void test_output_diagram() {
     const auto tri = make_tri(n, sims);
 
     PhssConfig cfg;
+    // Diagram output is only populated by the heavy LargestGap path, not the
+    // LargestGapApprox fast path (which is now the default).
+    cfg.criterion = PhssConfig::Criterion::LargestGap;
     cfg.output_diagram = true;
     auto r = phss_select_scale(tri, n, cfg);
     assert(!r.diagram.empty());
@@ -193,6 +196,9 @@ void test_threshold_filters_all_edges() {
     const auto tri = make_tri(n, sims);
 
     PhssConfig cfg;
+    // n_pairs semantics below is for the heavy LargestGap path (survivor
+    // components = components that never merge). Set explicit criterion.
+    cfg.criterion = PhssConfig::Criterion::LargestGap;
     cfg.threshold = 0.95f;
     auto r = phss_select_scale(tri, n, cfg);
     // No edges pass threshold -> no merges -> all components survive
@@ -211,6 +217,8 @@ void test_threshold_filters_partial_edges() {
     const auto tri = make_tri(n, sims);
 
     PhssConfig cfg;
+    // n_pairs semantics: survivor components (LargestGap heavy path).
+    cfg.criterion = PhssConfig::Criterion::LargestGap;
     cfg.threshold = 0.7f;
     auto r = phss_select_scale(tri, n, cfg);
     // One merge at 0.9, plus 2 surviving components

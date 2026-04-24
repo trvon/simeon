@@ -1,11 +1,9 @@
 # QPP post-retrieval predictors — negative/weak result
 
-Tests two post-retrieval query-performance predictors (Shtok-Kurland-Carmel
-2012 NQC and Zhou-Croft 2007 full WIG) against the router's existing
-`score_decay_rate` ("WIG-lite") on all three BEIR fixtures. Result: neither
-clears the validate threshold for routing; WIG-lite already dominates. The
-oracle-to-passE gap is not closable via cheap per-query post-retrieval
-signals alone.
+Tests two post-retrieval query-performance predictors (NQC and full WIG)
+against the router's existing `score_decay_rate` ("WIG-lite") on all three
+BEIR fixtures. Neither clears the validate threshold; WIG-lite already
+dominates.
 
 ## Predictors
 
@@ -17,8 +15,8 @@ signals alone.
 - `score_decay_rate` — WIG-lite, pre-existing (`router_design.md:53`):
   `(S@1 - S@10) / S@1` over the top-K pool.
 
-All three are filled by `QueryRouter::features_with_pool()`; costs one
-extra O(nd) pass over `scores0` added to the already-hot vector.
+All three are filled by `QueryRouter::features_with_pool()` and cost one extra
+O(nd) pass over `scores0`.
 
 ## Three-corpus Spearman ρ
 
@@ -62,41 +60,27 @@ nfcorpus=224, fiqa=444. Pool K=50.
 ### T1 — NQC
 
 Promote threshold: ρ(nqc, oracle-best) > 0.4 on ≥2/3 corpora. Observed
-ρ = {0.245, 0.299, 0.162}. 0/3 pass. Weak positive signal on all three,
-but below the routing-utility bar — a gate that fires on "NQC > τ" cannot
-improve the passE baseline when the top predictor saturates near ρ=0.3.
+ρ = {0.245, 0.299, 0.162}. Weak signal, below the routing-utility bar.
 
 ### T2 — Full WIG vs WIG-lite
 
 Promote threshold: ρ_WIG − ρ_WIG-lite > 0.1 on ≥2/3 corpora. Observed Δρ
-= {−0.355, −0.008, −0.247}. **WIG-lite beats full WIG on 2/3 corpora**;
-the BM25-adapted Zhou-Croft form underperforms the top-drop decay ratio
-the router already carries.
+= {−0.355, −0.008, −0.247}. **WIG-lite beats full WIG on 2/3 corpora**.
 
 ### Implication for T6 (learned router)
 
-The routing-discriminator row (predictor vs Atire−SAB diff) is the
-decisive one: all three predictors land within ρ ∈ [−0.08, +0.08] across
-all three corpora. A logistic regression over these features cannot
-exceed the correlation of its strongest input feature — we have none that
-discriminates which recipe wins per query. The plan's T6 feasibility
-probe would find <25% gap closure; it is effectively pre-disproved.
+The decisive row is the routing-discriminator one: all three predictors land
+within ρ ∈ [−0.08, +0.08]. No cheap feature here can reliably predict which of
+Atire or SAB wins per query, so T6 is effectively pre-disproved.
 
 ## Mechanism — why full WIG underperforms WIG-lite
 
-Zhou-Croft WIG trusts the absolute value of the BM25 score mean. In a
-BM25 (rather than query-likelihood) setting, that mean tracks query
-length and term rarity — signals already covered by `avg_idf` and
-`n_terms`. The top-drop decay ratio is dimensionless and corpus-agnostic:
-it asks "how peaked is the top?" which is the question WIG is actually
-trying to answer. Normalizing away the scale removes a confounder.
+Zhou-Croft WIG trusts the absolute value of the BM25 score mean, which in this
+setting mostly tracks query length and rarity. `score_decay_rate` instead asks
+the cleaner question: how peaked is the top of the ranking?
 
-NQC has the same weakness: it normalizes by corpus mean (not collection
-baseline), which on a BM25 score distribution is dominated by zeros for
-non-matching docs — so the division is close to `σ(top-K) / (top_mass /
-nd)` = `σ · nd / top_mass`. On larger corpora (fiqa, 57k docs) the `nd`
-scaling compresses the discriminative range. The predictor degrades as
-corpus size grows, which matches the observed fiqa drop to ρ=0.16.
+NQC has a related weakness: corpus-mean normalization on sparse BM25 scores is
+dominated by zeros, so its discriminative range compresses as corpus size grows.
 
 ## Infrastructure disposition
 
@@ -109,14 +93,9 @@ corpus size grows, which matches the observed fiqa drop to ρ=0.16.
 
 ## Next lever
 
-- Feature-limited: drop T6 (learned router) from the simeon plan — no
-  cheap pre/post predictor discriminates the Atire-vs-SAB routing
-  decision. Closing the remaining ~3–7 nDCG points to the oracle
-  requires either labeled routing data or a genuinely different
-  signal (e.g., per-query dense-leg quality from the cascade).
-- Recall-focused: the plan's Phase B/C experiments (Weighted SDM,
-  adaptive RM3, axiomatic LTD correction) do not depend on routing —
-  pursue those unchanged.
+- Drop T6 (learned router) from the near-term plan: no cheap pre/post predictor
+  here discriminates the Atire-vs-SAB decision.
+- The remaining Phase B/C experiments are orthogonal to routing and can proceed unchanged.
 
 ## References
 

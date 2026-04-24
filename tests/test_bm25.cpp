@@ -166,6 +166,20 @@ void test_add_doc_without_aux_keeps_bm25f_safe() {
     assert(plain == fused);
 }
 
+void test_mixed_aux_presence_stays_aligned() {
+    Bm25Index idx;
+    idx.add_doc("general overview");
+    idx.add_doc("general overview", "gene therapy breakthrough");
+    idx.add_doc("general overview");
+    idx.finalize();
+
+    std::vector<float> s(3, 0.0f);
+    idx.score_bm25f("missing body term", "gene therapy", s, 0.0f, 1.0f);
+    assert(s[0] == 0.0f);
+    assert(s[1] > 0.0f);
+    assert(s[2] == 0.0f);
+}
+
 void test_bm25f_accepts_distinct_aux_query_text() {
     Bm25Index idx;
     idx.add_doc("general overview", "ent7");
@@ -192,6 +206,7 @@ int main() {
     test_bm25f_aux_weight_zero_recovers_plain_bm25();
     test_bm25f_aux_field_adds_signal();
     test_add_doc_without_aux_keeps_bm25f_safe();
+    test_mixed_aux_presence_stays_aligned();
     test_bm25f_accepts_distinct_aux_query_text();
     return 0;
 }

@@ -1,8 +1,7 @@
 # Research notes
 
-This repository ships a compact engineering surface plus a small set of
-research-facing notes explaining how the published numbers were obtained,
-where the method works, and where it does not.
+This directory contains the benchmark, routing, and ablation notes behind
+the published simeon numbers.
 
 ## What to cite
 
@@ -28,17 +27,13 @@ temporary telemetry, or local helper scripts used during development.
 
 When describing simeon publicly:
 
-- treat it as a **training-free retrieval backend**, not a semantic replacement
-  for a learned encoder
-- separate **headline production claims** from **corpus-specific ablations**
+- treat it as a **training-free retrieval backend**, not a learned semantic replacement
+- separate **headline claims** from **corpus-specific ablations**
 - preserve negative results alongside positive ones
-- avoid treating simeon as a blanket validation of any single upstream paper
+- avoid treating simeon as blanket validation of any single upstream paper
 
-NUMEN is one important antecedent, but it is not the only one. The library also
-draws on late-interaction retrieval, product quantization, sparse random
-projection, nested representations, and query-difficulty routing literature.
-The shipped benchmark and router notes document places where simeon's measured
-behavior does **not** support a simplistic "this validates NUMEN" reading.
-
-That framing keeps the library useful to downstream users without overstating
-what the benchmark tables show.
+NUMEN is one important antecedent, but not the only one. The library also
+draws on late interaction, product quantization, sparse random projection,
+nested representations, and query-difficulty routing. The notes in this folder
+also document where the measured behavior does **not** support a simplistic
+"this validates NUMEN" reading.

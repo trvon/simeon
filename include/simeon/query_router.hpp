@@ -53,6 +53,15 @@ struct RouterConfig {
     // (<=) → CascadeLinearAlpha gate. Multi-term low-IDF queries benefit
     // most from simeon's semantic signal alongside BM25.
     float cascade_max_idf = 5.0f;
+
+    // Quality-router extension. Short queries stayed BM25-best on nfcorpus,
+    // while longer semantic queries benefited from fragment geometry on
+    // scifact / fiqa. Defaults come from the three-fixture recall/precision
+    // sweep: keep short lexical queries on BM25, use richcov+approx for
+    // medium semantic queries, and richcov+approx+max for the longest ones.
+    std::uint32_t quality_geometry_min_terms = 6u;
+    std::uint32_t quality_max_min_terms = 12u;
+    float quality_max_max_idf = 3.0f;
 };
 
 // Recipe selected by the router. Caller maps the recipe to a concrete
@@ -61,6 +70,17 @@ enum class Recipe : std::uint8_t {
     Bm25Atire,
     Bm25SabSmooth,
     CascadeLinearAlpha,
+};
+
+// Quality-oriented recipe selected by the router. Caller maps the recipe to a
+// concrete retrieval pipeline. The defaults are deliberately minimal:
+//  - Bm25Only: lexical ceiling / short-query regime
+//  - FragmentRichCovPhssApprox: medium-length semantic queries
+//  - FragmentRichCovPhssApproxMax: long semantic queries
+enum class QualityRecipe : std::uint8_t {
+    Bm25Only,
+    FragmentRichCovPhssApprox,
+    FragmentRichCovPhssApproxMax,
 };
 
 // Pre-retrieval features (Carmel & Yom-Tov 2010 family). Computed in
@@ -149,6 +169,8 @@ public:
                                      std::uint32_t k = 50) const;
     Recipe choose(std::string_view query) const;
     Recipe choose(const QueryFeatures& f) const noexcept;
+    QualityRecipe choose_quality(std::string_view query) const;
+    QualityRecipe choose_quality(const QueryFeatures& f) const noexcept;
 
     const RouterConfig& config() const noexcept { return cfg_; }
 
@@ -158,5 +180,6 @@ private:
 };
 
 const char* recipe_name(Recipe r) noexcept;
+const char* quality_recipe_name(QualityRecipe r) noexcept;
 
 } // namespace simeon

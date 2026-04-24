@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -32,6 +33,7 @@ struct SparseSignature {
 
 struct SemanticFragment {
     std::vector<float> vec;
+    std::vector<std::uint16_t> vec_bf16;
     SparseSignature signature;
 };
 
@@ -95,6 +97,66 @@ struct FragmentGeometryConfig {
     // query confidence clears the threshold; otherwise fall back to fixed-kNN.
     bool phss_adaptive = false;
     float phss_confidence_threshold = 0.55f;
+
+    // PHSS-1D Phase A — per-fragment triangle-count importance probe.
+    // After the kNN graph is built (PHSS-selected or fixed), count triangles
+    // each fragment participates in and apply weight w_i = 1 +
+    // triangle_alpha * log1p(tri_count[i]). The weight multiplies either the
+    // post-attention seed mass (QueryAttention placement) or the
+    // post-diffusion mass before doc aggregation (Diffusion placement).
+    enum class TrianglePlacement : std::uint8_t {
+        None,
+        QueryAttention,
+        Diffusion,
+    };
+    bool use_triangle_weight = false;
+    float triangle_alpha = 0.0f;
+    TrianglePlacement triangle_placement = TrianglePlacement::None;
+
+    // MaxSim aggregation probe (training-free ColBERTv2 analog).
+    // Sum (default): geom_pool[doc] += mass[fragment] — averages per-fragment
+    //   signal across the t fragments per doc, smoothing variance.
+    // Max: geom_pool[doc] = max(geom_pool[doc], mass[fragment]) — preserves
+    //   the strongest per-fragment match per doc, addressing the multi-
+    //   fragment averaging bottleneck identified by phss_1d_triangle_results.md.
+    enum class DocAggregator : std::uint8_t {
+        Sum,
+        Max,
+    };
+    DocAggregator doc_aggregator = DocAggregator::Sum;
+
+    // Plan 2 self-KB candidate-set expansion (Phase A probe).
+    // When non-empty, after the BM25 top-K pool is built, union it with the
+    // precomputed top-N doc-doc neighbors of each pool member. Re-rank the
+    // expanded pool with the existing geometry pipeline. Addresses the
+    // BM25-pool R@100 ceiling (Bottleneck 2) at the offline-precomputation
+    // layer instead of the per-query rerank layer.
+    //
+    // doc_doc_neighbors[d] = top-N neighbor IDs of doc d (precomputed).
+    // Empty span = no expansion (default; pure first-pass top-K).
+    std::span<const std::vector<std::uint32_t>> doc_doc_neighbors{};
+
+    // Plan 4 — Single-fragment-per-doc builder. At query time, keep only
+    // the argmax query-similar fragment per doc (suppress all others to
+    // zero mass via a -inf qsim). Addresses the multi-fragment averaging
+    // bottleneck (phss_1d_triangle_results.md mechanism) at a different
+    // attack point than MaxSim: MaxSim aggregates across fragments; this
+    // filter selects a single fragment before aggregation.
+    bool single_fragment_per_doc = false;
+
+    // Phase B tunables for self-KB expansion.
+    // Cap neighbors used per pool member at query time (0 = use all available
+    // in the precomputed graph). Smaller cap reduces expansion cost while
+    // keeping R@100 lift if the top neighbors carry most of the signal.
+    std::uint32_t selfkb_neighbors_per_pool_doc = 0;
+    // BM25-relevance filter: only add neighbor `n` if bm25_scores[n] > this
+    // threshold. Removes zero-query-overlap neighbors that cause top-10
+    // ranking noise. Default -inf = no filter (Phase A behavior).
+    float selfkb_min_bm25_score = -std::numeric_limits<float>::infinity();
+    // Topology confidence gate (Component C per plan): skip expansion when
+    // BM25 pool score decay is below this threshold (flat / diffuse pools).
+    // 0 = always expand (Phase A behavior). Sweep on dev fold to pick.
+    float selfkb_gate_score_decay_min = 0.0f;
 };
 
 struct FragmentGeometryProfile {
@@ -105,6 +167,17 @@ struct FragmentGeometryProfile {
     double whiten_us = 0.0;
     double phss_pairwise_us = 0.0;
     double phss_select_us = 0.0;
+    // Sub-phase breakdown of phss_select_us (populated by phss_select_scale).
+    // These should sum to ~phss_select_us within timer-overhead noise.
+    double phss_select_edge_gather_us = 0.0;
+    double phss_select_edge_sort_us = 0.0;
+    double phss_select_uf_us = 0.0;
+    double phss_select_survivor_us = 0.0;
+    double phss_select_death_sort_us = 0.0;
+    double phss_select_criterion_us = 0.0;
+    // PHSS-1D triangle counter (Phase A).
+    double triangle_count_us = 0.0;
+    std::uint64_t triangle_count_total = 0;
     double query_attention_us = 0.0;
     double adjacency_us = 0.0;
     double diffuse_us = 0.0;
@@ -126,7 +199,8 @@ struct FragmentGeometryProfile {
 std::vector<SemanticFragment> build_doc_semantic_fragments(const Encoder& enc, std::string_view doc,
                                                            const Bm25Index& idx,
                                                            std::uint32_t top_sentence_fragments,
-                                                           std::uint32_t fragment_signature_terms);
+                                                           std::uint32_t fragment_signature_terms,
+                                                           float position_weight = 0.0f);
 
 // Rich: basic sentences + centroid-of-sentences + whole-document vector.
 std::vector<SemanticFragment>
@@ -181,5 +255,12 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
                                  std::span<const std::vector<SemanticFragment>> doc_frags,
                                  const FragmentGeometryConfig& cfg,
                                  FragmentGeometryProfile* profile);
+
+// Compress all fragment vectors from float32 to bfloat16 in-place.
+// After calling, vec_bf16 holds the compressed data and vec is cleared.
+// The geometry scorer decompresses on the fly via read_frag_vec().
+// Halves peak memory for fragment vectors (2× per fragment dim).
+void compress_fragments_to_bf16(std::span<std::vector<SemanticFragment>> doc_frags,
+                                std::uint32_t dim);
 
 } // namespace simeon

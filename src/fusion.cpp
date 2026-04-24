@@ -4,6 +4,7 @@
 #include <cmath>
 #include <unordered_map>
 
+#include "simeon/bm25.hpp"
 #include "simeon/simd.hpp"
 
 namespace simeon {
@@ -32,6 +33,32 @@ std::vector<std::pair<std::uint32_t, float>> rrf_fuse(std::span<const Ranking> r
     std::vector<std::pair<std::uint32_t, float>> out(acc.begin(), acc.end());
     sort_desc_by_score(out);
     return out;
+}
+
+void score_bm25_variants_rrf(std::span<const Bm25Index* const> variants, std::string_view query,
+                             std::span<float> out_scores, float k_rrf) {
+    std::fill(out_scores.begin(), out_scores.end(), 0.0f);
+    if (variants.empty() || out_scores.empty())
+        return;
+    const std::size_t nd = out_scores.size();
+    std::vector<std::vector<std::pair<std::uint32_t, float>>> per_variant(variants.size());
+    std::vector<float> scratch(nd, 0.0f);
+    for (std::size_t v = 0; v < variants.size(); ++v) {
+        std::fill(scratch.begin(), scratch.end(), 0.0f);
+        variants[v]->score(query, scratch);
+        per_variant[v].resize(nd);
+        for (std::uint32_t d = 0; d < nd; ++d)
+            per_variant[v][d] = {d, scratch[d]};
+    }
+    std::vector<Ranking> ins;
+    ins.reserve(variants.size());
+    for (const auto& r : per_variant)
+        ins.emplace_back(r);
+    auto fused = rrf_fuse(ins, k_rrf);
+    for (const auto& [did, score] : fused) {
+        if (did < nd)
+            out_scores[did] = score;
+    }
 }
 
 std::vector<std::pair<std::uint32_t, float>> top_k(std::span<const float> scores, std::uint32_t k) {

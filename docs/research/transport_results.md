@@ -1,14 +1,13 @@
 # Phrase/document transport results
 
-Experiment: move beyond unigram neighbor expansion by scoring a **sparse phrase transport leg** inside a BM25 top-K pool. The transport leg is built from existing simeon primitives:
+Goal: move beyond unigram neighbor expansion by scoring a **sparse phrase transport leg** inside a BM25 top-K pool. The transport leg is built from existing simeon primitives:
 
 - ordered and unordered SDM bigram legs (`score_sdm()` with `lambda_unigram=0`)
 - optional PMI-mined concept postings (`ConceptIndex::score()`)
 - pool-restricted z-score fusion with BM25
 
-This is a training-free proxy for stronger transport structure: query mass is no longer pushed only onto isolated term neighbors, but onto phrase nodes that then connect to candidate documents.
-
-Implementation shipped in `benchmarks/bench_vs_reference.cpp` behind `--transport-only`.
+This is a training-free proxy for stronger transport structure: query mass
+flows through phrase nodes rather than only through isolated term neighbors.
 
 ## Protocol
 
@@ -38,35 +37,24 @@ Implementation shipped in `benchmarks/bench_vs_reference.cpp` behind `--transpor
 
 **Near-miss, not yet a promote.**
 
-What worked:
+Key points:
 
-1. **Phrase transport is materially better than unigram soft matching.**
-   The best row (`ordered+unordered`, `k=100`, `alpha=0.8`) lifts FiQA from `0.2053 -> 0.2101` (`+0.0048`), much closer to the predeclared `+0.005` bar than any prior portable transport attempt.
-2. **Concept nodes still hurt.**
-   Even after per-query normalization, adding mined concepts regresses all three corpora relative to the phrase-only transport leg.
-
-What failed:
-
-1. The best FiQA row regresses scifact by `-0.0073`, so it fails the cross-corpus regression gate.
-2. Diffuse-mass gating (`gate0.2`, `gate0.5`) protects scifact, but it also removes almost all of the FiQA lift.
+- **Phrase transport is materially better than unigram soft matching.** The
+  best row lifts FiQA by `+0.0048`, closer to the `+0.005` bar than any prior
+  portable transport attempt.
+- **Concept nodes still hurt.** Adding mined concepts regresses all three
+  corpora relative to phrase-only transport.
+- **The cross-corpus gate still fails.** The best FiQA row regresses scifact by
+  `-0.0073`, and diffuse-mass gating removes most of the FiQA gain.
 
 ## Interpretation
 
-This experiment refines the theory:
+- flat token transport is too weak
+- phrase structure adds real signal
+- phrase transport is still too local and corpus-bound
 
-- **Flat token transport is too weak.**
-  That was the soft-match result.
-- **Phrase structure does add real signal.**
-  The FiQA gain is the first portable transport-like lift that is clearly above noise.
-- **But phrase transport alone is still too local and corpus-bound.**
-  On scifact, the same mechanism overweights phrase adjacency where paraphrase and reordered terminology matter more.
-
-So the next mathematical step is not “more concept weight” or “another scalar blend.” It is a **higher-level transport graph**:
-
-1. **document-anchored transport** (`query -> top-K docs -> phrase nodes -> docs`), or
-2. **fragment-level transport** (sentence / passage nodes) so the walk has more structure than adjacent bigrams.
-
-Those are the closest sparse, portable analogues to position-sensitive / hierarchical OT that remain plausible in simeon's current architecture.
+That points to a higher-level transport graph rather than more concept weight or
+another scalar blend.
 
 ## Concept rework probes
 
@@ -81,12 +69,13 @@ After inspecting the concept failures, two reworks were tested:
 | nfcorpus | 0.2521 | 0.2517 | 0.2520 | 0.2520 |
 | fiqa | 0.2053 | 0.2040 | 0.2028 | 0.2025 |
 
-What this means:
+Takeaway:
 
-- **Generic-phrase suppression helps.** Filtering concepts by requiring both concept terms to be contentful query terms recovers much of the scifact damage (`0.6021 -> 0.6104`).
-- **But the deeper problem remains.** Neither filtered exact concepts nor doc-anchored concept transport beats plain BM25 on FiQA, which is exactly where concepts were supposed to help most.
+- filtering generic concepts helps scifact safety
+- the deeper problem remains: even filtered or doc-anchored concepts do not beat
+  BM25 on FiQA
 
-Updated conclusion: the concept failure is **partly a usage problem** (generic scaffolding phrases like `how do`, `risk of`, `associated with` were being rewarded), but **not only** a usage problem. Even after suppressing those, the concept leg still behaves too much like lexical phrase reuse and does not add enough paraphrase reach to justify its cost.
+So concept failure is partly a usage problem, but mostly a weak-signal problem.
 
 ## Graph transport follow-up
 
@@ -114,16 +103,12 @@ Rows tested:
 
 **Graph transport also disproves in its first form.**
 
-What changed:
+Takeaway:
 
-1. Adding doc-doc edges and lower damping makes FiQA slightly safer than pure phrase PPR (`0.2072` vs `0.2024`), so topology is not completely inert.
-2. But the graph never beats the earlier direct phrase row, and it never reaches the predeclared `+0.005` promote bar on any corpus.
-
-What this says about the theory:
-
-- The current graph is still too close to **adjacent-phrase reuse**.
-- Diffusion over query bigrams plus pool-local doc overlap mostly spreads the same local lexical evidence; it does not create new support paths strong enough to offset noise on scifact.
-- The remaining promising graph move is a **document-anchored or fragment-anchored walk** (`query -> docs -> phrases/fragments -> docs`), where first-pass BM25 docs seed the walk directly and sentence/passage structure can mediate support. That is closer to hierarchical transport than the current query-bigram PPR.
+- topology is not inert, but the graph never beats the earlier direct phrase row
+- diffusion over query bigrams plus pool-local doc overlap mostly spreads the
+  same lexical evidence
+- the next plausible move remains a document- or fragment-anchored walk
 
 ## Cluster topology follow-up
 
@@ -146,24 +131,11 @@ Rows tested:
 
 **Cluster topology also disproves in the first pass.**
 
-What this adds:
+Takeaway:
 
-1. The damage is more uniform than the earlier phrase graph: the best scifact row is only `-0.0033`, but FiQA and NFCorpus both move negative too.
-2. Tightening the overlap threshold (`o0.50`) helps slightly on FiQA versus the looser cluster row, but it still stays below BM25.
-
-What this says about the failure mode:
-
-- The current cluster cover behaves like a **salience/intersection filter**, not like a real semantic neighborhood.
-- Using sparse high-IDF fragment signatures plus greedy overlap clustering mostly groups fragments that already share rare lexical anchors; it does not bridge alternate lexical realizations.
-- So the topology got better, but the semantic substrate did not. The missing piece is not “more clustering,” it is a better **intra-pool relation** than raw lexical overlap.
-
-Updated next move:
-
-- keep the document-/fragment-anchored shape;
-- replace raw sparse-overlap clustering with a richer relation, e.g.:
-  - query-seeded `doc -> fragment -> fragment -> doc` walks,
-  - fragment nodes connected by shared concept/phrase neighborhoods rather than direct token overlap,
-  - or a lightweight vectorized fragment signature if portability constraints allow an in-corpus, training-free embedding.
+- the cluster cover behaves like a salience/intersection filter, not a semantic neighborhood
+- overlap clustering mostly groups fragments that already share rare lexical anchors
+- the missing piece is a better intra-pool relation than raw lexical overlap
 
 ## Semantic fragment graph follow-up
 
@@ -186,24 +158,11 @@ Rows tested:
 
 **Semantic fragment graphs are much safer, but still effectively inert.**
 
-What changed:
+Takeaway:
 
-1. The large negative regressions from lexical phrase/cluster topology mostly disappear.
-2. The best rows are now tiny positive nudges (`+0.0002` to `+0.0004`) instead of material regressions.
-
-What this says about the theory:
-
-- The **semantic substrate matters**: replacing lexical overlap with PMI fragment similarity removes most of the harm.
-- But PMI fragment neighborhoods are still too weak to create a meaningful reranking signal on top of BM25.
-- So the problem is no longer just topology. The walk is now safer, but the fragment relation lacks enough discriminative semantic separation to produce a real top-10 lift.
-
-Updated next move:
-
-- keep the semantic fragment graph shape;
-- strengthen the state space rather than the diffusion math:
-  - sentence/passage fragments beyond top-TextRank only,
-  - concept-mediated fragment edges on top of PMI similarity,
-  - or a stronger in-corpus fragment representation than summed PMI rows.
+- replacing lexical overlap with PMI similarity removes most of the harm
+- PMI fragment neighborhoods are still too weak to create a real reranking lift
+- the next lever is stronger fragment state, not more diffusion math
 
 ## Hybrid fragment graph follow-up
 
@@ -229,24 +188,13 @@ Rows tested:
 
 **The lexical scaffold reintroduces the old failure mode.**
 
-What changed:
+Takeaway:
 
-1. NFCorpus improves the most so far for fragment graphs (`+0.0025`), which means the hybrid graph is not empty.
-2. But scifact and fiqa both move negative again, so the scaffold trades safety for corpus-local lexical gain.
-
-What this says about the theory:
-
-- PMI-only fragment similarity was weak but stable.
-- Adding lexical bridge edges makes the graph sharper, but also pulls it back toward the same corpus-bound lexical bias that hurt phrase transport and overlap clustering.
-- So the next missing piece is probably **better semantic fragmentation / better fragment representations**, not more lexical reinforcement.
-
-Updated next move:
-
-- preserve the PMI fragment-graph backbone;
-- strengthen fragment state without lexical backsliding:
-  - sentence/passage coverage beyond top-TextRank selection,
-  - richer in-corpus fragment encoders,
-  - or concept-style bridges only when they are semantically filtered rather than raw overlap-driven.
+- the hybrid graph is not empty: nfcorpus improves the most so far for a
+  fragment graph (`+0.0025`)
+- but scifact and fiqa regress again, so the lexical scaffold trades safety for
+  corpus-local lexical gain
+- the next missing piece is better fragment state, not more lexical reinforcement
 
 ## Geometric fragment graph follow-up
 
@@ -274,23 +222,12 @@ Rows tested:
 
 **Geometric neighborhoods produce a real corpus-specific signal, but still fail the cross-corpus gate.**
 
-What changed:
+Takeaway:
 
-1. NFCorpus gets the best gain so far for a non-lexicalized fragment graph (`+0.0027`).
-2. FiQA stays roughly neutral instead of collapsing.
-3. Scifact still regresses materially, so the geometric neighborhood remains corpus-sensitive.
-
-What this says about the theory:
-
-- The literature intuition was directionally right: **query-centered soft geometry is stronger than plain PMI diffusion**.
-- But the local geometric kernel is still not robust across corpora; on scifact it likely amplifies dense neighborhood structure that does not correspond to relevance.
-- So cluster/graph shape is not fully exhausted, but any next step should adapt the geometry by corpus/query regime rather than assuming one neighborhood shape fits all three.
-
-Updated next move:
-
-- keep the geometric fragment backbone as the strongest non-lexical topology so far on nfcorpus;
-- add **query- or corpus-adaptive neighborhood sharpness** rather than a fixed geometric kernel;
-- or gate geometry to the regimes where it behaves more like nfcorpus and less like scifact.
+- query-centered soft geometry is stronger than plain PMI diffusion
+- the local geometric kernel is still corpus-sensitive
+- if this family continues, the next lever is adaptive sharpness or gating, not
+  another fixed neighborhood shape
 
 ## Adaptive geometric fragment graph follow-up
 
@@ -325,30 +262,12 @@ Rows tested:
 
 **This first adaptive/gated geometry attempt disproves.**
 
-What changed:
+Takeaway:
 
-1. NFCorpus improves again and sets a new best fragment-geometry gain (`+0.0036`).
-2. But scifact gets materially worse than the fixed-geometry pass, and fiqa
-   turns clearly negative.
-3. The adaptive heuristics also add runtime cost without buying cross-corpus
-   safety.
-
-What this says about the theory:
-
-- The broad direction was right — **geometry strength really is regime-sensitive**.
-- But the chosen regime signals (`avg_idf` + BM25 score decay) are not aligned
-  enough with the fragment-geometry failure mode to gate it safely.
-- In practice, this heuristic mostly sharpened the NFCorpus win while
-  over-correcting on the corpora where geometry was already fragile.
-
-Updated next move:
-
-- stop treating **simple BM25-side gating** as the likely fix for fragment geometry;
-- if this family continues, prefer:
-  - richer fragment representations,
-  - geometry-specific regime signals,
-  - or explicit structured-document fixtures where fragment neighborhoods are
-    more meaningful than on short body-only BEIR docs.
+- geometry strength really is regime-sensitive
+- the chosen BM25-side signals were not aligned enough with the fragment-geometry
+  failure mode to gate it safely
+- richer fragment representations remain the cleaner next direction
 
 ## Rich fragment vs geometry-signal ablation
 
@@ -383,41 +302,13 @@ Rows tested:
 
 **Richer fragment representations help; geometry-native control does not rescue cross-corpus robustness yet.**
 
-What changed:
+Takeaway:
 
-1. The **rich fragment** row sets the best fragment-geometry result so far on
-   NFCorpus (`+0.0057`), finally clearing the original `+0.005` lift bar on at
-   least one corpus.
-2. The rich rows also produce the first positive FiQA fragment-geometry result
-   above the earlier neutral floor (`0.2060` best, `+0.0007`).
-3. Geometry-specific gating by itself (`gsig`) is weaker than the fixed
-   geometry baseline on all three corpora.
-4. The combined row is a bit safer than rich-only on scifact, but still
-   regresses materially and does not beat the fixed-geometry scifact row.
-
-What this says about the theory:
-
-- **State quality matters more than control quality right now.** The biggest
-  gain came from giving the graph better fragment objects, not from changing
-  the gating logic.
-- The fragment geometry is still **corpus-sensitive**, but the richer
-  multi-scale state shifts the tradeoff in the right direction on the corpora
-  where fixed geometry had signal.
-- Geometry-native confidence signals are directionally cleaner than lexical
-  gating, but they are not yet calibrated enough to solve the scifact failure
-  mode.
-
-Updated next move:
-
-- make **richer fragment representations** the leading continuation of this
-  family;
-- treat geometry-signal gating as a secondary control path until it can help
-  scifact instead of only modulating already-positive regimes;
-- if we continue after this, prefer:
-  - stronger multi-scale fragment construction,
-  - fragment dedup / coverage controls,
-  - or structured-document fixtures where richer fragment anchors should pay
-    off more clearly than on short body-only BEIR docs.
+- **state quality matters more than control quality**
+- richer fragment representations are the first fragment-geometry branch to
+  clear the +0.005 bar on nfcorpus
+- geometry-native control remains secondary until it can help scifact rather
+  than only modulate already-positive regimes
 
 ## Rich-fragment coverage / dedup follow-up
 
@@ -446,31 +337,12 @@ Rows tested:
 
 **Coverage/dedup controls improve robustness, but trade away part of the rich-fragment gain.**
 
-What changed:
+Takeaway:
 
-1. Scifact improves sharply relative to the earlier rich rows (`-0.0060 -> -0.0027`).
-2. FiQA gets its best fragment-geometry result so far (`+0.0011`).
-3. NFCorpus remains positive, but gives back roughly half of the rich-fragment
-   lift (`+0.0057 -> +0.0029`).
-
-What this says about the theory:
-
-- The rich-fragment win was not just "more fragments is better" — **coverage and
-  redundancy control matter**.
-- Redundant anchors appear to amplify the bad regime on scifact.
-- But overly aggressive dedup also suppresses some of the productive dense
-  neighborhood structure on nfcorpus.
-
-Updated next move:
-
-- keep **rich fragment state** as the main direction;
-- treat **coverage / dedup** as the best current safety lever for scifact-like
-  corpora;
-- next continuation should tune that tradeoff more precisely, e.g.:
-  - separate sentence-fragment vs anchor-fragment budgets,
-  - confidence-weighted anchor retention,
-  - or corpus/query-adaptive dedup thresholds driven by fragment-space signals
-    rather than lexical heuristics.
+- the rich-fragment win was not just "more fragments is better"; redundancy
+  control matters
+- coverage/dedup is the best current safety lever for scifact-like corpora
+- but overly aggressive dedup suppresses part of the nfcorpus upside
 
 ## Budgeted rich-fragment follow-up
 
@@ -496,30 +368,11 @@ Rows tested:
 
 **This first sentence/anchor budgeting pass disproves.**
 
-What changed:
+Takeaway:
 
-1. It is noticeably faster than the richer coverage rows because fewer fragment
-   nodes survive into the geometry step.
-2. But the quality tradeoff is wrong: scifact gets worse again, nfcorpus loses
-   most of the retained upside, and fiqa turns negative.
-
-What this says about the theory:
-
-- The current richcov row was not simply "too many fragments." A hard budget of
-  `4 sentence + 1 anchor` throws away useful state rather than just removing
-  noise.
-- The anchor problem is likely subtler than a global count cap; **which anchor**
-  survives appears more important than just how many.
-- So the next useful control surface is probably **confidence-weighted anchor
-  retention** or softer, asymmetric budgets rather than a hard global cap.
-
-Updated next move:
-
-- keep the **richcov** rows as the active best frontier;
-- if continuing, prefer:
-  - confidence-weighted anchor retention,
-  - softer anchor-only budgets,
-  - or adaptive dedup thresholds before revisiting sentence-count caps.
+- hard budgets are faster but not better
+- `4 sentence + 1 anchor` throws away useful state rather than just noise
+- the next control surface would need softer or asymmetric anchor retention
 
 ## MMR-style rich-fragment selection follow-up
 
@@ -552,36 +405,12 @@ Rows tested:
 **This is the strongest soft-control near-miss so far, but it still does not
 clear the scifact safety bar.**
 
-What changed:
+Takeaway:
 
-1. The balanced MMR row (`lambda=0.35`) is the first post-`richcov` control
-   surface that clearly improves **both** nfcorpus and fiqa at once.
-2. The novelty-heavier row (`lambda=0.50`) recovers some scifact safety relative
-   to the balanced row, but it gives back part of the nfcorpus / fiqa upside.
-3. Both rows still outperform the earlier hard budget on every corpus, which is
-   direct evidence that **soft novelty-aware selection is better than blunt
-   count caps** for this fragment family.
-
-What this says about the theory:
-
-- The literature-backed intuition was right: the missing control surface is more
-  like **MMR / soft redundancy suppression** than a global fragment budget.
-- Rich-fragment state still has upside left in it: the balanced MMR row pushes
-  nfcorpus to `+0.0064` and fiqa to `+0.0026` over BM25 without reintroducing
-  the severe regressions from earlier lexical graph variants.
-- But scifact still prefers the stricter `richcov` safety profile, so the
-  remaining problem is likely **asymmetric control**, especially around anchors
-  and late-selected fragments, rather than one global MMR setting.
-
-Updated next move:
-
-- keep **richcov** as the safest active frontier and **richmmr** as the best
-  upside-seeking soft selector;
-- if continuing, prefer:
-  - anchor-specific MMR penalties or anchor-only minimum-score tightening,
-  - sentence-MMR plus stricter anchor retention,
-  - or a two-stage selector that keeps `richcov` sentence safety but lets MMR
-    choose among the remaining anchor candidates.
+- soft novelty-aware selection is better than blunt count caps
+- `richmmr` is the best upside-seeking soft selector so far
+- scifact still prefers the stricter `richcov` safety profile, so the remaining
+  problem is asymmetric control rather than one global MMR setting
 
 ---
 

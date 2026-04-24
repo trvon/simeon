@@ -824,6 +824,7 @@ inline float dot(const float* a, const float* b, std::size_t n) {
 
 struct Metrics {
     double ndcg_at_10;
+    double precision_at_10;
     double recall_at_10;
     double recall_at_100;
     double mrr_at_10;
@@ -838,7 +839,7 @@ Metrics score_rankings(const std::vector<std::vector<std::pair<float, std::uint3
     for (const auto& q : fx.qrels)
         rel[q.q][q.d] = q.rel;
 
-    double ndcg10_sum = 0.0, r10_sum = 0.0, r100_sum = 0.0, mrr10_sum = 0.0;
+    double ndcg10_sum = 0.0, p10_sum = 0.0, r10_sum = 0.0, r100_sum = 0.0, mrr10_sum = 0.0;
     std::size_t n_eval = 0;
 
     for (std::uint32_t qi = 0; qi < rankings.size(); ++qi) {
@@ -884,6 +885,7 @@ Metrics score_rankings(const std::vector<std::vector<std::pair<float, std::uint3
             idcg += static_cast<double>(rels[r]) / std::log2(static_cast<double>(r) + 2.0);
         }
         ndcg10_sum += idcg > 0.0 ? dcg / idcg : 0.0;
+        p10_sum += static_cast<double>(hits10) / 10.0;
 
         const double denom10 = static_cast<double>(std::min<std::size_t>(10, qrel.size()));
         const double denom100 = static_cast<double>(std::min<std::size_t>(100, qrel.size()));
@@ -893,7 +895,7 @@ Metrics score_rankings(const std::vector<std::vector<std::pair<float, std::uint3
     }
 
     const double n = static_cast<double>(n_eval == 0 ? 1 : n_eval);
-    return {ndcg10_sum / n, r10_sum / n, r100_sum / n, mrr10_sum / n, n_eval};
+    return {ndcg10_sum / n, p10_sum / n, r10_sum / n, r100_sum / n, mrr10_sum / n, n_eval};
 }
 
 // Optional per-config timings. Zero means "not measured" — emit() omits the field.
@@ -912,19 +914,20 @@ void emit(const char* config_name, const Fixture& fx, const Metrics& m,
     const double encode_dps = encode_us_per_doc > 0 ? 1.0e6 / encode_us_per_doc : 0.0;
     const double query_qps = query_us_per_q > 0 ? 1.0e6 / query_us_per_q : 0.0;
 
-    std::printf("{\"bench\":\"vs_reference\",\"config\":\"%s\",\"model\":\"%s\","
-                "\"queries\":%zu,\"docs\":%zu,\"evaluated_queries\":%zu,"
-                "\"code_bytes_per_doc\":%u,"
-                "\"ndcg_at_10\":%.4f,\"recall_at_10\":%.4f,\"recall_at_100\":%.4f,"
-                "\"mrr_at_10\":%.4f,"
-                "\"encode_us_per_doc\":%.3f,\"query_us_per_q\":%.3f,"
-                "\"encode_throughput_dps\":%.1f,\"query_throughput_qps\":%.1f,"
-                "\"index_build_us\":%.1f,"
-                "\"simd_tier\":\"%s\"}\n",
-                config_name, fx.ref_model.c_str(), fx.query_ids.size(), fx.doc_ids.size(),
-                m.evaluated_queries, code_bytes_per_doc, m.ndcg_at_10, m.recall_at_10,
-                m.recall_at_100, m.mrr_at_10, encode_us_per_doc, query_us_per_q, encode_dps,
-                query_qps, t.index_build_us, simeon::simd_tier_name(simeon::active_simd_tier()));
+    std::printf(
+        "{\"bench\":\"vs_reference\",\"config\":\"%s\",\"model\":\"%s\","
+        "\"queries\":%zu,\"docs\":%zu,\"evaluated_queries\":%zu,"
+        "\"code_bytes_per_doc\":%u,"
+        "\"ndcg_at_10\":%.4f,\"precision_at_10\":%.4f,\"recall_at_10\":%.4f,\"recall_at_100\":%.4f,"
+        "\"mrr_at_10\":%.4f,"
+        "\"encode_us_per_doc\":%.3f,\"query_us_per_q\":%.3f,"
+        "\"encode_throughput_dps\":%.1f,\"query_throughput_qps\":%.1f,"
+        "\"index_build_us\":%.1f,"
+        "\"simd_tier\":\"%s\"}\n",
+        config_name, fx.ref_model.c_str(), fx.query_ids.size(), fx.doc_ids.size(),
+        m.evaluated_queries, code_bytes_per_doc, m.ndcg_at_10, m.precision_at_10, m.recall_at_10,
+        m.recall_at_100, m.mrr_at_10, encode_us_per_doc, query_us_per_q, encode_dps, query_qps,
+        t.index_build_us, simeon::simd_tier_name(simeon::active_simd_tier()));
     std::fflush(stdout);
 }
 
@@ -1050,6 +1053,41 @@ Bm25WithTiming build_bm25f(const Fixture& fx, std::span<const std::string> aux_t
     out.idx.finalize();
     out.build_us = extra_build_us + elapsed_us(t0);
     return out;
+}
+
+// Plan 3 — RRF (reciprocal rank fusion) over multiple BM25 variant rankings.
+// Each variant produces a per-query top-K via BM25. Rankings are RRF-fused
+// to produce a pool diversified over length-normalization / weighting
+// differences. Attacks Bottleneck 2 (BM25-pool R@100 ceiling) via
+// first-pass candidate diversification instead of fragment-geometry rerank.
+void run_bm25_variants_rrf(const char* name, const Fixture& fx,
+                           std::span<const simeon::Bm25Index* const> variants, double build_us) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<std::vector<std::pair<std::uint32_t, float>>> per_variant_rank(variants.size());
+    for (auto& r : per_variant_rank)
+        r.resize(nd);
+    std::vector<float> s(nd, 0.0f);
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        std::vector<simeon::Ranking> ins;
+        ins.reserve(variants.size());
+        for (std::size_t v = 0; v < variants.size(); ++v) {
+            std::fill(s.begin(), s.end(), 0.0f);
+            variants[v]->score(fx.query_texts[qi], s);
+            for (std::uint32_t di = 0; di < nd; ++di)
+                per_variant_rank[v][di] = {di, s[di]};
+            ins.emplace_back(per_variant_rank[v]);
+        }
+        auto fused = simeon::rrf_fuse(ins, 60.0f);
+        rankings[qi].reserve(fused.size());
+        for (const auto& [did, sc] : fused)
+            rankings[qi].emplace_back(sc, did);
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
 }
 
 void run_bm25(const char* name, const Fixture& fx, const simeon::Bm25Index& idx, double build_us) {
@@ -1965,6 +2003,64 @@ void run_bm25_fragment_geometry(const char* name, const Fixture& fx, const simeo
     emit(name, fx, score_rankings(rankings, fx), 0, t);
 }
 
+void run_fragment_quality_router(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                                 double build_us, const simeon::Encoder& enc,
+                                 std::span<const std::vector<SemanticFragment>> rich_cov_doc_frags,
+                                 simeon::RouterConfig rc = {}) {
+    Timing t;
+    t.index_build_us = build_us;
+    simeon::QueryRouter router(idx, rc);
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+
+    const GeometryGraphConfig richcov_cfg{
+        .pool_size = 100,
+        .alpha = 0.8f,
+        .top_fragments_per_doc = 8,
+        .attention_scale = 8.0f,
+        .knn = 8,
+        .steps = 2,
+        .use_phss = true,
+        .phss_config =
+            simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
+    };
+    auto richcov_max_cfg = richcov_cfg;
+    richcov_max_cfg.doc_aggregator = simeon::FragmentGeometryConfig::DocAggregator::Max;
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::array<std::uint32_t, 3> route_counts{};
+
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        rankings[qi].reserve(nd);
+        const auto features = router.features(fx.query_texts[qi]);
+        const auto recipe = router.choose_quality(features);
+        ++route_counts[static_cast<std::size_t>(recipe)];
+
+        std::vector<float> scores(nd, 0.0f);
+        switch (recipe) {
+            case simeon::QualityRecipe::Bm25Only:
+                idx.score(fx.query_texts[qi], scores);
+                break;
+            case simeon::QualityRecipe::FragmentRichCovPhssApprox:
+                scores = simeon::score_fragment_geometry(fx.query_texts[qi], idx, enc,
+                                                         rich_cov_doc_frags, richcov_cfg);
+                break;
+            case simeon::QualityRecipe::FragmentRichCovPhssApproxMax:
+                scores = simeon::score_fragment_geometry(fx.query_texts[qi], idx, enc,
+                                                         rich_cov_doc_frags, richcov_max_cfg);
+                break;
+        }
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(scores[di], di);
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+    std::fprintf(
+        stderr, "[fragment-quality-router] %s: bm25=%u richcov=%u richcov_max=%u (of %u queries)\n",
+        name, route_counts[0], route_counts[1], route_counts[2],
+        static_cast<std::uint32_t>(fx.query_ids.size()));
+}
+
 void run_bm25_transport_grid(const Fixture& fx) {
     simeon::Bm25Config cfg;
     cfg.build_word_bigrams = true;
@@ -2155,12 +2251,21 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
     for (const auto& doc : fx.doc_texts)
         doc_frags.push_back(simeon::build_doc_semantic_fragments(enc, doc, idx.idx, 6, 8));
     const double total_build_us = idx.build_us + elapsed_us(tb);
+    auto basicpos_tb = Clock::now();
+    std::vector<std::vector<SemanticFragment>> basicpos_doc_frags;
+    basicpos_doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        basicpos_doc_frags.push_back(
+            simeon::build_doc_semantic_fragments(enc, doc, idx.idx, 6, 8, 0.20f));
+    simeon::compress_fragments_to_bf16(basicpos_doc_frags, enc.output_dim());
+    const double basicpos_total_build_us = total_build_us + elapsed_us(basicpos_tb);
     auto rich_tb = Clock::now();
     std::vector<std::vector<SemanticFragment>> rich_doc_frags;
     rich_doc_frags.reserve(fx.doc_texts.size());
     for (const auto& doc : fx.doc_texts)
         rich_doc_frags.push_back(
             simeon::build_doc_semantic_fragments_rich(enc, doc, idx.idx, 6, 8));
+    simeon::compress_fragments_to_bf16(rich_doc_frags, enc.output_dim());
     const double rich_total_build_us = total_build_us + elapsed_us(rich_tb);
     auto cover_tb = Clock::now();
     std::vector<std::vector<SemanticFragment>> rich_cov_doc_frags;
@@ -2168,6 +2273,7 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
     for (const auto& doc : fx.doc_texts)
         rich_cov_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_covered(
             enc, doc, idx.idx, 6, 8, 0.60f, 0.80f));
+    simeon::compress_fragments_to_bf16(rich_cov_doc_frags, enc.output_dim());
     const double rich_cov_total_build_us = total_build_us + elapsed_us(cover_tb);
     auto mmr_tb = Clock::now();
     std::vector<std::vector<SemanticFragment>> rich_mmr_doc_frags;
@@ -2175,6 +2281,7 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
     for (const auto& doc : fx.doc_texts)
         rich_mmr_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_mmr(
             enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.35f, 0.30f, 0.15f));
+    simeon::compress_fragments_to_bf16(rich_mmr_doc_frags, enc.output_dim());
     const double rich_mmr_total_build_us = total_build_us + elapsed_us(mmr_tb);
     auto mmr_novel_tb = Clock::now();
     std::vector<std::vector<SemanticFragment>> rich_mmr_novel_doc_frags;
@@ -2182,6 +2289,7 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
     for (const auto& doc : fx.doc_texts)
         rich_mmr_novel_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_mmr(
             enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.50f, 0.24f, 0.12f));
+    simeon::compress_fragments_to_bf16(rich_mmr_novel_doc_frags, enc.output_dim());
     const double rich_mmr_novel_total_build_us = total_build_us + elapsed_us(mmr_novel_tb);
     auto budget_tb = Clock::now();
     std::vector<std::vector<SemanticFragment>> rich_budget_doc_frags;
@@ -2189,6 +2297,7 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
     for (const auto& doc : fx.doc_texts)
         rich_budget_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_budgeted(
             enc, doc, idx.idx, 6, 8, 0.60f, 4, 0.80f, 0.15f, 1));
+    simeon::compress_fragments_to_bf16(rich_budget_doc_frags, enc.output_dim());
     const double rich_budget_total_build_us = total_build_us + elapsed_us(budget_tb);
 
     run_bm25_fragment_graph("bm25_fragment_graph_k100_d0.85_q0.20_f0.35_a0.8", fx, idx.idx,
@@ -2276,8 +2385,19 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
                                                 .fragment_signature_terms = 8,
                                                 .max_iters = 20});
 
+    simeon::compress_fragments_to_bf16(doc_frags, enc.output_dim());
+
     run_bm25_fragment_geometry("bm25_fragment_geom_k100_t4_s8_k8_p2_a0.8", fx, idx.idx,
                                total_build_us, enc, doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.8f,
+                                                   .top_fragments_per_doc = 4,
+                                                   .attention_scale = 8.0f,
+                                                   .knn = 8,
+                                                   .steps = 2,
+                                                   .use_phss = false});
+    run_bm25_fragment_geometry("bm25_fragment_geom_basicpos_k100_t4_s8_k8_p2_a0.8", fx, idx.idx,
+                               basicpos_total_build_us, enc, basicpos_doc_frags,
                                GeometryGraphConfig{.pool_size = 100,
                                                    .alpha = 0.8f,
                                                    .top_fragments_per_doc = 4,
@@ -2477,6 +2597,7 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
     for (const auto& doc : fx.doc_texts)
         rich_asym_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_asymmetric(
             enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.35f, 0.15f));
+    simeon::compress_fragments_to_bf16(rich_asym_doc_frags, enc.output_dim());
     const double rich_asym_total_build_us = total_build_us + elapsed_us(asym_tb);
     run_bm25_fragment_geometry("bm25_fragment_geom_richasym_k100_t6_s8_k8_p2_a0.8", fx, idx.idx,
                                rich_asym_total_build_us, enc, rich_asym_doc_frags,
@@ -2495,6 +2616,7 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
     for (const auto& doc : fx.doc_texts)
         rich_asym2_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_asymmetric(
             enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.50f, 0.15f));
+    simeon::compress_fragments_to_bf16(rich_asym2_doc_frags, enc.output_dim());
     const double rich_asym2_total_build_us = total_build_us + elapsed_us(asym2_tb);
     run_bm25_fragment_geometry("bm25_fragment_geom_richasym2_k100_t6_s8_k8_p2_a0.8", fx, idx.idx,
                                rich_asym2_total_build_us, enc, rich_asym2_doc_frags,
@@ -2520,7 +2642,31 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
                             .phss_config = simeon::PhssConfig{
                                 .criterion = simeon::PhssConfig::Criterion::LargestGap}});
     run_bm25_fragment_geometry(
+        "bm25_fragment_geom_basicpos_phss_k100_t4_gap", fx, idx.idx, basicpos_total_build_us, enc,
+        basicpos_doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 4,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGap}});
+    run_bm25_fragment_geometry(
         "bm25_fragment_geom_phssapprox_k100_t4_gap", fx, idx.idx, total_build_us, enc, doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 4,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_basicpos_phssapprox_k100_t4_gap", fx, idx.idx, basicpos_total_build_us,
+        enc, basicpos_doc_frags,
         GeometryGraphConfig{.pool_size = 100,
                             .alpha = 0.8f,
                             .top_fragments_per_doc = 4,
@@ -2568,6 +2714,244 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
         "bm25_fragment_geom_phssapprox_k100_t8_richcov_gap", fx, idx.idx, rich_cov_total_build_us,
         enc, rich_cov_doc_frags,
         GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 8,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+    // Per-corpus α sweep — Bruch & Gai 2023 fusion analysis. Convex blend
+    // α tuned on dev fold, validated on test fold. Sweep on production
+    // frontier (richcov + Sum + LargestGapApprox).
+    {
+        auto alpha_richcov = [&](const char* name, float alpha) {
+            run_bm25_fragment_geometry(
+                name, fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+                GeometryGraphConfig{
+                    .pool_size = 100,
+                    .alpha = alpha,
+                    .top_fragments_per_doc = 8,
+                    .attention_scale = 8.0f,
+                    .knn = 8,
+                    .steps = 2,
+                    .use_phss = true,
+                    .phss_config = simeon::PhssConfig{
+                        .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+        };
+        alpha_richcov("bm25_fragment_geom_phssapprox_a0.50_richcov", 0.50f);
+        alpha_richcov("bm25_fragment_geom_phssapprox_a0.65_richcov", 0.65f);
+        alpha_richcov("bm25_fragment_geom_phssapprox_a0.75_richcov", 0.75f);
+        // a0.80 is the existing default — already in `phssapprox_k100_t8_richcov_gap`
+        alpha_richcov("bm25_fragment_geom_phssapprox_a0.85_richcov", 0.85f);
+        alpha_richcov("bm25_fragment_geom_phssapprox_a0.95_richcov", 0.95f);
+    }
+
+    // Plan 2 self-KB — corpus-mined doc-doc graph + query-time pool expansion.
+    // Phase A (n=20, no gate) validated R@100 cross-fold on 2/3 corpora but
+    // regressed nDCG on scifact/fiqa and latency was 200x baseline.
+    // Phase B sweeps three tunables: neighbor cap, BM25-score filter,
+    // topology (score-decay) gate. See docs/research/self_kb_results.md.
+    {
+        const std::uint32_t graph_neighbors_per_doc = 20;
+        const std::size_t nd_local = fx.doc_texts.size();
+        std::vector<std::vector<std::uint32_t>> doc_doc_neighbors(nd_local);
+        std::vector<float> tmp_scores(nd_local);
+        for (std::size_t d = 0; d < nd_local; ++d) {
+            std::fill(tmp_scores.begin(), tmp_scores.end(), 0.0f);
+            idx.idx.score(fx.doc_texts[d], tmp_scores);
+            tmp_scores[d] = -std::numeric_limits<float>::infinity();
+            auto neighbors = simeon::top_k(tmp_scores, graph_neighbors_per_doc);
+            doc_doc_neighbors[d].reserve(neighbors.size());
+            for (const auto& [nid, _sc] : neighbors)
+                doc_doc_neighbors[d].push_back(nid);
+        }
+
+        auto selfkb_run = [&](const char* name, std::uint32_t n_cap, float bm25_min,
+                              float decay_min) {
+            run_bm25_fragment_geometry(
+                name, fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+                GeometryGraphConfig{
+                    .pool_size = 100,
+                    .alpha = 0.8f,
+                    .top_fragments_per_doc = 8,
+                    .attention_scale = 8.0f,
+                    .knn = 8,
+                    .steps = 2,
+                    .use_phss = true,
+                    .phss_config =
+                        simeon::PhssConfig{.criterion =
+                                               simeon::PhssConfig::Criterion::LargestGapApprox},
+                    .doc_doc_neighbors = doc_doc_neighbors,
+                    .selfkb_neighbors_per_pool_doc = n_cap,
+                    .selfkb_min_bm25_score = bm25_min,
+                    .selfkb_gate_score_decay_min = decay_min});
+        };
+
+        selfkb_run("bm25_fragment_geom_phssapprox_selfkb_n20_richcov", 0,
+                   -std::numeric_limits<float>::infinity(), 0.0f);
+        selfkb_run("bm25_fragment_geom_phssapprox_selfkb_n5_richcov", 5,
+                   -std::numeric_limits<float>::infinity(), 0.0f);
+        selfkb_run("bm25_fragment_geom_phssapprox_selfkb_n10_richcov", 10,
+                   -std::numeric_limits<float>::infinity(), 0.0f);
+        selfkb_run("bm25_fragment_geom_phssapprox_selfkb_n10_bm25filt_richcov", 10, 0.0f, 0.0f);
+        selfkb_run("bm25_fragment_geom_phssapprox_selfkb_n10_gate25_richcov", 10,
+                   -std::numeric_limits<float>::infinity(), 0.25f);
+        selfkb_run("bm25_fragment_geom_phssapprox_selfkb_n10_filt_gate25_richcov", 10, 0.0f, 0.25f);
+    }
+
+    // Plan 4 — single-fragment-per-doc builder. Per-doc argmax-qsim
+    // selection BEFORE aggregation. Different attack point than MaxSim:
+    // MaxSim aggregates across 8 fragments (max); Plan 4 selects 1 fragment
+    // per doc then aggregates (sum over 1 = the fragment).
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_singlefrag_k100_t4", fx, idx.idx, total_build_us, enc,
+        doc_frags,
+        GeometryGraphConfig{
+            .pool_size = 100,
+            .alpha = 0.8f,
+            .top_fragments_per_doc = 4,
+            .attention_scale = 8.0f,
+            .knn = 8,
+            .steps = 2,
+            .use_phss = true,
+            .phss_config =
+                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
+            .single_fragment_per_doc = true});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_singlefrag_k100_t8_richcov", fx, idx.idx,
+        rich_cov_total_build_us, enc, rich_cov_doc_frags,
+        GeometryGraphConfig{
+            .pool_size = 100,
+            .alpha = 0.8f,
+            .top_fragments_per_doc = 8,
+            .attention_scale = 8.0f,
+            .knn = 8,
+            .steps = 2,
+            .use_phss = true,
+            .phss_config =
+                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
+            .single_fragment_per_doc = true});
+
+    // MaxSim aggregation probe — training-free ColBERTv2 analog.
+    // Replaces sum-aggregation at the doc level with max-pooling. Tests
+    // whether the multi-fragment averaging mechanism (identified by
+    // phss_1d_triangle_results.md) is the actual ceiling. Both basic
+    // (t=4) and richcov (t=8) builders, all using LargestGapApprox.
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_max_k100_t4", fx, idx.idx, total_build_us, enc, doc_frags,
+        GeometryGraphConfig{
+            .pool_size = 100,
+            .alpha = 0.8f,
+            .top_fragments_per_doc = 4,
+            .attention_scale = 8.0f,
+            .knn = 8,
+            .steps = 2,
+            .use_phss = true,
+            .phss_config =
+                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
+            .doc_aggregator = simeon::FragmentGeometryConfig::DocAggregator::Max});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_max_k100_t8_richcov", fx, idx.idx, rich_cov_total_build_us,
+        enc, rich_cov_doc_frags,
+        GeometryGraphConfig{
+            .pool_size = 100,
+            .alpha = 0.8f,
+            .top_fragments_per_doc = 8,
+            .attention_scale = 8.0f,
+            .knn = 8,
+            .steps = 2,
+            .use_phss = true,
+            .phss_config =
+                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
+            .doc_aggregator = simeon::FragmentGeometryConfig::DocAggregator::Max});
+
+    {
+        simeon::RouterConfig qrc;
+        qrc.atire_max_clarity = 3.0f;
+        run_fragment_quality_router("bm25_fragment_geom_quality_router_t6_t12_clar3_richcov", fx,
+                                    idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags, qrc);
+    }
+
+    // PHSS-1D Phase A — triangle-count importance probe over PHSS-selected
+    // kNN graph. 6 recipes: 3 alphas {0.25, 0.5, 1.0} × 2 placements
+    // {QueryAttention, Diffusion}. Built on richcov + LargestGapApprox
+    // (current production frontier per phss_largest_gap_approx_results.md).
+    {
+        auto tri_richcov = [&](const char* name, float alpha,
+                               simeon::FragmentGeometryConfig::TrianglePlacement place) {
+            run_bm25_fragment_geometry(
+                name, fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+                GeometryGraphConfig{
+                    .pool_size = 100,
+                    .alpha = 0.8f,
+                    .top_fragments_per_doc = 8,
+                    .attention_scale = 8.0f,
+                    .knn = 8,
+                    .steps = 2,
+                    .use_phss = true,
+                    .phss_config =
+                        simeon::PhssConfig{.criterion =
+                                               simeon::PhssConfig::Criterion::LargestGapApprox},
+                    .use_triangle_weight = true,
+                    .triangle_alpha = alpha,
+                    .triangle_placement = place});
+        };
+        tri_richcov("bm25_fragment_geom_phssapprox_tri_a0.25_att_richcov", 0.25f,
+                    simeon::FragmentGeometryConfig::TrianglePlacement::QueryAttention);
+        tri_richcov("bm25_fragment_geom_phssapprox_tri_a0.50_att_richcov", 0.50f,
+                    simeon::FragmentGeometryConfig::TrianglePlacement::QueryAttention);
+        tri_richcov("bm25_fragment_geom_phssapprox_tri_a1.00_att_richcov", 1.00f,
+                    simeon::FragmentGeometryConfig::TrianglePlacement::QueryAttention);
+        tri_richcov("bm25_fragment_geom_phssapprox_tri_a0.25_diff_richcov", 0.25f,
+                    simeon::FragmentGeometryConfig::TrianglePlacement::Diffusion);
+        tri_richcov("bm25_fragment_geom_phssapprox_tri_a0.50_diff_richcov", 0.50f,
+                    simeon::FragmentGeometryConfig::TrianglePlacement::Diffusion);
+        tri_richcov("bm25_fragment_geom_phssapprox_tri_a1.00_diff_richcov", 1.00f,
+                    simeon::FragmentGeometryConfig::TrianglePlacement::Diffusion);
+    }
+
+    // Phase C — pool_size sweep with LargestGapApprox (validated default per
+    // docs/research/phss_largest_gap_approx_results.md).
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_k200_t4_gap", fx, idx.idx, total_build_us, enc, doc_frags,
+        GeometryGraphConfig{.pool_size = 200,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 4,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_k500_t4_gap", fx, idx.idx, total_build_us, enc, doc_frags,
+        GeometryGraphConfig{.pool_size = 500,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 4,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_k200_t8_richcov_gap", fx, idx.idx, rich_cov_total_build_us,
+        enc, rich_cov_doc_frags,
+        GeometryGraphConfig{.pool_size = 200,
+                            .alpha = 0.8f,
+                            .top_fragments_per_doc = 8,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_k500_t8_richcov_gap", fx, idx.idx, rich_cov_total_build_us,
+        enc, rich_cov_doc_frags,
+        GeometryGraphConfig{.pool_size = 500,
                             .alpha = 0.8f,
                             .top_fragments_per_doc = 8,
                             .attention_scale = 8.0f,
@@ -2630,6 +3014,49 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
                             .use_phss = true,
                             .phss_config = simeon::PhssConfig{
                                 .criterion = simeon::PhssConfig::Criterion::LargestGap}});
+}
+
+void run_bm25_fragment_quality_router_grid(const Fixture& fx) {
+    simeon::Bm25Config bcfg;
+    bcfg.build_word_bigrams = true;
+    auto idx = build_bm25(fx, bcfg);
+
+    std::vector<std::string_view> seed_views;
+    seed_views.reserve(fx.doc_texts.size());
+    for (const auto& d : fx.doc_texts)
+        seed_views.emplace_back(d);
+
+    auto tb = Clock::now();
+    simeon::PmiConfig pcfg;
+    pcfg.target_rank = 128;
+    pcfg.min_token_count = 5;
+    pcfg.max_vocab_size = 20'000;
+    auto pmi = simeon::PmiEmbeddings::learn(std::span<const std::string_view>(seed_views), pcfg);
+
+    simeon::EncoderConfig ecfg;
+    ecfg.ngram_mode = simeon::NGramMode::WordOnly;
+    ecfg.ngram_min = 1;
+    ecfg.ngram_max = 1;
+    ecfg.sketch_dim = 0;
+    ecfg.output_dim = pmi.dim();
+    ecfg.projection = simeon::ProjectionMode::None;
+    ecfg.l2_normalize = true;
+    ecfg.pmi_rows = &pmi;
+    simeon::Encoder enc(ecfg);
+
+    std::vector<std::vector<SemanticFragment>> rich_cov_doc_frags;
+    rich_cov_doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts) {
+        rich_cov_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_covered(
+            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f));
+    }
+    simeon::compress_fragments_to_bf16(rich_cov_doc_frags, enc.output_dim());
+    const double rich_cov_total_build_us = idx.build_us + elapsed_us(tb);
+
+    simeon::RouterConfig qrc;
+    qrc.atire_max_clarity = 3.0f;
+    run_fragment_quality_router("bm25_fragment_geom_quality_router_t6_t12_clar3_richcov", fx,
+                                idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags, qrc);
 }
 #endif // SIMEON_RESEARCH_BENCH
 
@@ -3072,6 +3499,7 @@ void run_router_cascade(const char* name, simeon::EncoderConfig sc, const Fixtur
 // using the saturating-recall convention.
 struct PerQueryMetric {
     double ndcg_at_10 = 0.0;
+    double precision_at_10 = 0.0;
     double recall_at_10 = 0.0;
     double recall_at_100 = 0.0;
     double mrr_at_10 = 0.0;
@@ -3117,6 +3545,7 @@ PerQueryMetric compute_per_query(const std::vector<std::pair<float, std::uint32_
         idcg += static_cast<double>(rels[r]) / std::log2(static_cast<double>(r) + 2.0);
     }
     out.ndcg_at_10 = idcg > 0.0 ? dcg / idcg : 0.0;
+    out.precision_at_10 = static_cast<double>(hits10) / 10.0;
     const double denom10 = static_cast<double>(std::min<std::size_t>(10, qrel.size()));
     const double denom100 = static_cast<double>(std::min<std::size_t>(100, qrel.size()));
     out.recall_at_10 = static_cast<double>(hits10) / denom10;
@@ -3271,7 +3700,7 @@ void run_router_grid(const std::string& prefix, simeon::EncoderConfig sc, const 
                              "\"score_decay_rate\":%.4f,\"score_normalized_var\":%.4f,"
                              "\"top_k_score_entropy\":%.4f,\"pool_overlap_jaccard\":%.4f,"
                              "\"nqc\":%.4f,\"wig_full\":%.4f,"
-                             "\"has_relevant\":%s,\"ndcg_at_10\":%.4f,"
+                             "\"has_relevant\":%s,\"ndcg_at_10\":%.4f,\"precision_at_10\":%.4f,"
                              "\"recall_at_10\":%.4f,\"recall_at_100\":%.4f,"
                              "\"mrr_at_10\":%.4f}\n",
                              name.c_str(), fx.query_ids[qi].c_str(), simeon::recipe_name(recipe),
@@ -3280,8 +3709,8 @@ void run_router_grid(const std::string& prefix, simeon::EncoderConfig sc, const 
                              features.avg_term_chars, features.score_decay_rate,
                              features.score_normalized_var, features.top_k_score_entropy,
                              features.pool_overlap_jaccard, features.nqc, features.wig_full,
-                             pq.has_relevant ? "true" : "false", pq.ndcg_at_10, pq.recall_at_10,
-                             pq.recall_at_100, pq.mrr_at_10);
+                             pq.has_relevant ? "true" : "false", pq.ndcg_at_10, pq.precision_at_10,
+                             pq.recall_at_10, pq.recall_at_100, pq.mrr_at_10);
             }
         }
         t.query_us = elapsed_us(t1);
@@ -3397,7 +3826,7 @@ void run_oracle_router(const char* name, simeon::EncoderConfig sc, const Fixture
                          "\"top_k_score_entropy\":%.4f,\"pool_overlap_jaccard\":%.4f,"
                          "\"nqc\":%.4f,\"wig_full\":%.4f,"
                          "\"scq_sum\":%.4f,\"simplified_clarity\":%.4f,"
-                         "\"has_relevant\":%s,\"ndcg_at_10\":%.4f,"
+                         "\"has_relevant\":%s,\"ndcg_at_10\":%.4f,\"precision_at_10\":%.4f,"
                          "\"recall_at_10\":%.4f,\"recall_at_100\":%.4f,"
                          "\"mrr_at_10\":%.4f,"
                          "\"ndcg_atire\":%.4f,\"ndcg_sab\":%.4f,\"ndcg_cascade\":%.4f}\n",
@@ -3408,8 +3837,9 @@ void run_oracle_router(const char* name, simeon::EncoderConfig sc, const Fixture
                          features.top_k_score_entropy, features.pool_overlap_jaccard, features.nqc,
                          features.wig_full, features.scq_sum, features.simplified_clarity,
                          best->m->has_relevant ? "true" : "false", best->m->ndcg_at_10,
-                         best->m->recall_at_10, best->m->recall_at_100, best->m->mrr_at_10,
-                         m_atire.ndcg_at_10, m_sab.ndcg_at_10, m_cascade.ndcg_at_10);
+                         best->m->precision_at_10, best->m->recall_at_10, best->m->recall_at_100,
+                         best->m->mrr_at_10, m_atire.ndcg_at_10, m_sab.ndcg_at_10,
+                         m_cascade.ndcg_at_10);
         }
     }
     t.query_us = elapsed_us(t0);
@@ -3437,6 +3867,7 @@ int main(int argc, char** argv) {
     bool graph_only = false;
     bool cluster_only = false;
     bool fragment_only = false;
+    bool fragment_quality_router_only = false;
 #endif
 
     for (int i = 1; i < argc; ++i) {
@@ -3470,6 +3901,8 @@ int main(int argc, char** argv) {
             cluster_only = true;
         } else if (a == "--fragment-only") {
             fragment_only = true;
+        } else if (a == "--fragment-quality-router-only") {
+            fragment_quality_router_only = true;
 #endif
         } else if (a == "--router-per-query" && i + 1 < argc) {
             router_per_query_path = argv[++i];
@@ -3485,6 +3918,7 @@ int main(int argc, char** argv) {
                 "  --graph-only                 run graph transport rows only\n"
                 "  --cluster-only               run fragment/cluster topology rows only\n"
                 "  --fragment-only              run PMI fragment graph rows only\n"
+                "  --fragment-quality-router-only run only the quality-routed fragment row\n"
                 "  --router-per-query <path>    write per-query router telemetry JSONL\n"
                 "  fixture_dir expects corpus.tsv, queries[_dev].tsv,\n"
                 "  qrels[_dev].tsv, reference[_dev].bin\n"
@@ -3594,6 +4028,11 @@ int main(int argc, char** argv) {
         if (g_router_per_query_fp)
             std::fclose(g_router_per_query_fp);
         return 0;
+    } else if (fragment_quality_router_only) {
+        run_bm25_fragment_quality_router_grid(fx);
+        if (g_router_per_query_fp)
+            std::fclose(g_router_per_query_fp);
+        return 0;
     }
 #endif
 
@@ -3658,10 +4097,10 @@ int main(int argc, char** argv) {
         run_bm25(name, fx, idx.idx, idx.build_us);
         return idx;
     };
-    bm25_variant("bm25_atire", simeon::Bm25Variant::Atire);
-    bm25_variant("bm25_plus", simeon::Bm25Variant::BM25Plus);
-    bm25_variant("bm25_l", simeon::Bm25Variant::BM25L);
-    bm25_variant("bm25_dlh13", simeon::Bm25Variant::DLH13);
+    auto atire_keep = bm25_variant("bm25_atire", simeon::Bm25Variant::Atire);
+    auto plus_keep = bm25_variant("bm25_plus", simeon::Bm25Variant::BM25Plus);
+    auto l_keep = bm25_variant("bm25_l", simeon::Bm25Variant::BM25L);
+    auto dlh_keep = bm25_variant("bm25_dlh13", simeon::Bm25Variant::DLH13);
     bm25_variant("bm25_pl2", simeon::Bm25Variant::PL2);
     bm25_variant("bm25_dph", simeon::Bm25Variant::DPH);
     bm25_variant("bm25_dcm", simeon::Bm25Variant::Dcm);
@@ -3685,6 +4124,20 @@ int main(int argc, char** argv) {
         bm25_variant("bm25_sab_strict", simeon::Bm25Variant::SubwordAwareBackoff, 1.0f, 0.0f);
     auto sab_smooth = bm25_variant("bm25_sab_smooth_gamma5",
                                    simeon::Bm25Variant::SubwordAwareBackoff, 1.0f, 5.0f);
+
+    // Plan 3 — RRF over 5 BM25 variants (Atire, BM25+, BM25L, DLH13, SAB-smooth).
+    // Attacks Bottleneck 2 (BM25-pool R@100 ceiling) via first-pass candidate
+    // diversification. Per Bruch-Gai 2023, RRF is generally sensitive to
+    // parameter k; using the canonical k=60. See docs/research/next_research_plans.md.
+    {
+        std::array<const simeon::Bm25Index*, 5> variants{
+            &atire_keep.idx, &plus_keep.idx, &l_keep.idx, &dlh_keep.idx, &sab_smooth.idx};
+        const double total_build_us = atire_keep.build_us + plus_keep.build_us + l_keep.build_us +
+                                      dlh_keep.build_us + sab_smooth.build_us;
+        run_bm25_variants_rrf("bm25_rrf_variants5", fx,
+                              std::span<const simeon::Bm25Index* const>(variants), total_build_us);
+    }
+
     // Headline cascade: SAB pool (strongest morphological recall) → simeon
     // cosine rerank inside the pool. This is the row that should beat
     // bm25_only on lexical+morphological corpora like scifact.
