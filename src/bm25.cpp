@@ -420,6 +420,32 @@ void Bm25Index::score_weighted_hashes(
     }
 }
 
+void Bm25Index::reserve_docs(std::size_t expected_docs) {
+    if (finalized_ || expected_docs == 0)
+        return;
+    const std::size_t word_est =
+        std::min<std::size_t>(10'000'000u, std::max<std::size_t>(128u, expected_docs * 100u));
+    const std::size_t ngram_est =
+        std::min<std::size_t>(100'000'000u, std::max<std::size_t>(1024u, expected_docs * 1100u));
+
+    postings_.reserve(word_est);
+    aux_postings_.reserve(word_est);
+    doc_lengths_.reserve(expected_docs);
+    aux_doc_lengths_.reserve(expected_docs);
+    if (cfg_.variant == Bm25Variant::SubwordAwareBackoff) {
+        ngram_postings_.reserve(ngram_est);
+        aux_ngram_postings_.reserve(ngram_est);
+        ngram_doc_lengths_.reserve(expected_docs);
+        aux_ngram_doc_lengths_.reserve(expected_docs);
+    }
+    if (cfg_.build_word_bigrams) {
+        // Bigrams sublinear in unique words but in-doc counts; use the word
+        // estimate as a generous upper bound.
+        ordered_bigram_postings_.reserve(word_est);
+        unordered_bigram_postings_.reserve(word_est);
+    }
+}
+
 void Bm25Index::add_doc(std::string_view text) {
     add_doc(text, {});
 }
@@ -561,6 +587,31 @@ void Bm25Index::finalize() {
             avg_dl = static_cast<float>(static_cast<double>(total) / static_cast<double>(n));
         }
         const float nf = static_cast<float>(n);
+        const std::size_t df_max =
+            cfg_.ngram_df_prune_ratio > 0.0f && n > 0
+                ? static_cast<std::size_t>(static_cast<double>(cfg_.ngram_df_prune_ratio) *
+                                           static_cast<double>(n))
+                : std::numeric_limits<std::size_t>::max();
+        std::size_t pruned = 0;
+        if (df_max < std::numeric_limits<std::size_t>::max()) {
+            std::size_t keep_count = 0;
+            for (const auto& [h, tp] : postings) {
+                if (tp.docs.size() <= df_max)
+                    ++keep_count;
+                else
+                    ++pruned;
+            }
+            if (pruned > 0) {
+                FlatHashMapU64<TermPostings> kept;
+                kept.reserve(keep_count);
+                for (auto& [h, tp] : postings) {
+                    if (tp.docs.size() <= df_max) {
+                        kept[h] = std::move(tp);
+                    }
+                }
+                postings = std::move(kept);
+            }
+        }
         for (auto& [h, tp] : postings) {
             const float df = static_cast<float>(tp.docs.size());
             tp.idf = std::log((nf - df + 0.5f) / (df + 0.5f) + 1.0f);
@@ -571,6 +622,7 @@ void Bm25Index::finalize() {
             tp.docs.shrink_to_fit();
         }
         postings.shrink_to_fit();
+        (void)pruned;
     };
 
     finalize_word_field(doc_lengths_, postings_, avg_dl_, total_tokens_, alpha_sum_);

@@ -78,7 +78,13 @@ struct Bm25Config {
     // Char n-gram range used by SubwordAwareBackoff for the secondary index.
     // Ignored by other variants.
     std::uint32_t ngram_min = 3;
-    std::uint32_t ngram_max = 5;
+    std::uint32_t ngram_max = 4;
+    // Drop n-gram postings whose df exceeds this fraction of the corpus at
+    // finalize(). Standard IR practice (Lucene StopFilter default): n-grams
+    // present in >50% of docs have near-zero IDF and contribute noise, not
+    // signal, to ranking. 0 disables pruning. Only applies to ngram_postings
+    // and aux_ngram_postings; word postings are never pruned.
+    float ngram_df_prune_ratio = 0.5f;
     // Dirichlet concentration for Dcm variant. 0 means "derive from corpus"
     // (uses avg_dl at finalize() time, matching Zhai-Lafferty μ=avg_dl).
     // Ignored by other variants.
@@ -152,6 +158,8 @@ class Bm25Index {
 public:
     explicit Bm25Index(Bm25Config cfg = {}) noexcept;
 
+    void reserve_docs(std::size_t expected_docs);
+
     void add_doc(std::string_view text);
     // Optional second field for BM25F-style scoring. This is an opt-in utility:
     // the default router and shipped production rows remain body-only unless the
@@ -172,6 +180,10 @@ public:
         return static_cast<std::uint32_t>(doc_lengths_.size());
     }
     const Bm25Config& config() const noexcept { return cfg_; }
+    // Average document length (in word tokens) over the indexed corpus.
+    // Cached at finalize(); 0 before finalize. Used by corpus-class
+    // recipe routing (see `recommend_recipe_by_avg_dl`).
+    float avg_dl() const noexcept { return avg_dl_; }
 
     // Per-term lookup for pre-retrieval predictors (QueryRouter). Tokenizes
     // `term` exactly like score() does (word-only) and returns the document
@@ -300,5 +312,36 @@ private:
     FlatHashMapU64<TermPostings> ordered_bigram_postings_;
     FlatHashMapU64<TermPostings> unordered_bigram_postings_;
 };
+
+// ---------------------------------------------------------------------------
+// Corpus-class recipe routing.
+//
+// Per `docs/research/plan1_trec_covid_results.md`, cross-fold validated
+// findings cluster by corpus length:
+// - avg_dl > 250 (true long-doc, e.g., trec-covid 290): AtireLTD α=0.7 lifts
+//   nDCG cross-fold (+0.0057 dev / +0.0082 test) and R@100 (+0.0239 / +0.0066).
+// - avg_dl ≤ 250 (BEIR-3 fixtures: scifect 215, nfcorpus 234, fiqa 133):
+//   Atire baseline; LTD on these corpora was at best partial (R@100 only).
+//
+// This helper formalizes the recommendation. Callers that build a single
+// Bm25Index per corpus can use it to pick a sensible default at construction
+// time without per-query routing overhead.
+// ---------------------------------------------------------------------------
+
+struct CorpusClassRecipe {
+    Bm25Variant variant;
+    float ltd_alpha; // ignored unless variant == AtireLTD
+};
+
+// Pick a recommended Bm25 recipe based on corpus average document length.
+// Returns AtireLTD with α=0.7 when avg_dl > long_doc_threshold (default 250),
+// otherwise plain Atire. Callers free to ignore and build any other variant.
+constexpr CorpusClassRecipe recommend_recipe_by_avg_dl(float avg_dl,
+                                                       float long_doc_threshold = 250.0f) noexcept {
+    if (avg_dl > long_doc_threshold) {
+        return {Bm25Variant::AtireLTD, 0.7f};
+    }
+    return {Bm25Variant::Atire, 1.0f};
+}
 
 } // namespace simeon

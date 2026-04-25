@@ -40,9 +40,9 @@ Bm25Index build(Bm25Variant v) {
 }
 
 void test_each_variant_deterministic() {
-    for (auto v : {Bm25Variant::Atire, Bm25Variant::BM25Plus, Bm25Variant::BM25L,
-                   Bm25Variant::DLH13, Bm25Variant::PL2, Bm25Variant::DPH, Bm25Variant::Dcm,
-                   Bm25Variant::SubwordAwareBackoff}) {
+    for (auto v :
+         {Bm25Variant::Atire, Bm25Variant::BM25Plus, Bm25Variant::BM25L, Bm25Variant::DLH13,
+          Bm25Variant::PL2, Bm25Variant::DPH, Bm25Variant::Dcm, Bm25Variant::SubwordAwareBackoff}) {
         auto a = build(v);
         auto b = build(v);
         const std::size_t n = a.doc_count();
@@ -374,6 +374,30 @@ void test_subword_aware_smooth_blends_exact_and_ngram() {
     assert(any_diff);
 }
 
+// Cross-fold-validated long-doc → AtireLTD α=0.7 recommendation per
+// docs/research/plan1_trec_covid_results.md.
+void test_corpus_class_recommendation_long_doc_picks_ltd() {
+    const auto rec = simeon::recommend_recipe_by_avg_dl(290.0f);
+    assert(rec.variant == Bm25Variant::AtireLTD);
+    assert(std::fabs(rec.ltd_alpha - 0.7f) < 1e-6f);
+}
+
+void test_corpus_class_recommendation_short_doc_picks_atire() {
+    // BEIR-3 fixtures: scifact 215, nfcorpus 234, fiqa 133 — all ≤ default
+    // long-doc threshold of 250. Recommendation should be plain Atire.
+    for (float avg_dl : {133.0f, 215.0f, 234.0f, 250.0f}) {
+        const auto rec = simeon::recommend_recipe_by_avg_dl(avg_dl);
+        assert(rec.variant == Bm25Variant::Atire);
+    }
+}
+
+void test_corpus_class_recommendation_threshold_override() {
+    auto rec_high_thresh = simeon::recommend_recipe_by_avg_dl(290.0f, 300.0f);
+    assert(rec_high_thresh.variant == Bm25Variant::Atire); // 290 < 300
+    auto rec_low_thresh = simeon::recommend_recipe_by_avg_dl(200.0f, 150.0f);
+    assert(rec_low_thresh.variant == Bm25Variant::AtireLTD); // 200 > 150
+}
+
 } // namespace
 
 int main() {
@@ -392,5 +416,8 @@ int main() {
     test_subword_aware_oov_query_term_gets_nonzero_score();
     test_subword_aware_strict_collapses_to_bm25plus_on_known_query();
     test_subword_aware_smooth_blends_exact_and_ngram();
+    test_corpus_class_recommendation_long_doc_picks_ltd();
+    test_corpus_class_recommendation_short_doc_picks_atire();
+    test_corpus_class_recommendation_threshold_override();
     return 0;
 }
