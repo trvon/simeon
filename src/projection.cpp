@@ -1,6 +1,7 @@
 #include "simeon/projection.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <stdexcept>
 #include <utility>
@@ -80,7 +81,7 @@ std::uint32_t next_pow2(std::uint32_t n) noexcept {
 // Walsh-Hadamard matrix entry: H[i, j] = (-1)^popcount(i & j). Rows of H are
 // orthogonal with squared norm = pad_n; H/sqrt(pad_n) is orthonormal.
 int hadamard_sign(std::uint32_t i, std::uint32_t j) noexcept {
-    return (__builtin_popcount(i & j) & 1) ? -1 : +1;
+    return (std::popcount(i & j) & 1) ? -1 : +1;
 }
 
 // Very sparse (Li 2006): entries scaled by sqrt(s), nonzero with probability 1/s.
