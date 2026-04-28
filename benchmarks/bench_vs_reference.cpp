@@ -28,6 +28,7 @@
 #include "simeon/concept_mining.hpp"
 #include "simeon/fragment_geometry.hpp"
 #include "simeon/fusion.hpp"
+#include "simeon/glove_embeddings.hpp"
 #include "simeon/matryoshka.hpp"
 #include "simeon/minhash.hpp"
 #include "simeon/persistent_homology.hpp"
@@ -2299,6 +2300,24 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
             enc, doc, idx.idx, 6, 8, 0.60f, 4, 0.80f, 0.15f, 1));
     simeon::compress_fragments_to_bf16(rich_budget_doc_frags, enc.output_dim());
     const double rich_budget_total_build_us = total_build_us + elapsed_us(budget_tb);
+    // C8a: SIF-weighted PMI fragments (richcov overlap caps, same sentence/anchor params).
+    auto sif_tb = Clock::now();
+    std::vector<std::vector<SemanticFragment>> sif_doc_frags;
+    sif_doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        sif_doc_frags.push_back(simeon::build_doc_semantic_fragments_richcov_sif(
+            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f));
+    simeon::compress_fragments_to_bf16(sif_doc_frags, enc.output_dim());
+    const double sif_total_build_us = total_build_us + elapsed_us(sif_tb);
+    // C8b: Bigram Hadamard SIF fragments (Mitchell-Lapata multiplicative composition).
+    auto bsif_tb = Clock::now();
+    std::vector<std::vector<SemanticFragment>> bsif_doc_frags;
+    bsif_doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        bsif_doc_frags.push_back(simeon::build_doc_semantic_fragments_richcov_bsif(
+            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f));
+    simeon::compress_fragments_to_bf16(bsif_doc_frags, enc.output_dim());
+    const double bsif_total_build_us = total_build_us + elapsed_us(bsif_tb);
 
     run_bm25_fragment_graph("bm25_fragment_graph_k100_d0.85_q0.20_f0.35_a0.8", fx, idx.idx,
                             total_build_us, enc, doc_frags,
@@ -3014,6 +3033,211 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
                             .use_phss = true,
                             .phss_config = simeon::PhssConfig{
                                 .criterion = simeon::PhssConfig::Criterion::LargestGap}});
+
+    // C2: rank normalization on BM25 pool scores. Replaces z-score on the BM25
+    // side with rank-then-zscore (distribution-free; Bruch et al. 2022 arXiv:2210.11934).
+    // alpha unchanged at 0.8; geometry side still z-scored. Tests whether
+    // Pareto/log-normal BM25 score distribution miscalibrates the z-score blend.
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_ranknorm_k100_t4", fx, idx.idx, total_build_us, enc,
+        doc_frags,
+        GeometryGraphConfig{
+            .pool_size = 100,
+            .alpha = 0.8f,
+            .top_fragments_per_doc = 4,
+            .attention_scale = 8.0f,
+            .knn = 8,
+            .steps = 2,
+            .use_phss = true,
+            .phss_config =
+                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
+            .bm25_rank_norm = true});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_ranknorm_k100_t8_richcov", fx, idx.idx,
+        rich_cov_total_build_us, enc, rich_cov_doc_frags,
+        GeometryGraphConfig{
+            .pool_size = 100,
+            .alpha = 0.8f,
+            .top_fragments_per_doc = 8,
+            .attention_scale = 8.0f,
+            .knn = 8,
+            .steps = 2,
+            .use_phss = true,
+            .phss_config =
+                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
+            .bm25_rank_norm = true});
+
+    // C3: PHSS gap-magnitude adaptive blend. Reduces alpha (more geometry weight)
+    // when max_gap is large (well-clustered pool = high geometry confidence).
+    // Three delta sweep on richcov+LargestGapApprox: delta in {0.05, 0.10, 0.15}.
+    // gap_scale=0.30 means a gap of 0.30 saturates confidence to 1.0.
+    for (const float gap_delta : {0.05f, 0.10f, 0.15f}) {
+        const int delta_pct = static_cast<int>(gap_delta * 100.0f + 0.5f);
+        const std::string name =
+            "bm25_fragment_geom_phssapprox_gapadapt_k100_t8_richcov_d" + std::to_string(delta_pct);
+        run_bm25_fragment_geometry(
+            name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+            GeometryGraphConfig{
+                .pool_size = 100,
+                .alpha = 0.8f,
+                .top_fragments_per_doc = 8,
+                .attention_scale = 8.0f,
+                .knn = 8,
+                .steps = 2,
+                .use_phss = true,
+                .phss_config =
+                    simeon::PhssConfig{.criterion =
+                                           simeon::PhssConfig::Criterion::LargestGapApprox},
+                .phss_gap_adaptive = true,
+                .phss_gap_delta = gap_delta,
+                .phss_gap_scale = 0.30f,
+                .phss_gap_alpha_min = 0.65f});
+    }
+
+    // C1: SPLATE-style outer MaxSim. Geometry score = max(query·frag) per doc,
+    // computed before the alpha blend (not inside diffusion). Eliminates the
+    // ~0.006 attenuation multiplier from attention×diffusion×t-fragment averaging.
+    // Alpha sweep on richcov (t=8): determines optimal BM25/MaxSim blend ratio.
+    // Reference: SPLATE (Formal et al. 2024, arXiv:2404.13950).
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_outermaxsim_k100_t4", fx, idx.idx, total_build_us, enc, doc_frags,
+        GeometryGraphConfig{
+            .pool_size = 100, .alpha = 0.8f, .top_fragments_per_doc = 4, .outer_maxsim = true});
+    for (const float om_alpha : {0.50f, 0.65f, 0.80f, 0.90f, 0.95f}) {
+        const std::string om_name = "bm25_fragment_geom_outermaxsim_a" +
+                                    std::to_string(om_alpha).substr(0, 4) + "_k100_t8_richcov";
+        run_bm25_fragment_geometry(om_name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc,
+                                   rich_cov_doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = om_alpha,
+                                                       .top_fragments_per_doc = 8,
+                                                       .outer_maxsim = true});
+    }
+
+    // C6: IDF-weighted query-coverage reranking (Lin & Bilmes 2010, Carbonell &
+    // Goldstein 1998). Adds gamma * z(coverage) to the final blend, where coverage
+    // is the IDF-weighted BM25 score of the doc against unique query terms.
+    // Operates at document level on BM25 term structure; independent of Ceiling B.
+    // Tested on outer MaxSim (C1+C6 combo) and standalone PHSS configs.
+    // Gamma sweep: determines optimal coverage weight.
+    for (const float cov_gamma : {0.05f, 0.10f, 0.15f, 0.20f}) {
+        const std::string cov_name = "bm25_fragment_geom_outermaxsim_cov_a0.80_g" +
+                                     std::to_string(cov_gamma).substr(0, 4) + "_k100_t8_richcov";
+        run_bm25_fragment_geometry(cov_name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc,
+                                   rich_cov_doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = 0.80f,
+                                                       .top_fragments_per_doc = 8,
+                                                       .outer_maxsim = true,
+                                                       .idf_coverage = true,
+                                                       .idf_coverage_gamma = cov_gamma});
+    }
+    // Coverage on PHSS t8 richcov (production config + coverage).
+    for (const float cov_gamma : {0.05f, 0.10f, 0.15f, 0.20f}) {
+        const std::string cov_name = "bm25_fragment_geom_phssapprox_cov_a0.80_g" +
+                                     std::to_string(cov_gamma).substr(0, 4) + "_k100_t8_richcov";
+        run_bm25_fragment_geometry(cov_name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc,
+                                   rich_cov_doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = 0.80f,
+                                                       .top_fragments_per_doc = 8,
+                                                       .idf_coverage = true,
+                                                       .idf_coverage_gamma = cov_gamma});
+    }
+    // Coverage on BM25-only (geometry disabled, pure coverage additive).
+    for (const float cov_gamma : {0.05f, 0.10f, 0.15f, 0.20f}) {
+        const std::string cov_name =
+            "bm25_cov_a1.00_g" + std::to_string(cov_gamma).substr(0, 4) + "_k100";
+        run_bm25_fragment_geometry(cov_name.c_str(), fx, idx.idx, idx.build_us, enc, doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = 1.0f,
+                                                       .top_fragments_per_doc = 4,
+                                                       .idf_coverage = true,
+                                                       .idf_coverage_gamma = cov_gamma});
+    }
+
+    // C4: RFF kernel augmentation (Rahimi & Recht 2007, NIPS). Arc-cosine degree-1
+    // feature map Φ(x)=max(0,Wx)/√rff_dim applied to whitened fragment/query vectors
+    // before similarity computation. Captures higher-order PMI co-occurrence beyond
+    // linear cosine. Tested in combination with outer MaxSim (C1+C4) — the validated
+    // quality path on trec-covid — and alone with PHSS for comparison.
+    // rff_dim=256: 2× expansion from dim=128.
+    run_bm25_fragment_geometry("bm25_fragment_geom_rff_outermaxsim_a0.80_k100_t8_richcov", fx,
+                               idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+                               GeometryGraphConfig{.pool_size = 100,
+                                                   .alpha = 0.80f,
+                                                   .top_fragments_per_doc = 8,
+                                                   .outer_maxsim = true,
+                                                   .rff_augment = true,
+                                                   .rff_dim = 256});
+    for (const float rff_alpha : {0.50f, 0.65f, 0.80f, 0.90f, 0.95f}) {
+        const std::string rff_name = "bm25_fragment_geom_rff_outermaxsim_a" +
+                                     std::to_string(rff_alpha).substr(0, 4) + "_k100_t8_richcov";
+        run_bm25_fragment_geometry(rff_name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc,
+                                   rich_cov_doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = rff_alpha,
+                                                       .top_fragments_per_doc = 8,
+                                                       .outer_maxsim = true,
+                                                       .rff_augment = true,
+                                                       .rff_dim = 256});
+    }
+
+    // C8a: SIF-weighted PMI fragment encoding (Arora, Liang, Ma 2017). IDF-weighted
+    // token accumulation replaces uniform PMI sum: content nouns up-weighted,
+    // function words down-weighted. Targets Ceiling B (PMI space flatness).
+    // Tested with outer MaxSim (C1+C8a) and PHSS to isolate representation effect.
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_outermaxsim_sif_a0.80_k100_t8_richcov", fx, idx.idx, sif_total_build_us,
+        enc, sif_doc_frags,
+        GeometryGraphConfig{
+            .pool_size = 100, .alpha = 0.80f, .top_fragments_per_doc = 8, .outer_maxsim = true});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_sif_a0.80_k100_t8_richcov", fx, idx.idx, sif_total_build_us,
+        enc, sif_doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.80f,
+                            .top_fragments_per_doc = 8,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+    for (const float sif_alpha : {0.50f, 0.65f, 0.80f, 0.90f, 0.95f}) {
+        const std::string sif_name = "bm25_fragment_geom_outermaxsim_sif_a" +
+                                     std::to_string(sif_alpha).substr(0, 4) + "_k100_t8_richcov";
+        run_bm25_fragment_geometry(sif_name.c_str(), fx, idx.idx, sif_total_build_us, enc,
+                                   sif_doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = sif_alpha,
+                                                       .top_fragments_per_doc = 8,
+                                                       .outer_maxsim = true});
+    }
+
+    // C8b: Bigram Hadamard SIF (Mitchell & Lapata 2010, multiplicative composition).
+    // Hadamard product of adjacent PMI vectors adds relational structure beyond unigram SIF.
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_outermaxsim_bsif_a0.80_k100_t8_richcov", fx, idx.idx,
+        bsif_total_build_us, enc, bsif_doc_frags,
+        GeometryGraphConfig{
+            .pool_size = 100, .alpha = 0.80f, .top_fragments_per_doc = 8, .outer_maxsim = true});
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_bsif_a0.80_k100_t8_richcov", fx, idx.idx,
+        bsif_total_build_us, enc, bsif_doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.80f,
+                            .top_fragments_per_doc = 8,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+    for (const float bsif_alpha : {0.50f, 0.65f, 0.80f, 0.90f, 0.95f}) {
+        const std::string bsif_name = "bm25_fragment_geom_outermaxsim_bsif_a" +
+                                      std::to_string(bsif_alpha).substr(0, 4) + "_k100_t8_richcov";
+        run_bm25_fragment_geometry(bsif_name.c_str(), fx, idx.idx, bsif_total_build_us, enc,
+                                   bsif_doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = bsif_alpha,
+                                                       .top_fragments_per_doc = 8,
+                                                       .outer_maxsim = true});
+    }
 }
 
 void run_bm25_fragment_quality_router_grid(const Fixture& fx) {
@@ -3057,6 +3281,65 @@ void run_bm25_fragment_quality_router_grid(const Fixture& fx) {
     qrc.atire_max_clarity = 3.0f;
     run_fragment_quality_router("bm25_fragment_geom_quality_router_t6_t12_clar3_richcov", fx,
                                 idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags, qrc);
+}
+
+// C9: Pre-trained GloVe/fastText fragment geometry grid.
+// Replaces corpus-trained PMI (rank 128, vocab 20K) with externally loaded
+// 300d word vectors to test whether richer embeddings lift the PMI Ceiling B.
+// Runs BM25 baseline + outer MaxSim alpha sweep + PHSS on richcov fragments.
+void run_bm25_fragment_glove_grid(const Fixture& fx, const std::string& glove_path) {
+    simeon::Bm25Config bcfg;
+    bcfg.build_word_bigrams = true;
+    auto idx = build_bm25(fx, bcfg);
+
+    auto tb = Clock::now();
+    // max_vocab=200000: top-200K covers the head of GloVe 840B / fastText Common Crawl;
+    // keeps memory at ~240 MB for 300d vectors.
+    auto glove = simeon::load_glove(glove_path, 200'000);
+
+    simeon::EncoderConfig ecfg;
+    ecfg.ngram_mode = simeon::NGramMode::WordOnly;
+    ecfg.ngram_min = 1;
+    ecfg.ngram_max = 1;
+    ecfg.sketch_dim = 0;
+    ecfg.output_dim = glove.dim();
+    ecfg.projection = simeon::ProjectionMode::None;
+    ecfg.l2_normalize = true;
+    ecfg.pmi_rows = &glove;
+    simeon::Encoder enc(ecfg);
+
+    std::vector<std::vector<SemanticFragment>> rich_cov_doc_frags;
+    rich_cov_doc_frags.reserve(fx.doc_texts.size());
+    for (const auto& doc : fx.doc_texts)
+        rich_cov_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_covered(
+            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f));
+    simeon::compress_fragments_to_bf16(rich_cov_doc_frags, enc.output_dim());
+    const double rich_cov_total_build_us = idx.build_us + elapsed_us(tb);
+
+    run_bm25("bm25_only", fx, idx.idx, idx.build_us);
+
+    for (const float alpha : {0.50f, 0.65f, 0.80f, 0.90f, 0.95f}) {
+        const std::string name = "bm25_fragment_geom_outermaxsim_glove_a" +
+                                 std::to_string(alpha).substr(0, 4) + "_k100_t8_richcov";
+        run_bm25_fragment_geometry(name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc,
+                                   rich_cov_doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = alpha,
+                                                       .top_fragments_per_doc = 8,
+                                                       .outer_maxsim = true});
+    }
+    run_bm25_fragment_geometry(
+        "bm25_fragment_geom_phssapprox_glove_a0.80_k100_t8_richcov", fx, idx.idx,
+        rich_cov_total_build_us, enc, rich_cov_doc_frags,
+        GeometryGraphConfig{.pool_size = 100,
+                            .alpha = 0.80f,
+                            .top_fragments_per_doc = 8,
+                            .attention_scale = 8.0f,
+                            .knn = 8,
+                            .steps = 2,
+                            .use_phss = true,
+                            .phss_config = simeon::PhssConfig{
+                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
 }
 #endif // SIMEON_RESEARCH_BENCH
 
@@ -3868,6 +4151,7 @@ int main(int argc, char** argv) {
     bool cluster_only = false;
     bool fragment_only = false;
     bool fragment_quality_router_only = false;
+    std::string fragment_glove_path;
 #endif
 
     for (int i = 1; i < argc; ++i) {
@@ -3903,6 +4187,8 @@ int main(int argc, char** argv) {
             fragment_only = true;
         } else if (a == "--fragment-quality-router-only") {
             fragment_quality_router_only = true;
+        } else if (a == "--fragment-glove" && i + 1 < argc) {
+            fragment_glove_path = argv[++i];
 #endif
         } else if (a == "--router-per-query" && i + 1 < argc) {
             router_per_query_path = argv[++i];
@@ -3919,6 +4205,7 @@ int main(int argc, char** argv) {
                 "  --cluster-only               run fragment/cluster topology rows only\n"
                 "  --fragment-only              run PMI fragment graph rows only\n"
                 "  --fragment-quality-router-only run only the quality-routed fragment row\n"
+                "  --fragment-glove <path>      run GloVe/fastText fragment grid (C9)\n"
                 "  --router-per-query <path>    write per-query router telemetry JSONL\n"
                 "  fixture_dir expects corpus.tsv, queries[_dev].tsv,\n"
                 "  qrels[_dev].tsv, reference[_dev].bin\n"
@@ -4030,6 +4317,11 @@ int main(int argc, char** argv) {
         return 0;
     } else if (fragment_quality_router_only) {
         run_bm25_fragment_quality_router_grid(fx);
+        if (g_router_per_query_fp)
+            std::fclose(g_router_per_query_fp);
+        return 0;
+    } else if (!fragment_glove_path.empty()) {
+        run_bm25_fragment_glove_grid(fx, fragment_glove_path);
         if (g_router_per_query_fp)
             std::fclose(g_router_per_query_fp);
         return 0;

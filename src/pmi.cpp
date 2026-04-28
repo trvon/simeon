@@ -41,14 +41,15 @@ inline bool is_word_char(unsigned char c) noexcept {
 
 // Walks `text` emitting lowercased word tokens via `cb(tok)`. Matches the
 // tokenizer's `emit_word_tokens` word boundary rules.
-template <typename Cb>
-void for_each_word(std::string_view text, Cb&& cb) {
+template <typename Cb> void for_each_word(std::string_view text, Cb&& cb) {
     const std::size_t n = text.size();
     std::size_t i = 0;
     while (i < n) {
-        while (i < n && !is_word_char(static_cast<unsigned char>(text[i]))) ++i;
+        while (i < n && !is_word_char(static_cast<unsigned char>(text[i])))
+            ++i;
         const std::size_t start = i;
-        while (i < n && is_word_char(static_cast<unsigned char>(text[i]))) ++i;
+        while (i < n && is_word_char(static_cast<unsigned char>(text[i])))
+            ++i;
         if (start < i) {
             std::string tok(text.substr(start, i - start));
             for (auto& c : tok)
@@ -62,9 +63,9 @@ void for_each_word(std::string_view text, Cb&& cb) {
 // (i, j) and (j, i) are stored explicitly so matmul is a single row scan.
 struct SparseSym {
     std::uint32_t n = 0;
-    std::vector<std::uint32_t> row_ptr;  // size n+1
-    std::vector<std::uint32_t> col_idx;  // size nnz
-    std::vector<float> vals;             // size nnz
+    std::vector<std::uint32_t> row_ptr; // size n+1
+    std::vector<std::uint32_t> col_idx; // size nnz
+    std::vector<float> vals;            // size nnz
 };
 
 // y = M * x. x, y are n-by-cols column-major dense matrices. M is symmetric
@@ -74,7 +75,8 @@ void spmm(const SparseSym& M, const float* x, std::uint32_t cols, float* y) {
     for (std::uint32_t i = 0; i < n; ++i) {
         const std::uint32_t beg = M.row_ptr[i];
         const std::uint32_t end = M.row_ptr[i + 1];
-        for (std::uint32_t c = 0; c < cols; ++c) y[i + c * n] = 0.0f;
+        for (std::uint32_t c = 0; c < cols; ++c)
+            y[i + c * n] = 0.0f;
         for (std::uint32_t e = beg; e < end; ++e) {
             const std::uint32_t j = M.col_idx[e];
             const float v = M.vals[e];
@@ -94,20 +96,25 @@ void qr_inplace(float* A, std::uint32_t n, std::uint32_t k) {
             for (std::uint32_t prev = 0; prev < col; ++prev) {
                 const float* qp = A + prev * n;
                 double dot = 0.0;
-                for (std::uint32_t i = 0; i < n; ++i) dot += static_cast<double>(qp[i]) * q[i];
+                for (std::uint32_t i = 0; i < n; ++i)
+                    dot += static_cast<double>(qp[i]) * q[i];
                 const float d = static_cast<float>(dot);
-                for (std::uint32_t i = 0; i < n; ++i) q[i] -= d * qp[i];
+                for (std::uint32_t i = 0; i < n; ++i)
+                    q[i] -= d * qp[i];
             }
         }
         double sq = 0.0;
-        for (std::uint32_t i = 0; i < n; ++i) sq += static_cast<double>(q[i]) * q[i];
+        for (std::uint32_t i = 0; i < n; ++i)
+            sq += static_cast<double>(q[i]) * q[i];
         const double nrm = std::sqrt(sq);
         if (nrm > 1e-12) {
             const float inv = static_cast<float>(1.0 / nrm);
-            for (std::uint32_t i = 0; i < n; ++i) q[i] *= inv;
+            for (std::uint32_t i = 0; i < n; ++i)
+                q[i] *= inv;
         } else {
             // Degenerate column — zero it. Rare on real corpora.
-            for (std::uint32_t i = 0; i < n; ++i) q[i] = 0.0f;
+            for (std::uint32_t i = 0; i < n; ++i)
+                q[i] = 0.0f;
         }
     }
 }
@@ -117,7 +124,8 @@ void qr_inplace(float* A, std::uint32_t n, std::uint32_t k) {
 // columns. Unordered output.
 void jacobi_eigh(std::vector<double>& A, std::vector<double>& V, std::uint32_t k) {
     V.assign(static_cast<std::size_t>(k) * k, 0.0);
-    for (std::uint32_t i = 0; i < k; ++i) V[i + i * k] = 1.0;
+    for (std::uint32_t i = 0; i < k; ++i)
+        V[i + i * k] = 1.0;
 
     const std::uint32_t max_sweeps = 64;
     for (std::uint32_t sweep = 0; sweep < max_sweeps; ++sweep) {
@@ -128,12 +136,14 @@ void jacobi_eigh(std::vector<double>& A, std::vector<double>& V, std::uint32_t k
                 off += a * a;
             }
         }
-        if (off < 1e-24) break;
+        if (off < 1e-24)
+            break;
 
         for (std::uint32_t p = 0; p < k - 1; ++p) {
             for (std::uint32_t q = p + 1; q < k; ++q) {
                 const double apq = A[p + q * k];
-                if (std::fabs(apq) < 1e-14) continue;
+                if (std::fabs(apq) < 1e-14)
+                    continue;
                 const double app = A[p + p * k];
                 const double aqq = A[q + q * k];
                 const double theta = (aqq - app) / (2.0 * apq);
@@ -153,7 +163,8 @@ void jacobi_eigh(std::vector<double>& A, std::vector<double>& V, std::uint32_t k
                 A[q + p * k] = 0.0;
 
                 for (std::uint32_t i = 0; i < k; ++i) {
-                    if (i == p || i == q) continue;
+                    if (i == p || i == q)
+                        continue;
                     const double aip = A[i + p * k];
                     const double aiq = A[i + q * k];
                     A[i + p * k] = c * aip - s * aiq;
@@ -172,7 +183,7 @@ void jacobi_eigh(std::vector<double>& A, std::vector<double>& V, std::uint32_t k
     }
 }
 
-}  // namespace
+} // namespace
 
 PmiEmbeddings PmiEmbeddings::learn(std::span<const std::string_view> seed_corpus,
                                    const PmiConfig& cfg) {
@@ -212,12 +223,13 @@ PmiEmbeddings PmiEmbeddings::learn(std::span<const std::string_view> seed_corpus
             ranked.emplace_back(std::move(const_cast<std::string&>(kv.first)), kv.second);
         }
     }
-    std::sort(ranked.begin(), ranked.end(),
-              [](const auto& a, const auto& b) {
-                  if (a.second != b.second) return a.second > b.second;
-                  return a.first < b.first;  // break ties deterministically
-              });
-    if (ranked.size() > cfg.max_vocab_size) ranked.resize(cfg.max_vocab_size);
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second)
+            return a.second > b.second;
+        return a.first < b.first; // break ties deterministically
+    });
+    if (ranked.size() > cfg.max_vocab_size)
+        ranked.resize(cfg.max_vocab_size);
     if (ranked.empty()) {
         throw std::invalid_argument(
             "PmiEmbeddings::learn: no tokens met min_token_count threshold");
@@ -237,7 +249,7 @@ PmiEmbeddings PmiEmbeddings::learn(std::span<const std::string_view> seed_corpus
     // upper-triangular plus diagonal in a dense-hashed sparse map. For each
     // pair (i, j) we record c_ij once; the diagonal holds c_ii (same-token
     // co-occurrence within window).
-    std::vector<std::uint64_t> per_tok(n, 0);  // marginal context counts
+    std::vector<std::uint64_t> per_tok(n, 0); // marginal context counts
     std::uint64_t total_pairs = 0;
     std::unordered_map<std::uint64_t, std::uint64_t> pair_counts;
     pair_counts.reserve(static_cast<std::size_t>(n) * 8);
@@ -249,19 +261,20 @@ PmiEmbeddings PmiEmbeddings::learn(std::span<const std::string_view> seed_corpus
         ids.reserve(toks.size());
         for (const auto& t : toks) {
             auto it = index.find(t);
-            ids.push_back(it != index.end()
-                              ? static_cast<std::int32_t>(it->second)
-                              : -1);
+            ids.push_back(it != index.end() ? static_cast<std::int32_t>(it->second) : -1);
         }
         const std::size_t m = ids.size();
         for (std::size_t i = 0; i < m; ++i) {
-            if (ids[i] < 0) continue;
+            if (ids[i] < 0)
+                continue;
             const std::uint32_t ti = static_cast<std::uint32_t>(ids[i]);
             const std::size_t lo = (i > w) ? (i - w) : 0;
             const std::size_t hi = std::min(m, i + w + 1);
             for (std::size_t j = lo; j < hi; ++j) {
-                if (j == i) continue;
-                if (ids[j] < 0) continue;
+                if (j == i)
+                    continue;
+                if (ids[j] < 0)
+                    continue;
                 const std::uint32_t tj = static_cast<std::uint32_t>(ids[j]);
                 per_tok[ti] += 1;
                 total_pairs += 1;
@@ -277,8 +290,7 @@ PmiEmbeddings PmiEmbeddings::learn(std::span<const std::string_view> seed_corpus
     }
 
     if (total_pairs == 0) {
-        throw std::invalid_argument(
-            "PmiEmbeddings::learn: no co-occurrence pairs in seed_corpus");
+        throw std::invalid_argument("PmiEmbeddings::learn: no co-occurrence pairs in seed_corpus");
     }
 
     // Build SPPMI CSR. For each pair (a, b) compute
@@ -295,21 +307,25 @@ PmiEmbeddings PmiEmbeddings::learn(std::span<const std::string_view> seed_corpus
         const std::uint64_t cnt = kv.second;
         const std::uint32_t a = static_cast<std::uint32_t>(key >> 32);
         const std::uint32_t b = static_cast<std::uint32_t>(key & 0xFFFFFFFFULL);
-        const double c_ab = 2.0 * static_cast<double>(cnt);  // a->b and b->a
+        const double c_ab = 2.0 * static_cast<double>(cnt); // a->b and b->a
         if (a == b) {
             // Diagonal: pair counted once per i (since we skipped i==j).
             // Still symmetric; only store once in the diagonal slot.
             const double c_a = static_cast<double>(per_tok[a]);
-            if (c_a <= 0.0) continue;
+            if (c_a <= 0.0)
+                continue;
             const double pmi = std::log((static_cast<double>(cnt) * D) / (c_a * c_a)) - shift;
-            if (pmi > 0.0) rows_tmp[a].emplace_back(a, static_cast<float>(pmi));
+            if (pmi > 0.0)
+                rows_tmp[a].emplace_back(a, static_cast<float>(pmi));
             continue;
         }
         const double c_a = static_cast<double>(per_tok[a]);
         const double c_b = static_cast<double>(per_tok[b]);
-        if (c_a <= 0.0 || c_b <= 0.0) continue;
+        if (c_a <= 0.0 || c_b <= 0.0)
+            continue;
         const double pmi = std::log((c_ab * D) / (c_a * c_b)) - shift;
-        if (pmi <= 0.0) continue;
+        if (pmi <= 0.0)
+            continue;
         const float v = static_cast<float>(pmi);
         rows_tmp[a].emplace_back(b, v);
         rows_tmp[b].emplace_back(a, v);
@@ -319,7 +335,8 @@ PmiEmbeddings PmiEmbeddings::learn(std::span<const std::string_view> seed_corpus
     M.n = n;
     M.row_ptr.resize(static_cast<std::size_t>(n) + 1, 0);
     std::uint32_t nnz = 0;
-    for (std::uint32_t i = 0; i < n; ++i) nnz += static_cast<std::uint32_t>(rows_tmp[i].size());
+    for (std::uint32_t i = 0; i < n; ++i)
+        nnz += static_cast<std::uint32_t>(rows_tmp[i].size());
     M.col_idx.resize(nnz);
     M.vals.resize(nnz);
     std::uint32_t pos = 0;
@@ -343,14 +360,17 @@ PmiEmbeddings PmiEmbeddings::learn(std::span<const std::string_view> seed_corpus
     // Clamp `r + oversample` to the vocab size — small seed corpora
     // legitimately produce vocabularies below the configured rank.
     std::uint32_t r = cfg.target_rank;
-    if (r > n) r = n;
+    if (r > n)
+        r = n;
     std::uint32_t k = r + cfg.svd_oversample;
-    if (k > n) k = n;
+    if (k > n)
+        k = n;
 
     // Draw Gaussian test matrix Ω (n x k) and compute Y = M Ω.
     std::uint64_t rng = cfg.svd_seed;
     std::vector<float> Omega(static_cast<std::size_t>(n) * k);
-    for (auto& x : Omega) x = gauss(rng);
+    for (auto& x : Omega)
+        x = gauss(rng);
     std::vector<float> Y(static_cast<std::size_t>(n) * k, 0.0f);
     spmm(M, Omega.data(), k, Y.data());
     qr_inplace(Y.data(), n, k);
@@ -376,7 +396,8 @@ PmiEmbeddings PmiEmbeddings::learn(std::span<const std::string_view> seed_corpus
             double s = 0.0;
             const float* qp = Y.data() + static_cast<std::size_t>(p) * n;
             const float* mq = MQ.data() + static_cast<std::size_t>(q) * n;
-            for (std::uint32_t i = 0; i < n; ++i) s += static_cast<double>(qp[i]) * mq[i];
+            for (std::uint32_t i = 0; i < n; ++i)
+                s += static_cast<double>(qp[i]) * mq[i];
             C[p + q * k] = s;
         }
     }
@@ -397,10 +418,12 @@ PmiEmbeddings PmiEmbeddings::learn(std::span<const std::string_view> seed_corpus
     // factorization.
     std::vector<std::pair<double, std::uint32_t>> order;
     order.reserve(k);
-    for (std::uint32_t j = 0; j < k; ++j) order.emplace_back(C[j + j * k], j);
+    for (std::uint32_t j = 0; j < k; ++j)
+        order.emplace_back(C[j + j * k], j);
     std::sort(order.begin(), order.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
-    if (order.size() > r) order.resize(r);
+    if (order.size() > r)
+        order.resize(r);
 
     PmiEmbeddings out;
     out.dim_ = r;
@@ -448,7 +471,8 @@ const float* PmiEmbeddings::row(std::string_view tok) const noexcept {
         buf[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(tok[i])));
     }
     auto it = index_.find(std::string(buf, n));
-    if (it == index_.end()) return nullptr;
+    if (it == index_.end())
+        return nullptr;
     return rows_.data() + static_cast<std::size_t>(it->second) * dim_;
 }
 
@@ -485,7 +509,7 @@ float read_f32(const char* p) noexcept {
     return v;
 }
 
-}  // namespace
+} // namespace
 
 std::string PmiEmbeddings::serialize() const {
     std::string out;
@@ -497,7 +521,8 @@ std::string PmiEmbeddings::serialize() const {
         write_u32(out, static_cast<std::uint32_t>(tok.size()));
         out.append(tok);
     }
-    for (float v : rows_) write_f32(out, v);
+    for (float v : rows_)
+        write_f32(out, v);
     return out;
 }
 
@@ -541,4 +566,18 @@ PmiEmbeddings PmiEmbeddings::from_bytes(std::string_view bytes) {
     return out;
 }
 
-}  // namespace simeon
+PmiEmbeddings PmiEmbeddings::from_external(std::uint32_t dim, std::vector<std::string> vocab,
+                                           std::vector<float> rows) {
+    if (rows.size() != static_cast<std::size_t>(vocab.size()) * dim)
+        throw std::invalid_argument("PmiEmbeddings::from_external: row size mismatch");
+    PmiEmbeddings out;
+    out.dim_ = dim;
+    out.vocab_ = std::move(vocab);
+    out.rows_ = std::move(rows);
+    out.index_.reserve(out.vocab_.size() * 2);
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(out.vocab_.size()); ++i)
+        out.index_.emplace(out.vocab_[i], i);
+    return out;
+}
+
+} // namespace simeon

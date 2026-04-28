@@ -6,11 +6,14 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "simeon/bm25.hpp"
 #include "simeon/fusion.hpp"
+#include "simeon/hasher.hpp"
+#include "simeon/pmi.hpp"
 #include "simeon/query_router.hpp"
 #include "simeon/simd.hpp"
 #include "simeon/simeon.hpp"
@@ -58,6 +61,53 @@ void tokenize_words(std::string_view text, std::vector<std::string>& out) {
     StringTokenSink sink{};
     sink.out = &out;
     tokenize(text, word_only_cfg(), sink);
+}
+
+// ---------------------------------------------------------------------------
+// RFF (C4) — arc-cosine degree-1 random feature map
+// ---------------------------------------------------------------------------
+
+// Deterministic Box–Muller Gaussian: identical to gaussian_entry in projection.cpp.
+float rff_gaussian(std::uint32_t row, std::uint32_t col, std::uint64_t seed) noexcept {
+    const std::uint64_t key = (static_cast<std::uint64_t>(row) << 32) ^ col;
+    const std::uint64_t h0 = splitmix64_mix(key ^ seed);
+    const std::uint64_t h1 = splitmix64_mix(h0 ^ 0x9E3779B97F4A7C15ULL);
+    const float u0 = static_cast<float>((h0 >> 11) | 1ULL) / static_cast<float>(1ULL << 53);
+    const float u1 = static_cast<float>((h1 >> 11) | 1ULL) / static_cast<float>(1ULL << 53);
+    return std::sqrt(-2.0f * std::log(u0)) * std::cos(6.2831853071795864769f * u1);
+}
+
+// Thread-local W matrix cache: regenerated only when (seed, in_dim, out_dim) changes.
+struct RffMatrixCache {
+    std::uint64_t seed = 0;
+    std::uint32_t in_dim = 0;
+    std::uint32_t out_dim = 0;
+    std::vector<float> W; // out_dim × in_dim, row-major
+};
+
+thread_local RffMatrixCache g_rff_cache;
+
+const float* rff_matrix(std::uint64_t seed, std::uint32_t in_dim, std::uint32_t out_dim) {
+    auto& c = g_rff_cache;
+    if (c.seed != seed || c.in_dim != in_dim || c.out_dim != out_dim) {
+        c.W.resize(static_cast<std::size_t>(out_dim) * in_dim);
+        for (std::uint32_t r = 0; r < out_dim; ++r)
+            for (std::uint32_t col = 0; col < in_dim; ++col)
+                c.W[r * in_dim + col] = rff_gaussian(r, col, seed);
+        c.seed = seed;
+        c.in_dim = in_dim;
+        c.out_dim = out_dim;
+    }
+    return c.W.data();
+}
+
+// Apply arc-cosine RFF: dst[r] = max(0, W[r,:] · src) / sqrt(out_dim). Normalizes dst.
+void apply_rff(const float* W, const float* src, float* dst, std::uint32_t in_dim,
+               std::uint32_t out_dim) noexcept {
+    const float scale = 1.0f / std::sqrt(static_cast<float>(out_dim));
+    for (std::uint32_t r = 0; r < out_dim; ++r)
+        dst[r] = std::max(0.0f, simd::dot(W + r * in_dim, src, in_dim)) * scale;
+    simd::l2_normalize(dst, out_dim);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +181,23 @@ void zscore_inplace(std::vector<float>& v) {
     const float sd = static_cast<float>(std::sqrt(var / v.size()) + 1e-12);
     for (float& x : v)
         x = static_cast<float>((x - mean) / sd);
+}
+
+// C2: rank-then-zscore. Sort descending, assign -rank (rank-1 doc gets the
+// highest value), then z-score. Distribution-free alternative to raw z-score
+// for Pareto/log-normal BM25 score distributions (Bruch et al. 2022).
+void rank_norm_inplace(std::vector<float>& v) {
+    if (v.size() < 2) {
+        if (!v.empty())
+            v[0] = 0.0f;
+        return;
+    }
+    std::vector<std::size_t> idx(v.size());
+    std::iota(idx.begin(), idx.end(), std::size_t{0});
+    std::sort(idx.begin(), idx.end(), [&v](std::size_t a, std::size_t b) { return v[a] > v[b]; });
+    for (std::size_t r = 0; r < idx.size(); ++r)
+        v[idx[r]] = -static_cast<float>(r);
+    zscore_inplace(v);
 }
 
 float clamp_unit(float x) {
@@ -274,6 +341,75 @@ void merge_signature_max(SparseSignature& dst, const SparseSignature& src,
     dst.weight_sum = 0.0f;
     for (const auto& term : dst.terms)
         dst.weight_sum += term.weight;
+}
+
+// ---------------------------------------------------------------------------
+// C8a: SIF-Weighted PMI encoding (Arora, Liang, Ma 2017).
+// IDF acts as a proxy for 1/p(w): rare content nouns get high weight,
+// common function words get near-zero weight. Addresses Ceiling B (flat
+// PMI bag-of-words) by producing content-noun-dominant fragment vectors.
+// Requires a PMI encoder (pmi_rows != nullptr); returns empty otherwise.
+// ---------------------------------------------------------------------------
+
+std::vector<float> encode_sif_weighted(const Encoder& enc, const Bm25Index& idx,
+                                       std::string_view text) {
+    const auto* pmi = enc.config().pmi_rows;
+    if (!pmi)
+        return {};
+    const auto dim = enc.output_dim();
+    std::vector<float> vec(dim, 0.0f);
+    std::vector<std::string> toks;
+    tokenize_words(text, toks);
+    for (const auto& tok : toks) {
+        const float* row = pmi->row(tok);
+        if (!row)
+            continue;
+        const float w = std::max(idx.idf(tok), 0.1f);
+        simd::saxpy(vec.data(), row, w, dim);
+    }
+    if (simd::l2_normalize(vec.data(), dim) <= 0.0f)
+        vec.clear();
+    return vec;
+}
+
+// ---------------------------------------------------------------------------
+// C8b: Bigram-augmented SIF (B-SIF, Mitchell & Lapata 2010).
+// Adds Hadamard product of consecutive PMI vectors to the SIF unigram sum.
+// Each bigram term (wᵢ, wᵢ₊₁) contributes:
+//   bigram_weight · √(idf(wᵢ) · idf(wᵢ₊₁)) · (pmi(wᵢ) ⊙ pmi(wᵢ₊₁))
+// Approximates multiplicative composition in distributional semantics.
+// ---------------------------------------------------------------------------
+
+std::vector<float> encode_bsif_weighted(const Encoder& enc, const Bm25Index& idx,
+                                        std::string_view text, float bigram_weight = 0.5f) {
+    const auto* pmi = enc.config().pmi_rows;
+    if (!pmi)
+        return {};
+    const auto dim = enc.output_dim();
+    std::vector<float> vec(dim, 0.0f);
+    std::vector<std::string> toks;
+    tokenize_words(text, toks);
+    const float* prev_row = nullptr;
+    float prev_idf = 0.0f;
+    for (const auto& tok : toks) {
+        const float* row = pmi->row(tok);
+        const float idf_val = std::max(idx.idf(tok), 0.1f);
+        if (row) {
+            simd::saxpy(vec.data(), row, idf_val, dim);
+            if (prev_row) {
+                const float bidf = bigram_weight * std::sqrt(prev_idf * idf_val);
+                if (bidf > 0.0f) {
+                    for (std::uint32_t d = 0; d < dim; ++d)
+                        vec[d] += bidf * prev_row[d] * row[d];
+                }
+            }
+        }
+        prev_row = row;
+        prev_idf = row ? idf_val : 0.0f;
+    }
+    if (simd::l2_normalize(vec.data(), dim) <= 0.0f)
+        vec.clear();
+    return vec;
 }
 
 } // anonymous namespace
@@ -575,6 +711,166 @@ std::vector<SemanticFragment> build_doc_semantic_fragments_rich_budgeted(
     return out;
 }
 
+// C8a: SIF-Weighted PMI fragment builder (richcov selection variant).
+// TextRank selects top sentences; each sentence + anchors are IDF-weighted
+// via encode_sif_weighted(). Richcov overlap caps applied after selection.
+// Falls back to standard richcov if the encoder is not PMI-based.
+std::vector<SemanticFragment>
+build_doc_semantic_fragments_richcov_sif(const Encoder& enc, std::string_view doc,
+                                         const Bm25Index& idx, std::uint32_t top_sentence_fragments,
+                                         std::uint32_t fragment_signature_terms,
+                                         float sentence_overlap_cap, float anchor_overlap_cap) {
+    if (!enc.config().pmi_rows)
+        return build_doc_semantic_fragments_rich_covered(enc, doc, idx, top_sentence_fragments,
+                                                         fragment_signature_terms,
+                                                         sentence_overlap_cap, anchor_overlap_cap);
+    const auto dim = enc.output_dim();
+
+    auto try_sif = [&](std::string_view text) -> std::optional<SemanticFragment> {
+        auto vec = encode_sif_weighted(enc, idx, text);
+        auto sig = build_sparse_signature(idx, text, fragment_signature_terms);
+        if (!vec.empty() && !sig.terms.empty())
+            return SemanticFragment{std::move(vec), {}, std::move(sig)};
+        return std::nullopt;
+    };
+
+    // Phase 1: TextRank sentence selection.
+    TextRank ranker;
+    auto ranked = ranker.rank(doc, 4 * top_sentence_fragments);
+    if (ranked.size() > top_sentence_fragments)
+        ranked.resize(top_sentence_fragments);
+
+    // Phase 2: Encode selected sentences with SIF weighting.
+    std::vector<SemanticFragment> sif_frags;
+    sif_frags.reserve(ranked.size() + 2);
+    for (const auto& sent : ranked) {
+        if (auto f = try_sif(sent.text))
+            sif_frags.push_back(std::move(*f));
+    }
+    if (sif_frags.empty()) {
+        if (auto f = try_sif(doc))
+            sif_frags.push_back(std::move(*f));
+        return sif_frags;
+    }
+
+    // Phase 3: Add centroid and whole-doc anchors (mirrors build_doc_semantic_fragments_rich).
+    if (sif_frags.size() >= 2) {
+        std::vector<float> centroid(dim, 0.0f);
+        SparseSignature merged;
+        const std::uint32_t merged_terms =
+            std::max<std::uint32_t>(fragment_signature_terms * 2, fragment_signature_terms + 4);
+        for (const auto& frag : sif_frags) {
+            for (std::uint32_t d = 0; d < dim; ++d)
+                centroid[d] += frag.vec[d];
+            merge_signature_max(merged, frag.signature, merged_terms);
+        }
+        const float inv = 1.0f / static_cast<float>(sif_frags.size());
+        for (float& x : centroid)
+            x *= inv;
+        if (simd::l2_normalize(centroid.data(), dim) > 0.0f && !merged.terms.empty())
+            sif_frags.push_back(SemanticFragment{std::move(centroid), {}, std::move(merged)});
+        if (auto f = try_sif(doc))
+            sif_frags.push_back(std::move(*f));
+    }
+
+    // Phase 4: Apply richcov overlap caps.
+    std::vector<SemanticFragment> out;
+    out.reserve(sif_frags.size());
+    const std::size_t base_count = sif_frags.size() >= 2 ? sif_frags.size() - 2 : sif_frags.size();
+    auto append_if_novel = [&](SemanticFragment frag, float cap) {
+        float max_ov = 0.0f;
+        for (const auto& kept : out)
+            max_ov = std::max(max_ov, weighted_overlap_coeff(frag.signature, kept.signature));
+        if (max_ov <= cap || out.empty())
+            out.push_back(std::move(frag));
+    };
+    for (std::size_t i = 0; i < base_count; ++i)
+        append_if_novel(std::move(sif_frags[i]), sentence_overlap_cap);
+    for (std::size_t i = base_count; i < sif_frags.size(); ++i)
+        append_if_novel(std::move(sif_frags[i]), anchor_overlap_cap);
+    if (out.empty())
+        out.push_back(std::move(sif_frags[0]));
+    return out;
+}
+
+// C8b: Bigram-SIF PMI fragment builder (Mitchell-Lapata Hadamard composition).
+// Adds Hadamard bigram products to the SIF unigram accumulation: adjacent token
+// pairs contribute pmi(a) ⊙ pmi(b) scaled by sqrt(idf(a)*idf(b))*bigram_weight.
+// Falls back to standard richcov if the encoder is not PMI-based.
+std::vector<SemanticFragment> build_doc_semantic_fragments_richcov_bsif(
+    const Encoder& enc, std::string_view doc, const Bm25Index& idx,
+    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
+    float sentence_overlap_cap, float anchor_overlap_cap, float bigram_weight) {
+    if (!enc.config().pmi_rows)
+        return build_doc_semantic_fragments_rich_covered(enc, doc, idx, top_sentence_fragments,
+                                                         fragment_signature_terms,
+                                                         sentence_overlap_cap, anchor_overlap_cap);
+    const auto dim = enc.output_dim();
+
+    auto try_bsif = [&](std::string_view text) -> std::optional<SemanticFragment> {
+        auto vec = encode_bsif_weighted(enc, idx, text, bigram_weight);
+        auto sig = build_sparse_signature(idx, text, fragment_signature_terms);
+        if (!vec.empty() && !sig.terms.empty())
+            return SemanticFragment{std::move(vec), {}, std::move(sig)};
+        return std::nullopt;
+    };
+
+    TextRank ranker;
+    auto ranked = ranker.rank(doc, 4 * top_sentence_fragments);
+    if (ranked.size() > top_sentence_fragments)
+        ranked.resize(top_sentence_fragments);
+
+    std::vector<SemanticFragment> bsif_frags;
+    bsif_frags.reserve(ranked.size() + 2);
+    for (const auto& sent : ranked) {
+        if (auto f = try_bsif(sent.text))
+            bsif_frags.push_back(std::move(*f));
+    }
+    if (bsif_frags.empty()) {
+        if (auto f = try_bsif(doc))
+            bsif_frags.push_back(std::move(*f));
+        return bsif_frags;
+    }
+
+    if (bsif_frags.size() >= 2) {
+        std::vector<float> centroid(dim, 0.0f);
+        SparseSignature merged;
+        const std::uint32_t merged_terms =
+            std::max<std::uint32_t>(fragment_signature_terms * 2, fragment_signature_terms + 4);
+        for (const auto& frag : bsif_frags) {
+            for (std::uint32_t d = 0; d < dim; ++d)
+                centroid[d] += frag.vec[d];
+            merge_signature_max(merged, frag.signature, merged_terms);
+        }
+        const float inv = 1.0f / static_cast<float>(bsif_frags.size());
+        for (float& x : centroid)
+            x *= inv;
+        if (simd::l2_normalize(centroid.data(), dim) > 0.0f && !merged.terms.empty())
+            bsif_frags.push_back(SemanticFragment{std::move(centroid), {}, std::move(merged)});
+        if (auto f = try_bsif(doc))
+            bsif_frags.push_back(std::move(*f));
+    }
+
+    std::vector<SemanticFragment> out;
+    out.reserve(bsif_frags.size());
+    const std::size_t base_count =
+        bsif_frags.size() >= 2 ? bsif_frags.size() - 2 : bsif_frags.size();
+    auto append_if_novel = [&](SemanticFragment frag, float cap) {
+        float max_ov = 0.0f;
+        for (const auto& kept : out)
+            max_ov = std::max(max_ov, weighted_overlap_coeff(frag.signature, kept.signature));
+        if (max_ov <= cap || out.empty())
+            out.push_back(std::move(frag));
+    };
+    for (std::size_t i = 0; i < base_count; ++i)
+        append_if_novel(std::move(bsif_frags[i]), sentence_overlap_cap);
+    for (std::size_t i = base_count; i < bsif_frags.size(); ++i)
+        append_if_novel(std::move(bsif_frags[i]), anchor_overlap_cap);
+    if (out.empty())
+        out.push_back(std::move(bsif_frags[0]));
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Query scoring
 // ---------------------------------------------------------------------------
@@ -647,6 +943,37 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     if (profile) {
         profile->bm25_us = elapsed_us(t_bm250, t_bm251);
         profile->pool_docs = static_cast<std::uint32_t>(pool.size());
+    }
+
+    // C6: IDF-weighted query-coverage. Tokenize query, build IDF-weighted term
+    // hashes, score all docs, extract pool subset, z-score. Applied additively
+    // at both blend exits. Computed once; shared by outer MaxSim + PHSS paths.
+    std::vector<float> cov_pool_z;
+    if (cfg.idf_coverage && cfg.idf_coverage_gamma != 0.0f) {
+        std::vector<std::string> qtoks;
+        tokenize_words(query, qtoks);
+        std::sort(qtoks.begin(), qtoks.end());
+        qtoks.erase(std::unique(qtoks.begin(), qtoks.end()), qtoks.end());
+
+        std::vector<std::pair<std::uint64_t, float>> wterms;
+        float idf_sum = 0.0f;
+        for (const auto& tok : qtoks) {
+            const float iv = idx.idf(tok);
+            if (iv <= 0.0f)
+                continue;
+            wterms.emplace_back(idx.hash_term(tok), iv);
+            idf_sum += iv;
+        }
+        if (!wterms.empty() && idf_sum > 0.0f) {
+            for (auto& [h, w] : wterms)
+                w /= idf_sum;
+            std::vector<float> cov_all(nd, 0.0f);
+            idx.score_weighted_hashes(wterms, cov_all);
+            cov_pool_z.resize(pool.size());
+            for (std::size_t i = 0; i < pool.size(); ++i)
+                cov_pool_z[i] = cov_all[pool[i].first];
+            zscore_inplace(cov_pool_z);
+        }
     }
 
     const auto t_qenc0 = profile ? Clock::now() : Clock::time_point{};
@@ -770,10 +1097,58 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     if (profile)
         profile->whiten_us = elapsed_us(t_white0, Clock::now());
 
+    // C4: RFF kernel augmentation — apply arc-cosine feature map to whitened
+    // vectors before similarity computation. W is thread-locally cached.
+    std::vector<float> fvecs_rff, wq_rff;
+    const float* active_fvecs = fvecs.data();
+    const float* active_wq = wq.data();
+    std::uint32_t active_dim = dim;
+    if (cfg.rff_augment && cfg.rff_dim > dim) {
+        constexpr std::uint64_t kRffSeed = 0xB5AD4ECEDA1CE2A9ULL;
+        const std::uint32_t rdim = cfg.rff_dim;
+        const float* W = rff_matrix(kRffSeed, dim, rdim);
+        wq_rff.resize(rdim);
+        fvecs_rff.resize(frags.size() * rdim);
+        apply_rff(W, wq.data(), wq_rff.data(), dim, rdim);
+        for (std::size_t i = 0; i < frags.size(); ++i)
+            apply_rff(W, fvecs.data() + i * dim, fvecs_rff.data() + i * rdim, dim, rdim);
+        active_fvecs = fvecs_rff.data();
+        active_wq = wq_rff.data();
+        active_dim = rdim;
+    }
+
     const auto t_qatt0 = profile ? Clock::now() : Clock::time_point{};
     std::vector<float> qsim(frags.size(), 0.0f);
     for (std::size_t i = 0; i < frags.size(); ++i)
-        qsim[i] = dot(wq.data(), fvecs.data() + i * dim, dim);
+        qsim[i] = dot(active_wq, active_fvecs + i * active_dim, active_dim);
+
+    // C1: SPLATE-style outer MaxSim — geometry score = max(query · frag) per
+    // doc, bypassing PHSS+diffusion. MaxSim is at the outermost layer before
+    // the alpha blend, eliminating the attention×diffusion×averaging attenuation.
+    if (cfg.outer_maxsim) {
+        std::vector<float> bm_pool(pool.size(), 0.0f);
+        std::vector<float> geom_pool(pool.size(), -std::numeric_limits<float>::infinity());
+        for (std::size_t i = 0; i < pool.size(); ++i)
+            bm_pool[i] = pool[i].second;
+        for (std::size_t i = 0; i < frags.size(); ++i) {
+            float& slot = geom_pool[frags[i].pool_index];
+            if (qsim[i] > slot)
+                slot = qsim[i];
+        }
+        for (float& g : geom_pool)
+            if (!std::isfinite(g))
+                g = 0.0f;
+        zscore_inplace(bm_pool);
+        zscore_inplace(geom_pool);
+        for (std::size_t i = 0; i < pool.size(); ++i)
+            scores[pool[i].first] = query_alpha * bm_pool[i] + (1.0f - query_alpha) * geom_pool[i];
+        if (!cov_pool_z.empty())
+            for (std::size_t i = 0; i < pool.size(); ++i)
+                scores[pool[i].first] += cfg.idf_coverage_gamma * cov_pool_z[i];
+        if (profile)
+            profile->total_us = elapsed_us(t_total0, Clock::now());
+        return scores;
+    }
 
     const std::uint32_t nf = static_cast<std::uint32_t>(frags.size());
     const std::uint32_t tri_count = nf * (nf - 1) / 2;
@@ -782,7 +1157,8 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     sims_tri.reserve(tri_count);
     for (std::uint32_t i = 0; i < nf; ++i) {
         for (std::uint32_t j = i + 1; j < nf; ++j) {
-            sims_tri.push_back(dot(fvecs.data() + i * dim, fvecs.data() + j * dim, dim));
+            sims_tri.push_back(
+                dot(active_fvecs + i * active_dim, active_fvecs + j * active_dim, active_dim));
         }
     }
     const auto t_pair1 = profile ? Clock::now() : Clock::time_point{};
@@ -827,6 +1203,11 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
             use_phss_for_graph = (phss_selected_scale > 0.0f);
             if (profile)
                 profile->phss_selected_scale = phss_selected_scale;
+            if (cfg.phss_gap_adaptive && cfg.phss_gap_scale > 0.0f) {
+                const float conf = std::min(phss_result.max_gap / cfg.phss_gap_scale, 1.0f);
+                const float adapted = query_alpha - conf * cfg.phss_gap_delta;
+                query_alpha = std::max(adapted, cfg.phss_gap_alpha_min);
+            }
         }
     }
 
@@ -1044,10 +1425,16 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
             geom_pool[frags[i].pool_index] += mass[i];
     }
 
-    zscore_inplace(bm_pool);
+    if (cfg.bm25_rank_norm)
+        rank_norm_inplace(bm_pool);
+    else
+        zscore_inplace(bm_pool);
     zscore_inplace(geom_pool);
     for (std::size_t i = 0; i < pool.size(); ++i)
         scores[pool[i].first] = query_alpha * bm_pool[i] + (1.0f - query_alpha) * geom_pool[i];
+    if (!cov_pool_z.empty())
+        for (std::size_t i = 0; i < pool.size(); ++i)
+            scores[pool[i].first] += cfg.idf_coverage_gamma * cov_pool_z[i];
 
     if (profile) {
         profile->blend_us = elapsed_us(t_blend0, Clock::now());

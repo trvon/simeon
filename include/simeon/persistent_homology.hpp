@@ -78,6 +78,12 @@ struct PhssResult {
     // The selected similarity threshold for building the kNN graph.
     float selected_scale = 0.0f;
 
+    // The largest consecutive gap in the sorted similarity (or death) sequence
+    // used by the LargestGap / LargestGapApprox criterion. Reflects clustering
+    // quality: large gap = well-separated top cluster = high geometry confidence.
+    // Zero when the criterion is MaxPersistence or when fewer than 2 values exist.
+    float max_gap = 0.0f;
+
     // The full 0D persistence diagram (only populated if cfg.output_diagram).
     std::vector<PersistencePair0D> diagram;
 

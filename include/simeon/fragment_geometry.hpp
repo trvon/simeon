@@ -144,6 +144,25 @@ struct FragmentGeometryConfig {
     // filter selects a single fragment before aggregation.
     bool single_fragment_per_doc = false;
 
+    // C2: Rank normalization for the BM25 pool leg. When true, replaces
+    // z-score normalization on the BM25 side with rank-based normalization
+    // (sort descending, assign -rank, then z-score the ranks). This is
+    // distribution-free and scale-invariant, avoiding the Gaussian assumption
+    // of z-score on Pareto/log-normal BM25 score distributions.
+    // The geometry leg is still z-scored. alpha is unchanged.
+    bool bm25_rank_norm = false;
+
+    // C3: PHSS gap-magnitude adaptive blend. When true and use_phss is true,
+    // the BM25 blend weight is reduced (more geometry weight) when the PHSS
+    // LargestGap magnitude is large, indicating a well-clustered fragment pool.
+    // query_alpha = clamp(alpha - (max_gap / phss_gap_scale) * phss_gap_delta,
+    //                     phss_gap_alpha_min, alpha)
+    // Set phss_gap_delta > 0 to reduce alpha on high-confidence pools (default).
+    bool phss_gap_adaptive = false;
+    float phss_gap_delta = 0.10f;     // max alpha reduction at full confidence
+    float phss_gap_scale = 0.30f;     // gap magnitude that saturates confidence (≈1.0)
+    float phss_gap_alpha_min = 0.65f; // floor for adapted alpha
+
     // Phase B tunables for self-KB expansion.
     // Cap neighbors used per pool member at query time (0 = use all available
     // in the precomputed graph). Smaller cap reduces expansion cost while
@@ -157,6 +176,32 @@ struct FragmentGeometryConfig {
     // BM25 pool score decay is below this threshold (flat / diffuse pools).
     // 0 = always expand (Phase A behavior). Sweep on dev fold to pick.
     float selfkb_gate_score_decay_min = 0.0f;
+
+    // C1: SPLATE-style outer MaxSim. When true, bypass PHSS+diffusion and
+    // compute the geometry score as max cosine similarity over the doc's
+    // whitened fragments. MaxSim operates at the outermost layer (before the
+    // alpha blend), not inside the diffusion stack. Eliminates the ~0.006
+    // effective multiplier from attention × diffusion² × t-fragment averaging.
+    bool outer_maxsim = false;
+
+    // C6: IDF-weighted query-coverage reranking. When true, adds a third term
+    // gamma * z(coverage) to the final blend, where coverage(d,q) is the
+    // IDF-weighted BM25 score of the document against the unique query terms
+    // (captures how many unique query concepts each pool document addresses).
+    // Operates at the document level on BM25 term structure; independent of
+    // the geometry leg and Ceiling B.
+    bool idf_coverage = false;
+    float idf_coverage_gamma = 0.10f;
+
+    // C4: Random Fourier Feature kernel augmentation. When true, applies an
+    // arc-cosine degree-1 random feature map Φ(x) = max(0, Wx)/√rff_dim
+    // (W ~ N(0,1)) to the whitened fragment and query vectors before similarity
+    // computation. Approximates the arc-cosine kernel, capturing higher-order
+    // PMI co-occurrence structure beyond linear cosine. W is cached
+    // thread-locally for amortized per-query cost. rff_dim must be a multiple
+    // of the original dim; default 256 (2× expansion from dim=128).
+    bool rff_augment = false;
+    std::uint32_t rff_dim = 256;
 };
 
 struct FragmentGeometryProfile {
@@ -234,6 +279,23 @@ std::vector<SemanticFragment> build_doc_semantic_fragments_rich_budgeted(
     std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
     float sentence_overlap_cap, std::uint32_t max_sentence_keep, float anchor_overlap_cap,
     float anchor_novelty_floor, std::uint32_t max_anchor_keep);
+
+// C8a: SIF-weighted PMI fragments + richcov overlap caps (Arora et al. 2017).
+// IDF-weighted token accumulation replaces uniform sum: content nouns upweighted,
+// function words downweighted. Falls back to standard richcov on non-PMI encoders.
+std::vector<SemanticFragment>
+build_doc_semantic_fragments_richcov_sif(const Encoder& enc, std::string_view doc,
+                                         const Bm25Index& idx, std::uint32_t top_sentence_fragments,
+                                         std::uint32_t fragment_signature_terms,
+                                         float sentence_overlap_cap, float anchor_overlap_cap);
+
+// C8b: Bigram Hadamard SIF fragments (Mitchell & Lapata 2010, multiplicative composition).
+// Adjacent token pairs contribute pmi(a) ⊙ pmi(b) * bigram_weight * sqrt(idf(a)*idf(b)).
+// Falls back to standard richcov on non-PMI encoders.
+std::vector<SemanticFragment> build_doc_semantic_fragments_richcov_bsif(
+    const Encoder& enc, std::string_view doc, const Bm25Index& idx,
+    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
+    float sentence_overlap_cap, float anchor_overlap_cap, float bigram_weight = 0.5f);
 
 // ---------------------------------------------------------------------------
 // Query scoring.

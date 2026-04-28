@@ -48,8 +48,7 @@ class PmiEmbeddings {
 public:
     // Learn embeddings from `seed_corpus` under `cfg`. Deterministic given
     // a fixed `(seed_corpus, cfg)`.
-    static PmiEmbeddings learn(std::span<const std::string_view> seed_corpus,
-                               const PmiConfig& cfg);
+    static PmiEmbeddings learn(std::span<const std::string_view> seed_corpus, const PmiConfig& cfg);
 
     // Binary round-trip format:
     //   char[8]  magic "SMEPMI01"
@@ -60,13 +59,16 @@ public:
     std::string serialize() const;
     static PmiEmbeddings from_bytes(std::string_view bytes);
 
+    // Construct from externally loaded vectors (e.g. GloVe, fastText).
+    // `rows` must be row-major with exactly vocab.size() × dim elements.
+    static PmiEmbeddings from_external(std::uint32_t dim, std::vector<std::string> vocab,
+                                       std::vector<float> rows);
+
     // Pointer to the `dim()`-long row for `tok`, or nullptr if OOV.
     const float* row(std::string_view tok) const noexcept;
 
     std::uint32_t dim() const noexcept { return dim_; }
-    std::uint32_t vocab_size() const noexcept {
-        return static_cast<std::uint32_t>(vocab_.size());
-    }
+    std::uint32_t vocab_size() const noexcept { return static_cast<std::uint32_t>(vocab_.size()); }
 
 private:
     PmiEmbeddings() = default;
@@ -74,7 +76,7 @@ private:
     std::uint32_t dim_ = 0;
     std::vector<std::string> vocab_;
     std::unordered_map<std::string, std::uint32_t> index_;
-    std::vector<float> rows_;  // row-major, vocab_size x dim
+    std::vector<float> rows_; // row-major, vocab_size x dim
 };
 
-}  // namespace simeon
+} // namespace simeon

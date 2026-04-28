@@ -112,6 +112,7 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
                 best_idx = i;
             }
         }
+        result.max_gap = max_gap > 0.0f ? max_gap : 0.0f;
         result.selected_scale = (sims[best_idx] + sims[best_idx + 1]) * 0.5f;
         const auto t_crit1 = Clock::now();
         result.criterion_us = elapsed_us(t_crit0, t_crit1);
@@ -250,6 +251,7 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
                     best_idx = i;
                 }
             }
+            result.max_gap = max_gap > 0.0f ? max_gap : 0.0f;
             result.selected_scale = (deaths[best_idx] + deaths[best_idx + 1]) * 0.5f;
             break;
         }
