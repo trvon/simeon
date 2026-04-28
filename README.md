@@ -25,17 +25,24 @@ The whole pipeline is deterministic, seeded, and byte-identical across architect
 
 ## Features
 
-- **Three projection heads** — Achlioptas sparse, very-sparse (Li 2006), dense Gaussian
-- **Matryoshka-style nested output** — one projection, queryable at any prefix width with `1/sqrt(1 + r/decay)` row weights (training-free analog of Kusupati et al. 2022)
-- **Product Quantization + ADC** — 8–192× index compression with near-baseline R@10 (Jégou, Douze, Schmid 2010)
-- **Stable retrieval core** via [`<simeon/retrieval.hpp>`](include/simeon/retrieval.hpp) — BM25 variants, fusion helpers, and the query router that backs the shipped sparse/cascade recipes
-- **5 BM25 variants** including the novel **SubwordAwareBackoff** (training-free morphological backoff via a parallel char-n-gram inverted index)
-- **Per-query router** picks among `Bm25Atire` / `Bm25SabSmooth` / `CascadeLinearAlpha` from cheap pre-retrieval predictors (Carmel & Yom-Tov 2010 family) — matches MiniLM-L6 nDCG@10 on BEIR scifact, training-free, no GPU
-- **Opt-in retrieval extensions** — BM25F auxiliary fields, SDM/WSDM, RM3, and concept mining remain available, but they are corpus-sensitive and not part of the default routed path
-- **Densified MinHash head** (Shrivastava 2017) for Jaccard-space three-way fusion on duplicate-heavy corpora
-- **BPE-lite subword tokenizer** with caller-supplied merges (no built-in vocab; deterministic across runs)
-- **Three hash families** — SplitMix64, XXH64 (canonical), CRC32C (hardware on x86 SSE4.2 / aarch64 +crc, slice-by-1 fallback), plus Mixed Tabulation (Houen & Thorup 2023, sparse-JL with practical hashing)
-- **SIMD kernels** — aarch64 NEON, x86 AVX2+FMA, portable scalar
+**Embeddings**
+- Three projection heads — Achlioptas sparse, very-sparse (Li 2006), dense Gaussian
+- Matryoshka-style nested output — one projection, queryable at any prefix width with `1/sqrt(1 + r/decay)` row weights
+- Product Quantization + ADC — 8–192× index compression with near-baseline R@10
+
+**Retrieval**
+- Stable retrieval core via [`<simeon/retrieval.hpp>`](include/simeon/retrieval.hpp) — BM25 variants, fusion helpers, query router
+- 5 BM25 variants including the novel **SubwordAwareBackoff** (training-free morphological backoff via a parallel char-n-gram inverted index)
+- Per-query router among `Bm25Atire` / `Bm25SabSmooth` / `CascadeLinearAlpha` — matches MiniLM-L6 nDCG@10 on BEIR scifact, training-free, no GPU
+- Densified MinHash head (Shrivastava 2017) for Jaccard-space three-way fusion on duplicate-heavy corpora
+- Opt-in extensions: BM25F, SDM/WSDM, RM3, concept mining (corpus-sensitive; not part of the default routed path)
+
+**Quantization & tokenization**
+- BPE-lite subword tokenizer with caller-supplied merges; no built-in vocab, deterministic across runs
+- Three hash families — SplitMix64, XXH64, CRC32C, Mixed Tabulation (Houen & Thorup 2023)
+
+**Build & correctness**
+- SIMD kernels — aarch64 NEON, x86 AVX2+FMA, portable scalar
 - Standalone Meson build, zero runtime deps, GPLv3
 - Cross-arch byte-identity tests, SIMD-vs-scalar parity tests, determinism KATs
 
