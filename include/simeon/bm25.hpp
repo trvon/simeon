@@ -60,6 +60,23 @@ enum class Bm25Variant : std::uint8_t {
     // overpenalizes long docs that legitimately satisfy LTD). Default
     // α=0.5 per Fang-Zhai's recommended midpoint.
     AtireLTD,
+    // Layered BM25: combines L1 (Atire unigram) + L2 (ordered bigram) + L3
+    // (unordered bigram window) under the BM25 saturation+IDF+length-norm
+    // template, weighted by `layered_lambda_*`. Requires
+    // `build_word_bigrams = true` at index build (otherwise degrades to
+    // Atire-only with a warning at score time). Fixed weights from
+    // Metzler-Croft 2005 SDM defaults (0.85, 0.10, 0.05) preserve
+    // bag-of-words performance while adding ordered/window bigram signal.
+    // Equivalent to calling `score_sdm()` but exposed as a Bm25Variant so
+    // the xprod bench harness can sweep it as a candidate generator.
+    Layered,
+    // Layered with per-bigram IDF reweighting (Bendersky-Croft 2010 WSDM
+    // β=1). Same L1+L2+L3 structure as Layered but each bigram's weight
+    // is scaled by (idf_b / mean_query_bigram_idf)^β so rare bigrams (e.g.
+    // "covid-19", "machine learning") get upweighted relative to common
+    // ones ("of the", "in a"). β=0 recovers fixed-λ Layered byte-identically.
+    // Requires build_word_bigrams=true.
+    LayeredW,
 };
 
 struct Bm25Config {
@@ -107,6 +124,15 @@ struct Bm25Config {
     // doc. Metzler's default is 8. Fixed at index-build time; score_sdm()
     // reads it from the index, not from SdmConfig.
     std::uint32_t bigram_unordered_window = 8u;
+    // Layered variant weights: λ_unigram (L1) + λ_ordered (L2) + λ_unordered
+    // (L3). Defaults match Metzler-Croft 2005 SDM published recipe (0.85 /
+    // 0.10 / 0.05). Tunable per corpus via the xprod bench harness.
+    float layered_lambda_unigram = 0.85f;
+    float layered_lambda_ordered = 0.10f;
+    float layered_lambda_unordered = 0.05f;
+    // LayeredW per-bigram IDF reweighting exponent (Bendersky-Croft 2010).
+    // β=0 reduces to fixed-λ Layered; β=1 is canonical IDF reweighting.
+    float layered_w_beta = 1.0f;
 };
 
 // Sequential Dependence Model (Metzler & Croft 2005, SIGIR). Adds ordered

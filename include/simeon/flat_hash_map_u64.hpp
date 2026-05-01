@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -160,6 +161,16 @@ public:
         entries_.reserve(n);
         if (target > capacity())
             rehash(target);
+    }
+
+    // Reset all entries while keeping the allocated capacity. Useful for
+    // thread-local reuse across iterations (e.g. per-doc TF accumulators
+    // in BM25 indexing). Resets entry_indices_ to empty markers in O(capacity).
+    void clear() noexcept {
+        if (entries_.empty())
+            return;
+        std::fill(entry_indices_.begin(), entry_indices_.end(), kEmptyEntry);
+        entries_.clear();
     }
 
     void shrink_to_fit() {

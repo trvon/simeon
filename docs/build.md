@@ -205,8 +205,15 @@ Use this binary when reproducing the experimental grids documented under [resear
     fixtures/fiqa-minilm > fiqa_fragment.jsonl
 ```
 
-The current `--fragment-only` grid includes three families:
+The current `--fragment-only` grid includes:
 
 - PMI-only fragment graph rows,
 - hybrid fragment rows with lexical bridge edges,
-- geometric fragment rows with query-centered soft neighborhoods over locally whitened fragment vectors.
+- geometric fragment rows with query-centered soft neighborhoods over locally whitened fragment vectors,
+- DocScorer cross-product rows named
+  `bm25_fragment_geom_xprod_<bm25>_euclid_<scorer>_a<alpha>_k100_t8_richcov`
+  over BM25 ∈ {atire, bm25plus, bm25l, dph, pl2, dcm, layered, layeredw},
+  scorer ∈ {max, mean, topk3, smax, geom}, alpha ∈ {0.65, 0.80, 0.90},
+- per-corpus recipe-router rows (`xprod_v17{short,medium,long}_recipe_*`)
+  that select BM25 variant + DocScorer + dual-stage gating from observable
+  corpus features (`avg_dl`, `n_docs`).

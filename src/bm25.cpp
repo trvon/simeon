@@ -8,6 +8,8 @@
 #include <unordered_map>
 
 #include "simeon/hasher.hpp"
+#include "simeon/pmi.hpp"
+#include "simeon/simd.hpp"
 #include "simeon/tokenizer.hpp"
 
 namespace simeon {
@@ -79,10 +81,9 @@ bool is_word_char(unsigned char c) noexcept {
 }
 
 void collect_field_term_stats(std::string_view text, HashFamily family, std::uint64_t seed,
-                              std::unordered_map<std::uint64_t, std::uint32_t>& word_tf,
-                              std::uint32_t& word_dl,
-                              std::unordered_map<std::uint64_t, std::uint32_t>* ngram_tf,
-                              std::uint32_t* ngram_dl, std::uint32_t k_min, std::uint32_t k_max,
+                              FlatHashMapU64<std::uint32_t>& word_tf, std::uint32_t& word_dl,
+                              FlatHashMapU64<std::uint32_t>* ngram_tf, std::uint32_t* ngram_dl,
+                              std::uint32_t k_min, std::uint32_t k_max,
                               std::vector<std::uint64_t>* ordered_words = nullptr) {
     word_dl = 0;
     if (ngram_dl)
@@ -417,6 +418,15 @@ void Bm25Index::score_weighted_hashes(
                 return score_dcm(tff, total_tokens_, ttf, alpha_sum_);
             });
             break;
+        case Bm25Variant::Layered:
+        case Bm25Variant::LayeredW:
+            // PRF-style weighted scoring: use Atire unigram only (the bigram
+            // legs need adjacent-pair structure, which weighted_terms doesn't
+            // carry). Equivalent to lambda_unigram=1, no L2/L3.
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_atire(tff, dl, idf, k1, b, avg);
+            });
+            break;
     }
 }
 
@@ -454,8 +464,8 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
     if (finalized_)
         throw std::runtime_error("Bm25Index::add_doc after finalize()");
     const std::uint32_t did = static_cast<std::uint32_t>(doc_lengths_.size());
-    static thread_local std::unordered_map<std::uint64_t, std::uint32_t> tf;
-    static thread_local std::unordered_map<std::uint64_t, std::uint32_t> ngram_tf;
+    static thread_local FlatHashMapU64<std::uint32_t> tf;
+    static thread_local FlatHashMapU64<std::uint32_t> ngram_tf;
     static thread_local std::vector<std::uint64_t> ordered_words;
     auto add_field = [&](std::string_view field_text, std::vector<std::uint32_t>& lengths,
                          FlatHashMapU64<TermPostings>& postings, bool keep_ordered,
@@ -496,7 +506,7 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
 
     if (cfg_.build_word_bigrams) {
         // Ordered bigrams: adjacent (w_i, w_{i+1}) pairs.
-        static thread_local std::unordered_map<std::uint64_t, std::uint32_t> ord_bgm_tf;
+        static thread_local FlatHashMapU64<std::uint32_t> ord_bgm_tf;
         ord_bgm_tf.clear();
         for (std::size_t i = 1; i < ordered_words.size(); ++i) {
             ++ord_bgm_tf[hash_bigram(ordered_words[i - 1], ordered_words[i])];
@@ -509,7 +519,7 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
         // Unordered bigrams: every pair within `bigram_unordered_window`
         // positions of each other, canonicalized via (min, max) so (a,b) and
         // (b,a) hash identically. Skips self-pairs (i != j).
-        static thread_local std::unordered_map<std::uint64_t, std::uint32_t> unord_bgm_tf;
+        static thread_local FlatHashMapU64<std::uint32_t> unord_bgm_tf;
         unord_bgm_tf.clear();
         const std::uint32_t w = cfg_.bigram_unordered_window;
         if (w > 0 && ordered_words.size() >= 2) {
@@ -795,6 +805,64 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
             break;
         case Bm25Variant::SubwordAwareBackoff:
             break;
+        case Bm25Variant::LayeredW: {
+            // Per-bigram IDF-reweighted Layered (Bendersky-Croft 2010).
+            // Delegates to score_wsdm with the configured β and λ defaults.
+            WeightedSdmConfig wcfg;
+            wcfg.lambda_unigram = cfg_.layered_lambda_unigram;
+            wcfg.lambda_ordered = cfg_.layered_lambda_ordered;
+            wcfg.lambda_unordered = cfg_.layered_lambda_unordered;
+            wcfg.beta = cfg_.layered_w_beta;
+            score_wsdm(query, out_scores, wcfg);
+            return; // already filled out_scores
+        }
+        case Bm25Variant::Layered: {
+            // L1: Atire unigram leg, weighted by lambda_unigram.
+            const float lu = cfg_.layered_lambda_unigram;
+            accumulate([&](float tff, float dl, float idf, float) {
+                return lu * score_atire(tff, dl, idf, k1, b, avg);
+            });
+            // L2: ordered bigram leg, weighted by lambda_ordered. Skipped if
+            // build_word_bigrams=false at index time.
+            const float lo = cfg_.layered_lambda_ordered;
+            if (lo != 0.0f && q_terms.size() >= 2 && !ordered_bigram_postings_.empty()) {
+                for (std::size_t i = 1; i < q_terms.size(); ++i) {
+                    const std::uint64_t bh = hash_bigram(q_terms[i - 1], q_terms[i]);
+                    const auto pit = ordered_bigram_postings_.find(bh);
+                    if (pit == ordered_bigram_postings_.end())
+                        continue;
+                    const float idf = pit->second.idf;
+                    for (const auto& [did, tf] : pit->second.docs) {
+                        const float tff = static_cast<float>(tf);
+                        const float dl = static_cast<float>(doc_lengths_[did]);
+                        out_scores[did] += lo * score_atire(tff, dl, idf, k1, b, avg);
+                    }
+                }
+            }
+            // L3: unordered bigram window leg, weighted by lambda_unordered.
+            const float lw = cfg_.layered_lambda_unordered;
+            if (lw != 0.0f && q_terms.size() >= 2 && !unordered_bigram_postings_.empty()) {
+                for (std::size_t i = 1; i < q_terms.size(); ++i) {
+                    const std::uint64_t a = q_terms[i - 1];
+                    const std::uint64_t b2 = q_terms[i];
+                    if (a == b2)
+                        continue;
+                    const std::uint64_t lo_h = std::min(a, b2);
+                    const std::uint64_t hi_h = std::max(a, b2);
+                    const std::uint64_t bh = hash_bigram(lo_h, hi_h);
+                    const auto pit = unordered_bigram_postings_.find(bh);
+                    if (pit == unordered_bigram_postings_.end())
+                        continue;
+                    const float idf = pit->second.idf;
+                    for (const auto& [did, tf] : pit->second.docs) {
+                        const float tff = static_cast<float>(tf);
+                        const float dl = static_cast<float>(doc_lengths_[did]);
+                        out_scores[did] += lw * score_atire(tff, dl, idf, k1, b, avg);
+                    }
+                }
+            }
+            break;
+        }
     }
 }
 
@@ -960,6 +1028,14 @@ void Bm25Index::score_bm25f(std::string_view body_query, std::string_view aux_qu
             break;
         case Bm25Variant::SubwordAwareBackoff:
             break;
+        case Bm25Variant::Layered:
+        case Bm25Variant::LayeredW:
+            // Aux-field BM25F path: fall back to Atire (no bigram structure on
+            // aux fields). Equivalent to lambda_unigram=1 on aux.
+            accumulate([&](float tff, float dl, float idf, float) {
+                return score_atire(tff, dl, idf, k1, b, avg);
+            });
+            break;
     }
 }
 
@@ -1089,6 +1165,15 @@ void Bm25Index::score_sdm(std::string_view query, std::span<float> out_scores,
                     });
                     break;
                 case Bm25Variant::SubwordAwareBackoff:
+                    break;
+                case Bm25Variant::Layered:
+                case Bm25Variant::LayeredW:
+                    // SDM caller's λ_unigram already wraps Atire; just run Atire
+                    // on the unigram leg (avoid recursing into Layered which
+                    // would re-add the bigram legs SDM already provides).
+                    accumulate_unigram([&](float tff, float dl, float idf, float) {
+                        return score_atire(tff, dl, idf, k1, b, avg);
+                    });
                     break;
             }
         }
@@ -1271,6 +1356,12 @@ void Bm25Index::score_wsdm(std::string_view query, std::span<float> out_scores,
                     });
                     break;
                 case Bm25Variant::SubwordAwareBackoff:
+                    break;
+                case Bm25Variant::Layered:
+                case Bm25Variant::LayeredW:
+                    accumulate_unigram([&](float tff, float dl, float idf, float) {
+                        return score_atire(tff, dl, idf, k1, b, avg);
+                    });
                     break;
             }
         }

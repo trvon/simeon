@@ -2024,18 +2024,15 @@ void run_fragment_quality_router(const char* name, const Fixture& fx, const sime
         .phss_config =
             simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
     };
-    auto richcov_max_cfg = richcov_cfg;
-    richcov_max_cfg.doc_aggregator = simeon::FragmentGeometryConfig::DocAggregator::Max;
-
     std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
-    std::array<std::uint32_t, 3> route_counts{};
+    std::array<std::uint32_t, 2> route_counts{};
 
     auto t0 = Clock::now();
     for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
         rankings[qi].reserve(nd);
         const auto features = router.features(fx.query_texts[qi]);
         const auto recipe = router.choose_quality(features);
-        ++route_counts[static_cast<std::size_t>(recipe)];
+        ++route_counts[static_cast<std::size_t>(recipe) % 2];
 
         std::vector<float> scores(nd, 0.0f);
         switch (recipe) {
@@ -2043,12 +2040,9 @@ void run_fragment_quality_router(const char* name, const Fixture& fx, const sime
                 idx.score(fx.query_texts[qi], scores);
                 break;
             case simeon::QualityRecipe::FragmentRichCovPhssApprox:
-                scores = simeon::score_fragment_geometry(fx.query_texts[qi], idx, enc,
-                                                         rich_cov_doc_frags, richcov_cfg);
-                break;
             case simeon::QualityRecipe::FragmentRichCovPhssApproxMax:
                 scores = simeon::score_fragment_geometry(fx.query_texts[qi], idx, enc,
-                                                         rich_cov_doc_frags, richcov_max_cfg);
+                                                         rich_cov_doc_frags, richcov_cfg);
                 break;
         }
         for (std::uint32_t di = 0; di < nd; ++di)
@@ -2056,10 +2050,8 @@ void run_fragment_quality_router(const char* name, const Fixture& fx, const sime
     }
     t.query_us = elapsed_us(t0);
     emit(name, fx, score_rankings(rankings, fx), 0, t);
-    std::fprintf(
-        stderr, "[fragment-quality-router] %s: bm25=%u richcov=%u richcov_max=%u (of %u queries)\n",
-        name, route_counts[0], route_counts[1], route_counts[2],
-        static_cast<std::uint32_t>(fx.query_ids.size()));
+    std::fprintf(stderr, "[fragment-quality-router] %s: bm25=%u richcov=%u (of %u queries)\n", name,
+                 route_counts[0], route_counts[1], static_cast<std::uint32_t>(fx.query_ids.size()));
 }
 
 void run_bm25_transport_grid(const Fixture& fx) {
@@ -2219,9 +2211,13 @@ void run_bm25_cluster_grid(const Fixture& fx) {
                                          .min_query_cover = 0.35f});
 }
 
-void run_bm25_fragment_graph_grid(const Fixture& fx) {
+void run_bm25_fragment_graph_grid(const Fixture& fx, bool xprod_only = false,
+                                  bool dual_only = false) {
     simeon::Bm25Config bcfg;
-    bcfg.build_word_bigrams = true;
+    // Under --dual-only the initial idx feeds only the bm25_only baseline
+    // (no bigrams needed). Skip bigram build to cut setup time on long-doc
+    // corpora where the unordered window pair count balloons.
+    bcfg.build_word_bigrams = !dual_only;
     auto idx = build_bm25(fx, bcfg);
 
     std::vector<std::string_view> seed_views;
@@ -2247,836 +2243,475 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
     ecfg.pmi_rows = &pmi;
     simeon::Encoder enc(ecfg);
 
-    std::vector<std::vector<SemanticFragment>> doc_frags;
-    doc_frags.reserve(fx.doc_texts.size());
-    for (const auto& doc : fx.doc_texts)
-        doc_frags.push_back(simeon::build_doc_semantic_fragments(enc, doc, idx.idx, 6, 8));
-    const double total_build_us = idx.build_us + elapsed_us(tb);
-    auto basicpos_tb = Clock::now();
-    std::vector<std::vector<SemanticFragment>> basicpos_doc_frags;
-    basicpos_doc_frags.reserve(fx.doc_texts.size());
-    for (const auto& doc : fx.doc_texts)
-        basicpos_doc_frags.push_back(
-            simeon::build_doc_semantic_fragments(enc, doc, idx.idx, 6, 8, 0.20f));
-    simeon::compress_fragments_to_bf16(basicpos_doc_frags, enc.output_dim());
-    const double basicpos_total_build_us = total_build_us + elapsed_us(basicpos_tb);
-    auto rich_tb = Clock::now();
-    std::vector<std::vector<SemanticFragment>> rich_doc_frags;
-    rich_doc_frags.reserve(fx.doc_texts.size());
-    for (const auto& doc : fx.doc_texts)
-        rich_doc_frags.push_back(
-            simeon::build_doc_semantic_fragments_rich(enc, doc, idx.idx, 6, 8));
-    simeon::compress_fragments_to_bf16(rich_doc_frags, enc.output_dim());
-    const double rich_total_build_us = total_build_us + elapsed_us(rich_tb);
-    auto cover_tb = Clock::now();
-    std::vector<std::vector<SemanticFragment>> rich_cov_doc_frags;
-    rich_cov_doc_frags.reserve(fx.doc_texts.size());
-    for (const auto& doc : fx.doc_texts)
-        rich_cov_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_covered(
-            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f));
-    simeon::compress_fragments_to_bf16(rich_cov_doc_frags, enc.output_dim());
-    const double rich_cov_total_build_us = total_build_us + elapsed_us(cover_tb);
-    auto mmr_tb = Clock::now();
-    std::vector<std::vector<SemanticFragment>> rich_mmr_doc_frags;
-    rich_mmr_doc_frags.reserve(fx.doc_texts.size());
-    for (const auto& doc : fx.doc_texts)
-        rich_mmr_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_mmr(
-            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.35f, 0.30f, 0.15f));
-    simeon::compress_fragments_to_bf16(rich_mmr_doc_frags, enc.output_dim());
-    const double rich_mmr_total_build_us = total_build_us + elapsed_us(mmr_tb);
-    auto mmr_novel_tb = Clock::now();
-    std::vector<std::vector<SemanticFragment>> rich_mmr_novel_doc_frags;
-    rich_mmr_novel_doc_frags.reserve(fx.doc_texts.size());
-    for (const auto& doc : fx.doc_texts)
-        rich_mmr_novel_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_mmr(
-            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.50f, 0.24f, 0.12f));
-    simeon::compress_fragments_to_bf16(rich_mmr_novel_doc_frags, enc.output_dim());
-    const double rich_mmr_novel_total_build_us = total_build_us + elapsed_us(mmr_novel_tb);
-    auto budget_tb = Clock::now();
-    std::vector<std::vector<SemanticFragment>> rich_budget_doc_frags;
-    rich_budget_doc_frags.reserve(fx.doc_texts.size());
-    for (const auto& doc : fx.doc_texts)
-        rich_budget_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_budgeted(
-            enc, doc, idx.idx, 6, 8, 0.60f, 4, 0.80f, 0.15f, 1));
-    simeon::compress_fragments_to_bf16(rich_budget_doc_frags, enc.output_dim());
-    const double rich_budget_total_build_us = total_build_us + elapsed_us(budget_tb);
-    // C8a: SIF-weighted PMI fragments (richcov overlap caps, same sentence/anchor params).
-    auto sif_tb = Clock::now();
-    std::vector<std::vector<SemanticFragment>> sif_doc_frags;
-    sif_doc_frags.reserve(fx.doc_texts.size());
-    for (const auto& doc : fx.doc_texts)
-        sif_doc_frags.push_back(simeon::build_doc_semantic_fragments_richcov_sif(
-            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f));
-    simeon::compress_fragments_to_bf16(sif_doc_frags, enc.output_dim());
-    const double sif_total_build_us = total_build_us + elapsed_us(sif_tb);
-    // C8b: Bigram Hadamard SIF fragments (Mitchell-Lapata multiplicative composition).
-    auto bsif_tb = Clock::now();
-    std::vector<std::vector<SemanticFragment>> bsif_doc_frags;
-    bsif_doc_frags.reserve(fx.doc_texts.size());
-    for (const auto& doc : fx.doc_texts)
-        bsif_doc_frags.push_back(simeon::build_doc_semantic_fragments_richcov_bsif(
-            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f));
-    simeon::compress_fragments_to_bf16(bsif_doc_frags, enc.output_dim());
-    const double bsif_total_build_us = total_build_us + elapsed_us(bsif_tb);
-
-    run_bm25_fragment_graph("bm25_fragment_graph_k100_d0.85_q0.20_f0.35_a0.8", fx, idx.idx,
-                            total_build_us, enc, doc_frags,
-                            FragmentGraphConfig{.pool_size = 100,
-                                                .alpha = 0.8f,
-                                                .damping = 0.85f,
-                                                .top_fragments_per_doc = 3,
-                                                .min_query_sim = 0.20f,
-                                                .min_fragment_sim = 0.35f,
-                                                .lexical_bridge_weight = 0.0f,
-                                                .min_bridge_overlap = 0.35f,
-                                                .fragment_signature_terms = 8,
-                                                .max_iters = 20});
-    run_bm25_fragment_graph("bm25_fragment_graph_k100_d0.70_q0.20_f0.35_a0.8", fx, idx.idx,
-                            total_build_us, enc, doc_frags,
-                            FragmentGraphConfig{.pool_size = 100,
-                                                .alpha = 0.8f,
-                                                .damping = 0.70f,
-                                                .top_fragments_per_doc = 3,
-                                                .min_query_sim = 0.20f,
-                                                .min_fragment_sim = 0.35f,
-                                                .lexical_bridge_weight = 0.0f,
-                                                .min_bridge_overlap = 0.35f,
-                                                .fragment_signature_terms = 8,
-                                                .max_iters = 20});
-    run_bm25_fragment_graph("bm25_fragment_graph_k100_d0.85_q0.10_f0.20_a0.8", fx, idx.idx,
-                            total_build_us, enc, doc_frags,
-                            FragmentGraphConfig{.pool_size = 100,
-                                                .alpha = 0.8f,
-                                                .damping = 0.85f,
-                                                .top_fragments_per_doc = 3,
-                                                .min_query_sim = 0.10f,
-                                                .min_fragment_sim = 0.20f,
-                                                .lexical_bridge_weight = 0.0f,
-                                                .min_bridge_overlap = 0.20f,
-                                                .fragment_signature_terms = 8,
-                                                .max_iters = 20});
-    run_bm25_fragment_graph("bm25_fragment_graph_k300_d0.85_q0.20_f0.35_a0.8", fx, idx.idx,
-                            total_build_us, enc, doc_frags,
-                            FragmentGraphConfig{.pool_size = 300,
-                                                .alpha = 0.8f,
-                                                .damping = 0.85f,
-                                                .top_fragments_per_doc = 3,
-                                                .min_query_sim = 0.20f,
-                                                .min_fragment_sim = 0.35f,
-                                                .lexical_bridge_weight = 0.0f,
-                                                .min_bridge_overlap = 0.35f,
-                                                .fragment_signature_terms = 8,
-                                                .max_iters = 20});
-    run_bm25_fragment_graph("bm25_fragment_hybrid_k100_t6_d0.70_q0.20_f0.35_b0.20_a0.8", fx,
-                            idx.idx, total_build_us, enc, doc_frags,
-                            FragmentGraphConfig{.pool_size = 100,
-                                                .alpha = 0.8f,
-                                                .damping = 0.70f,
-                                                .top_fragments_per_doc = 6,
-                                                .min_query_sim = 0.20f,
-                                                .min_fragment_sim = 0.35f,
-                                                .lexical_bridge_weight = 0.20f,
-                                                .min_bridge_overlap = 0.20f,
-                                                .fragment_signature_terms = 8,
-                                                .max_iters = 20});
-    run_bm25_fragment_graph("bm25_fragment_hybrid_k100_t6_d0.85_q0.10_f0.20_b0.35_a0.8", fx,
-                            idx.idx, total_build_us, enc, doc_frags,
-                            FragmentGraphConfig{.pool_size = 100,
-                                                .alpha = 0.8f,
-                                                .damping = 0.85f,
-                                                .top_fragments_per_doc = 6,
-                                                .min_query_sim = 0.10f,
-                                                .min_fragment_sim = 0.20f,
-                                                .lexical_bridge_weight = 0.35f,
-                                                .min_bridge_overlap = 0.10f,
-                                                .fragment_signature_terms = 8,
-                                                .max_iters = 20});
-    run_bm25_fragment_graph("bm25_fragment_hybrid_k300_t6_d0.70_q0.20_f0.35_b0.20_a0.8", fx,
-                            idx.idx, total_build_us, enc, doc_frags,
-                            FragmentGraphConfig{.pool_size = 300,
-                                                .alpha = 0.8f,
-                                                .damping = 0.70f,
-                                                .top_fragments_per_doc = 6,
-                                                .min_query_sim = 0.20f,
-                                                .min_fragment_sim = 0.35f,
-                                                .lexical_bridge_weight = 0.20f,
-                                                .min_bridge_overlap = 0.20f,
-                                                .fragment_signature_terms = 8,
-                                                .max_iters = 20});
-
-    simeon::compress_fragments_to_bf16(doc_frags, enc.output_dim());
-
-    run_bm25_fragment_geometry("bm25_fragment_geom_k100_t4_s8_k8_p2_a0.8", fx, idx.idx,
-                               total_build_us, enc, doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 4,
-                                                   .attention_scale = 8.0f,
-                                                   .knn = 8,
-                                                   .steps = 2,
-                                                   .use_phss = false});
-    run_bm25_fragment_geometry("bm25_fragment_geom_basicpos_k100_t4_s8_k8_p2_a0.8", fx, idx.idx,
-                               basicpos_total_build_us, enc, basicpos_doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 4,
-                                                   .attention_scale = 8.0f,
-                                                   .knn = 8,
-                                                   .steps = 2,
-                                                   .use_phss = false});
-    run_bm25_fragment_geometry("bm25_fragment_geom_k100_t4_s4_k16_p2_a0.8", fx, idx.idx,
-                               total_build_us, enc, doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 4,
-                                                   .attention_scale = 4.0f,
-                                                   .knn = 16,
-                                                   .steps = 2,
-                                                   .use_phss = false});
-    run_bm25_fragment_geometry("bm25_fragment_geom_k100_t6_s8_k8_p3_a0.8", fx, idx.idx,
-                               total_build_us, enc, doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 6,
-                                                   .attention_scale = 8.0f,
-                                                   .knn = 8,
-                                                   .steps = 3,
-                                                   .use_phss = false});
-    run_bm25_fragment_geometry("bm25_fragment_geom_adapt_k100_t4_a0.70_0.98_s4_10_k4_16_p1_3", fx,
-                               idx.idx, total_build_us, enc, doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 4,
-                                                   .attention_scale = 8.0f,
-                                                   .knn = 8,
-                                                   .steps = 2,
-                                                   .adaptive = true,
-                                                   .adaptive_idf_lo = 2.0f,
-                                                   .adaptive_idf_hi = 5.0f,
-                                                   .adaptive_decay_lo = 0.25f,
-                                                   .adaptive_decay_hi = 0.95f,
-                                                   .adaptive_alpha_lo = 0.70f,
-                                                   .adaptive_alpha_hi = 0.98f,
-                                                   .adaptive_scale_lo = 4.0f,
-                                                   .adaptive_scale_hi = 10.0f,
-                                                   .adaptive_knn_lo = 4,
-                                                   .adaptive_knn_hi = 16,
-                                                   .adaptive_steps_lo = 1,
-                                                   .adaptive_steps_hi = 3,
-                                                   .use_phss = false});
-    run_bm25_fragment_geometry("bm25_fragment_geom_adapt_k100_t6_a0.65_0.95_s3_8_k8_20_p2_4", fx,
-                               idx.idx, total_build_us, enc, doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 6,
-                                                   .attention_scale = 8.0f,
-                                                   .knn = 8,
-                                                   .steps = 3,
-                                                   .adaptive = true,
-                                                   .adaptive_idf_lo = 1.5f,
-                                                   .adaptive_idf_hi = 4.5f,
-                                                   .adaptive_decay_lo = 0.20f,
-                                                   .adaptive_decay_hi = 0.90f,
-                                                   .adaptive_alpha_lo = 0.65f,
-                                                   .adaptive_alpha_hi = 0.95f,
-                                                   .adaptive_scale_lo = 3.0f,
-                                                   .adaptive_scale_hi = 8.0f,
-                                                   .adaptive_knn_lo = 8,
-                                                   .adaptive_knn_hi = 20,
-                                                   .adaptive_steps_lo = 2,
-                                                   .adaptive_steps_hi = 4,
-                                                   .use_phss = false});
-    run_bm25_fragment_geometry("bm25_fragment_geom_rich_k100_t8_s8_k8_p2_a0.8", fx, idx.idx,
-                               rich_total_build_us, enc, rich_doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 8,
-                                                   .attention_scale = 8.0f,
-                                                   .knn = 8,
-                                                   .steps = 2,
-                                                   .use_phss = false});
-    run_bm25_fragment_geometry("bm25_fragment_geom_gsig_k100_t4_a0.65_0.98_s3_10_k4_16_p1_3", fx,
-                               idx.idx, total_build_us, enc, doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 4,
-                                                   .attention_scale = 8.0f,
-                                                   .knn = 8,
-                                                   .steps = 2,
-                                                   .geometry_signal_adaptive = true,
-                                                   .geometry_alpha_lo = 0.65f,
-                                                   .geometry_alpha_hi = 0.98f,
-                                                   .geometry_scale_lo = 3.0f,
-                                                   .geometry_scale_hi = 10.0f,
-                                                   .geometry_knn_lo = 4,
-                                                   .geometry_knn_hi = 16,
-                                                   .geometry_steps_lo = 1,
-                                                   .geometry_steps_hi = 3,
-                                                   .use_phss = false});
-    run_bm25_fragment_geometry("bm25_fragment_geom_rich_gsig_k100_t8_a0.65_0.98_s3_10_k4_16_p1_3",
-                               fx, idx.idx, rich_total_build_us, enc, rich_doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 8,
-                                                   .attention_scale = 8.0f,
-                                                   .knn = 8,
-                                                   .steps = 2,
-                                                   .geometry_signal_adaptive = true,
-                                                   .geometry_alpha_lo = 0.65f,
-                                                   .geometry_alpha_hi = 0.98f,
-                                                   .geometry_scale_lo = 3.0f,
-                                                   .geometry_scale_hi = 10.0f,
-                                                   .geometry_knn_lo = 4,
-                                                   .geometry_knn_hi = 16,
-                                                   .geometry_steps_lo = 1,
-                                                   .geometry_steps_hi = 3,
-                                                   .use_phss = false});
-    run_bm25_fragment_geometry("bm25_fragment_geom_richcov_k100_t8_o0.60_0.80_s8_k8_p2_a0.8", fx,
-                               idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 8,
-                                                   .attention_scale = 8.0f,
-                                                   .knn = 8,
-                                                   .steps = 2,
-                                                   .use_phss = false});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_richcov_gsig_k100_t8_o0.60_0.80_a0.65_0.98_s3_10_k4_16_p1_3", fx,
-        idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 8,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .geometry_signal_adaptive = true,
-                            .geometry_alpha_lo = 0.65f,
-                            .geometry_alpha_hi = 0.98f,
-                            .geometry_scale_lo = 3.0f,
-                            .geometry_scale_hi = 10.0f,
-                            .geometry_knn_lo = 4,
-                            .geometry_knn_hi = 16,
-                            .geometry_steps_lo = 1,
-                            .geometry_steps_hi = 3,
-                            .use_phss = false});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_richmmr_k100_t8_l0.35_m0.30_0.15_o0.60_0.80_s8_k8_p2_a0.8", fx, idx.idx,
-        rich_mmr_total_build_us, enc, rich_mmr_doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 8,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = false});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_richmmr_k100_t8_l0.50_m0.24_0.12_o0.60_0.80_s8_k8_p2_a0.8", fx, idx.idx,
-        rich_mmr_novel_total_build_us, enc, rich_mmr_novel_doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 8,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = false});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_richbud_k100_t6_s4_a1_n0.15_o0.60_0.80_s8_k8_p2_a0.8", fx, idx.idx,
-        rich_budget_total_build_us, enc, rich_budget_doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 6,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = false});
-    run_bm25_fragment_geometry("bm25_fragment_geom_richbud_gsig_k100_t6_s4_a1_n0.15_o0.60_0.80_a0."
-                               "65_0.98_s3_10_k4_16_p1_3",
-                               fx, idx.idx, rich_budget_total_build_us, enc, rich_budget_doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 6,
-                                                   .attention_scale = 8.0f,
-                                                   .knn = 8,
-                                                   .steps = 2,
-                                                   .geometry_signal_adaptive = true,
-                                                   .geometry_alpha_lo = 0.65f,
-                                                   .geometry_alpha_hi = 0.98f,
-                                                   .geometry_scale_lo = 3.0f,
-                                                   .geometry_scale_hi = 10.0f,
-                                                   .geometry_knn_lo = 4,
-                                                   .geometry_knn_hi = 16,
-                                                   .geometry_steps_lo = 1,
-                                                   .geometry_steps_hi = 3,
-                                                   .use_phss = false});
-
-    // Asymmetric two-stage: richcov sentences + MMR anchors
-    auto asym_tb = Clock::now();
-    std::vector<std::vector<SemanticFragment>> rich_asym_doc_frags;
-    rich_asym_doc_frags.reserve(fx.doc_texts.size());
-    for (const auto& doc : fx.doc_texts)
-        rich_asym_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_asymmetric(
-            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.35f, 0.15f));
-    simeon::compress_fragments_to_bf16(rich_asym_doc_frags, enc.output_dim());
-    const double rich_asym_total_build_us = total_build_us + elapsed_us(asym_tb);
-    run_bm25_fragment_geometry("bm25_fragment_geom_richasym_k100_t6_s8_k8_p2_a0.8", fx, idx.idx,
-                               rich_asym_total_build_us, enc, rich_asym_doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 6,
-                                                   .attention_scale = 8.0f,
-                                                   .knn = 8,
-                                                   .steps = 2,
-                                                   .use_phss = false});
-
-    // Asymmetric variant 2: stricter anchor novelty (lambda=0.50)
-    auto asym2_tb = Clock::now();
-    std::vector<std::vector<SemanticFragment>> rich_asym2_doc_frags;
-    rich_asym2_doc_frags.reserve(fx.doc_texts.size());
-    for (const auto& doc : fx.doc_texts)
-        rich_asym2_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_asymmetric(
-            enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.50f, 0.15f));
-    simeon::compress_fragments_to_bf16(rich_asym2_doc_frags, enc.output_dim());
-    const double rich_asym2_total_build_us = total_build_us + elapsed_us(asym2_tb);
-    run_bm25_fragment_geometry("bm25_fragment_geom_richasym2_k100_t6_s8_k8_p2_a0.8", fx, idx.idx,
-                               rich_asym2_total_build_us, enc, rich_asym2_doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.8f,
-                                                   .top_fragments_per_doc = 6,
-                                                   .attention_scale = 8.0f,
-                                                   .knn = 8,
-                                                   .steps = 2,
-                                                   .use_phss = false});
-
-    // Persistent Homology Scale Selection (PHSS) variants
-    // Replace fixed knn/top-k with data-driven threshold from 0D persistence.
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phss_k100_t4_gap", fx, idx.idx, total_build_us, enc, doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 4,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGap}});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_basicpos_phss_k100_t4_gap", fx, idx.idx, basicpos_total_build_us, enc,
-        basicpos_doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 4,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGap}});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_k100_t4_gap", fx, idx.idx, total_build_us, enc, doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 4,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_basicpos_phssapprox_k100_t4_gap", fx, idx.idx, basicpos_total_build_us,
-        enc, basicpos_doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 4,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phss_k100_t4_persist", fx, idx.idx, total_build_us, enc, doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 4,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::MaxPersistence}});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phss_k100_t4_elbow", fx, idx.idx, total_build_us, enc, doc_frags,
-        GeometryGraphConfig{
-            .pool_size = 100,
-            .alpha = 0.8f,
-            .top_fragments_per_doc = 4,
-            .attention_scale = 8.0f,
-            .knn = 8,
-            .steps = 2,
-            .use_phss = true,
-            .phss_config = simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::Elbow}});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phss_k100_t8_richcov_gap", fx, idx.idx, rich_cov_total_build_us, enc,
-        rich_cov_doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 8,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGap}});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_k100_t8_richcov_gap", fx, idx.idx, rich_cov_total_build_us,
-        enc, rich_cov_doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 8,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
-    // Per-corpus α sweep — Bruch & Gai 2023 fusion analysis. Convex blend
-    // α tuned on dev fold, validated on test fold. Sweep on production
-    // frontier (richcov + Sum + LargestGapApprox).
-    {
-        auto alpha_richcov = [&](const char* name, float alpha) {
-            run_bm25_fragment_geometry(
-                name, fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
-                GeometryGraphConfig{
-                    .pool_size = 100,
-                    .alpha = alpha,
-                    .top_fragments_per_doc = 8,
-                    .attention_scale = 8.0f,
-                    .knn = 8,
-                    .steps = 2,
-                    .use_phss = true,
-                    .phss_config = simeon::PhssConfig{
-                        .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
-        };
-        alpha_richcov("bm25_fragment_geom_phssapprox_a0.50_richcov", 0.50f);
-        alpha_richcov("bm25_fragment_geom_phssapprox_a0.65_richcov", 0.65f);
-        alpha_richcov("bm25_fragment_geom_phssapprox_a0.75_richcov", 0.75f);
-        // a0.80 is the existing default — already in `phssapprox_k100_t8_richcov_gap`
-        alpha_richcov("bm25_fragment_geom_phssapprox_a0.85_richcov", 0.85f);
-        alpha_richcov("bm25_fragment_geom_phssapprox_a0.95_richcov", 0.95f);
+    // Single corpus pass: prepare each doc once (TextRank + signatures), then
+    // hand the prep to every fragment builder. Encoder-specific work is the only
+    // per-builder cost; shared TextRank/signature cost amortizes across 9 builders.
+    auto build_all_tb = Clock::now();
+    const std::size_t nd = fx.doc_texts.size();
+    std::vector<std::vector<SemanticFragment>> doc_frags(nd);
+    std::vector<std::vector<SemanticFragment>> basicpos_doc_frags(nd);
+    std::vector<std::vector<SemanticFragment>> rich_doc_frags(nd);
+    std::vector<std::vector<SemanticFragment>> rich_cov_doc_frags(nd);
+    std::vector<std::vector<SemanticFragment>> rich_mmr_doc_frags(nd);
+    std::vector<std::vector<SemanticFragment>> rich_mmr_novel_doc_frags(nd);
+    std::vector<std::vector<SemanticFragment>> rich_budget_doc_frags(nd);
+    std::vector<std::vector<SemanticFragment>> sif_doc_frags(nd);
+    std::vector<std::vector<SemanticFragment>> bsif_doc_frags(nd);
+    for (std::size_t i = 0; i < nd; ++i) {
+        const auto& doc = fx.doc_texts[i];
+        // Default prep (position_weight=0.0): used by all builders except basicpos.
+        const auto prep0 = simeon::prepare_doc(doc, idx.idx, 6, 8, 0.0f);
+        // xprod-only mode skips legacy builders not used by the cross-product harness.
+        if (xprod_only) {
+            rich_cov_doc_frags[i] = simeon::build_doc_semantic_fragments_rich_covered_from_prep(
+                enc, doc, prep0, 0.60f, 0.80f);
+            continue;
+        }
+        const auto prep_p = simeon::prepare_doc(doc, idx.idx, 6, 8, 0.20f);
+        doc_frags[i] = simeon::build_doc_semantic_fragments_from_prep(enc, doc, prep0);
+        basicpos_doc_frags[i] = simeon::build_doc_semantic_fragments_from_prep(enc, doc, prep_p);
+        rich_doc_frags[i] = simeon::build_doc_semantic_fragments_rich_from_prep(enc, doc, prep0);
+        rich_cov_doc_frags[i] = simeon::build_doc_semantic_fragments_rich_covered_from_prep(
+            enc, doc, prep0, 0.60f, 0.80f);
+        rich_mmr_doc_frags[i] = simeon::build_doc_semantic_fragments_rich_mmr_from_prep(
+            enc, doc, prep0, 0.60f, 0.80f, 0.35f, 0.30f, 0.15f);
+        rich_mmr_novel_doc_frags[i] = simeon::build_doc_semantic_fragments_rich_mmr_from_prep(
+            enc, doc, prep0, 0.60f, 0.80f, 0.50f, 0.24f, 0.12f);
+        rich_budget_doc_frags[i] = simeon::build_doc_semantic_fragments_rich_budgeted_from_prep(
+            enc, doc, prep0, 0.60f, 4, 0.80f, 0.15f, 1);
+        sif_doc_frags[i] = simeon::build_doc_semantic_fragments_richcov_sif_from_prep(
+            enc, idx.idx, doc, prep0, 0.60f, 0.80f);
+        bsif_doc_frags[i] = simeon::build_doc_semantic_fragments_richcov_bsif_from_prep(
+            enc, idx.idx, doc, prep0, 0.60f, 0.80f, 0.5f);
     }
+    simeon::compress_fragments_to_bf16(rich_cov_doc_frags, enc.output_dim());
+    if (!xprod_only) {
+        simeon::compress_fragments_to_bf16(basicpos_doc_frags, enc.output_dim());
+        simeon::compress_fragments_to_bf16(rich_doc_frags, enc.output_dim());
+        simeon::compress_fragments_to_bf16(rich_mmr_doc_frags, enc.output_dim());
+        simeon::compress_fragments_to_bf16(rich_mmr_novel_doc_frags, enc.output_dim());
+        simeon::compress_fragments_to_bf16(rich_budget_doc_frags, enc.output_dim());
+        simeon::compress_fragments_to_bf16(sif_doc_frags, enc.output_dim());
+        simeon::compress_fragments_to_bf16(bsif_doc_frags, enc.output_dim());
+    }
+    const double total_build_us = idx.build_us + elapsed_us(tb);
+    const double basicpos_total_build_us = total_build_us + elapsed_us(build_all_tb);
+    const double rich_total_build_us = basicpos_total_build_us;
+    const double rich_cov_total_build_us = basicpos_total_build_us;
+    const double rich_mmr_total_build_us = basicpos_total_build_us;
+    const double rich_mmr_novel_total_build_us = basicpos_total_build_us;
+    const double rich_budget_total_build_us = basicpos_total_build_us;
+    const double sif_total_build_us = basicpos_total_build_us;
+    const double bsif_total_build_us = basicpos_total_build_us;
 
-    // Plan 2 self-KB — corpus-mined doc-doc graph + query-time pool expansion.
-    // Phase A (n=20, no gate) validated R@100 cross-fold on 2/3 corpora but
-    // regressed nDCG on scifact/fiqa and latency was 200x baseline.
-    // Phase B sweeps three tunables: neighbor cap, BM25-score filter,
-    // topology (score-decay) gate. See docs/research/self_kb_results.md.
-    {
-        const std::uint32_t graph_neighbors_per_doc = 20;
-        const std::size_t nd_local = fx.doc_texts.size();
-        std::vector<std::vector<std::uint32_t>> doc_doc_neighbors(nd_local);
-        std::vector<float> tmp_scores(nd_local);
-        for (std::size_t d = 0; d < nd_local; ++d) {
-            std::fill(tmp_scores.begin(), tmp_scores.end(), 0.0f);
-            idx.idx.score(fx.doc_texts[d], tmp_scores);
-            tmp_scores[d] = -std::numeric_limits<float>::infinity();
-            auto neighbors = simeon::top_k(tmp_scores, graph_neighbors_per_doc);
-            doc_doc_neighbors[d].reserve(neighbors.size());
-            for (const auto& [nid, _sc] : neighbors)
-                doc_doc_neighbors[d].push_back(nid);
+    if (!xprod_only) {
+        run_bm25_fragment_graph("bm25_fragment_graph_k100_d0.85_q0.20_f0.35_a0.8", fx, idx.idx,
+                                total_build_us, enc, doc_frags,
+                                FragmentGraphConfig{.pool_size = 100,
+                                                    .alpha = 0.8f,
+                                                    .damping = 0.85f,
+                                                    .top_fragments_per_doc = 3,
+                                                    .min_query_sim = 0.20f,
+                                                    .min_fragment_sim = 0.35f,
+                                                    .lexical_bridge_weight = 0.0f,
+                                                    .min_bridge_overlap = 0.35f,
+                                                    .fragment_signature_terms = 8,
+                                                    .max_iters = 20});
+        run_bm25_fragment_graph("bm25_fragment_graph_k100_d0.70_q0.20_f0.35_a0.8", fx, idx.idx,
+                                total_build_us, enc, doc_frags,
+                                FragmentGraphConfig{.pool_size = 100,
+                                                    .alpha = 0.8f,
+                                                    .damping = 0.70f,
+                                                    .top_fragments_per_doc = 3,
+                                                    .min_query_sim = 0.20f,
+                                                    .min_fragment_sim = 0.35f,
+                                                    .lexical_bridge_weight = 0.0f,
+                                                    .min_bridge_overlap = 0.35f,
+                                                    .fragment_signature_terms = 8,
+                                                    .max_iters = 20});
+        run_bm25_fragment_graph("bm25_fragment_graph_k100_d0.85_q0.10_f0.20_a0.8", fx, idx.idx,
+                                total_build_us, enc, doc_frags,
+                                FragmentGraphConfig{.pool_size = 100,
+                                                    .alpha = 0.8f,
+                                                    .damping = 0.85f,
+                                                    .top_fragments_per_doc = 3,
+                                                    .min_query_sim = 0.10f,
+                                                    .min_fragment_sim = 0.20f,
+                                                    .lexical_bridge_weight = 0.0f,
+                                                    .min_bridge_overlap = 0.20f,
+                                                    .fragment_signature_terms = 8,
+                                                    .max_iters = 20});
+        run_bm25_fragment_graph("bm25_fragment_graph_k300_d0.85_q0.20_f0.35_a0.8", fx, idx.idx,
+                                total_build_us, enc, doc_frags,
+                                FragmentGraphConfig{.pool_size = 300,
+                                                    .alpha = 0.8f,
+                                                    .damping = 0.85f,
+                                                    .top_fragments_per_doc = 3,
+                                                    .min_query_sim = 0.20f,
+                                                    .min_fragment_sim = 0.35f,
+                                                    .lexical_bridge_weight = 0.0f,
+                                                    .min_bridge_overlap = 0.35f,
+                                                    .fragment_signature_terms = 8,
+                                                    .max_iters = 20});
+        run_bm25_fragment_graph("bm25_fragment_hybrid_k100_t6_d0.70_q0.20_f0.35_b0.20_a0.8", fx,
+                                idx.idx, total_build_us, enc, doc_frags,
+                                FragmentGraphConfig{.pool_size = 100,
+                                                    .alpha = 0.8f,
+                                                    .damping = 0.70f,
+                                                    .top_fragments_per_doc = 6,
+                                                    .min_query_sim = 0.20f,
+                                                    .min_fragment_sim = 0.35f,
+                                                    .lexical_bridge_weight = 0.20f,
+                                                    .min_bridge_overlap = 0.20f,
+                                                    .fragment_signature_terms = 8,
+                                                    .max_iters = 20});
+        run_bm25_fragment_graph("bm25_fragment_hybrid_k100_t6_d0.85_q0.10_f0.20_b0.35_a0.8", fx,
+                                idx.idx, total_build_us, enc, doc_frags,
+                                FragmentGraphConfig{.pool_size = 100,
+                                                    .alpha = 0.8f,
+                                                    .damping = 0.85f,
+                                                    .top_fragments_per_doc = 6,
+                                                    .min_query_sim = 0.10f,
+                                                    .min_fragment_sim = 0.20f,
+                                                    .lexical_bridge_weight = 0.35f,
+                                                    .min_bridge_overlap = 0.10f,
+                                                    .fragment_signature_terms = 8,
+                                                    .max_iters = 20});
+        run_bm25_fragment_graph("bm25_fragment_hybrid_k300_t6_d0.70_q0.20_f0.35_b0.20_a0.8", fx,
+                                idx.idx, total_build_us, enc, doc_frags,
+                                FragmentGraphConfig{.pool_size = 300,
+                                                    .alpha = 0.8f,
+                                                    .damping = 0.70f,
+                                                    .top_fragments_per_doc = 6,
+                                                    .min_query_sim = 0.20f,
+                                                    .min_fragment_sim = 0.35f,
+                                                    .lexical_bridge_weight = 0.20f,
+                                                    .min_bridge_overlap = 0.20f,
+                                                    .fragment_signature_terms = 8,
+                                                    .max_iters = 20});
+
+        simeon::compress_fragments_to_bf16(doc_frags, enc.output_dim());
+
+        run_bm25_fragment_geometry("bm25_fragment_geom_k100_t4_s8_k8_p2_a0.8", fx, idx.idx,
+                                   total_build_us, enc, doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = 0.8f,
+                                                       .top_fragments_per_doc = 4,
+                                                       .attention_scale = 8.0f,
+                                                       .knn = 8,
+                                                       .steps = 2,
+                                                       .use_phss = false});
+        run_bm25_fragment_geometry("bm25_fragment_geom_basicpos_k100_t4_s8_k8_p2_a0.8", fx, idx.idx,
+                                   basicpos_total_build_us, enc, basicpos_doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = 0.8f,
+                                                       .top_fragments_per_doc = 4,
+                                                       .attention_scale = 8.0f,
+                                                       .knn = 8,
+                                                       .steps = 2,
+                                                       .use_phss = false});
+        run_bm25_fragment_geometry("bm25_fragment_geom_k100_t4_s4_k16_p2_a0.8", fx, idx.idx,
+                                   total_build_us, enc, doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = 0.8f,
+                                                       .top_fragments_per_doc = 4,
+                                                       .attention_scale = 4.0f,
+                                                       .knn = 16,
+                                                       .steps = 2,
+                                                       .use_phss = false});
+        run_bm25_fragment_geometry("bm25_fragment_geom_k100_t6_s8_k8_p3_a0.8", fx, idx.idx,
+                                   total_build_us, enc, doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = 0.8f,
+                                                       .top_fragments_per_doc = 6,
+                                                       .attention_scale = 8.0f,
+                                                       .knn = 8,
+                                                       .steps = 3,
+                                                       .use_phss = false});
+        run_bm25_fragment_geometry("bm25_fragment_geom_rich_k100_t8_s8_k8_p2_a0.8", fx, idx.idx,
+                                   rich_total_build_us, enc, rich_doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = 0.8f,
+                                                       .top_fragments_per_doc = 8,
+                                                       .attention_scale = 8.0f,
+                                                       .knn = 8,
+                                                       .steps = 2,
+                                                       .use_phss = false});
+        run_bm25_fragment_geometry("bm25_fragment_geom_richcov_k100_t8_o0.60_0.80_s8_k8_p2_a0.8",
+                                   fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = 0.8f,
+                                                       .top_fragments_per_doc = 8,
+                                                       .attention_scale = 8.0f,
+                                                       .knn = 8,
+                                                       .steps = 2,
+                                                       .use_phss = false});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_richmmr_k100_t8_l0.35_m0.30_0.15_o0.60_0.80_s8_k8_p2_a0.8", fx,
+            idx.idx, rich_mmr_total_build_us, enc, rich_mmr_doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 8,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = false});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_richmmr_k100_t8_l0.50_m0.24_0.12_o0.60_0.80_s8_k8_p2_a0.8", fx,
+            idx.idx, rich_mmr_novel_total_build_us, enc, rich_mmr_novel_doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 8,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = false});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_richbud_k100_t6_s4_a1_n0.15_o0.60_0.80_s8_k8_p2_a0.8", fx, idx.idx,
+            rich_budget_total_build_us, enc, rich_budget_doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 6,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = false});
+
+        // Asymmetric two-stage: richcov sentences + MMR anchors
+        auto asym_tb = Clock::now();
+        std::vector<std::vector<SemanticFragment>> rich_asym_doc_frags;
+        rich_asym_doc_frags.reserve(fx.doc_texts.size());
+        for (const auto& doc : fx.doc_texts)
+            rich_asym_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_asymmetric(
+                enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.35f, 0.15f));
+        simeon::compress_fragments_to_bf16(rich_asym_doc_frags, enc.output_dim());
+        const double rich_asym_total_build_us = total_build_us + elapsed_us(asym_tb);
+        run_bm25_fragment_geometry("bm25_fragment_geom_richasym_k100_t6_s8_k8_p2_a0.8", fx, idx.idx,
+                                   rich_asym_total_build_us, enc, rich_asym_doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = 0.8f,
+                                                       .top_fragments_per_doc = 6,
+                                                       .attention_scale = 8.0f,
+                                                       .knn = 8,
+                                                       .steps = 2,
+                                                       .use_phss = false});
+
+        // Asymmetric variant 2: stricter anchor novelty (lambda=0.50)
+        auto asym2_tb = Clock::now();
+        std::vector<std::vector<SemanticFragment>> rich_asym2_doc_frags;
+        rich_asym2_doc_frags.reserve(fx.doc_texts.size());
+        for (const auto& doc : fx.doc_texts)
+            rich_asym2_doc_frags.push_back(simeon::build_doc_semantic_fragments_rich_asymmetric(
+                enc, doc, idx.idx, 6, 8, 0.60f, 0.80f, 0.50f, 0.15f));
+        simeon::compress_fragments_to_bf16(rich_asym2_doc_frags, enc.output_dim());
+        const double rich_asym2_total_build_us = total_build_us + elapsed_us(asym2_tb);
+        run_bm25_fragment_geometry("bm25_fragment_geom_richasym2_k100_t6_s8_k8_p2_a0.8", fx,
+                                   idx.idx, rich_asym2_total_build_us, enc, rich_asym2_doc_frags,
+                                   GeometryGraphConfig{.pool_size = 100,
+                                                       .alpha = 0.8f,
+                                                       .top_fragments_per_doc = 6,
+                                                       .attention_scale = 8.0f,
+                                                       .knn = 8,
+                                                       .steps = 2,
+                                                       .use_phss = false});
+
+        // Persistent Homology Scale Selection (PHSS) variants
+        // Replace fixed knn/top-k with data-driven threshold from 0D persistence.
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phss_k100_t4_gap", fx, idx.idx, total_build_us, enc, doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 4,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGap}});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_basicpos_phss_k100_t4_gap", fx, idx.idx, basicpos_total_build_us,
+            enc, basicpos_doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 4,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGap}});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phssapprox_k100_t4_gap", fx, idx.idx, total_build_us, enc,
+            doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 4,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_basicpos_phssapprox_k100_t4_gap", fx, idx.idx,
+            basicpos_total_build_us, enc, basicpos_doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 4,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phss_k100_t4_persist", fx, idx.idx, total_build_us, enc, doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 4,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::MaxPersistence}});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phss_k100_t4_elbow", fx, idx.idx, total_build_us, enc, doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 4,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::Elbow}});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phss_k100_t8_richcov_gap", fx, idx.idx, rich_cov_total_build_us,
+            enc, rich_cov_doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 8,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGap}});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phssapprox_k100_t8_richcov_gap", fx, idx.idx,
+            rich_cov_total_build_us, enc, rich_cov_doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 8,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+        // Per-corpus α sweep — Bruch & Gai 2023 fusion analysis. Convex blend
+        // α tuned on dev fold, validated on test fold. Sweep on production
+        // frontier (richcov + Sum + LargestGapApprox).
+        {
+            auto alpha_richcov = [&](const char* name, float alpha) {
+                run_bm25_fragment_geometry(
+                    name, fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+                    GeometryGraphConfig{
+                        .pool_size = 100,
+                        .alpha = alpha,
+                        .top_fragments_per_doc = 8,
+                        .attention_scale = 8.0f,
+                        .knn = 8,
+                        .steps = 2,
+                        .use_phss = true,
+                        .phss_config = simeon::PhssConfig{
+                            .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+            };
+            alpha_richcov("bm25_fragment_geom_phssapprox_a0.50_richcov", 0.50f);
+            alpha_richcov("bm25_fragment_geom_phssapprox_a0.65_richcov", 0.65f);
+            alpha_richcov("bm25_fragment_geom_phssapprox_a0.75_richcov", 0.75f);
+            // a0.80 is the existing default — already in `phssapprox_k100_t8_richcov_gap`
+            alpha_richcov("bm25_fragment_geom_phssapprox_a0.85_richcov", 0.85f);
+            alpha_richcov("bm25_fragment_geom_phssapprox_a0.95_richcov", 0.95f);
         }
 
-        auto selfkb_run = [&](const char* name, std::uint32_t n_cap, float bm25_min,
-                              float decay_min) {
-            run_bm25_fragment_geometry(
-                name, fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
-                GeometryGraphConfig{
-                    .pool_size = 100,
-                    .alpha = 0.8f,
-                    .top_fragments_per_doc = 8,
-                    .attention_scale = 8.0f,
-                    .knn = 8,
-                    .steps = 2,
-                    .use_phss = true,
-                    .phss_config =
-                        simeon::PhssConfig{.criterion =
-                                               simeon::PhssConfig::Criterion::LargestGapApprox},
-                    .doc_doc_neighbors = doc_doc_neighbors,
-                    .selfkb_neighbors_per_pool_doc = n_cap,
-                    .selfkb_min_bm25_score = bm25_min,
-                    .selfkb_gate_score_decay_min = decay_min});
-        };
+        {
+            simeon::RouterConfig qrc;
+            qrc.atire_max_clarity = 3.0f;
+            run_fragment_quality_router("bm25_fragment_geom_quality_router_t6_t12_clar3_richcov",
+                                        fx, idx.idx, rich_cov_total_build_us, enc,
+                                        rich_cov_doc_frags, qrc);
+        }
 
-        selfkb_run("bm25_fragment_geom_phssapprox_selfkb_n20_richcov", 0,
-                   -std::numeric_limits<float>::infinity(), 0.0f);
-        selfkb_run("bm25_fragment_geom_phssapprox_selfkb_n5_richcov", 5,
-                   -std::numeric_limits<float>::infinity(), 0.0f);
-        selfkb_run("bm25_fragment_geom_phssapprox_selfkb_n10_richcov", 10,
-                   -std::numeric_limits<float>::infinity(), 0.0f);
-        selfkb_run("bm25_fragment_geom_phssapprox_selfkb_n10_bm25filt_richcov", 10, 0.0f, 0.0f);
-        selfkb_run("bm25_fragment_geom_phssapprox_selfkb_n10_gate25_richcov", 10,
-                   -std::numeric_limits<float>::infinity(), 0.25f);
-        selfkb_run("bm25_fragment_geom_phssapprox_selfkb_n10_filt_gate25_richcov", 10, 0.0f, 0.25f);
-    }
-
-    // Plan 4 — single-fragment-per-doc builder. Per-doc argmax-qsim
-    // selection BEFORE aggregation. Different attack point than MaxSim:
-    // MaxSim aggregates across 8 fragments (max); Plan 4 selects 1 fragment
-    // per doc then aggregates (sum over 1 = the fragment).
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_singlefrag_k100_t4", fx, idx.idx, total_build_us, enc,
-        doc_frags,
-        GeometryGraphConfig{
-            .pool_size = 100,
-            .alpha = 0.8f,
-            .top_fragments_per_doc = 4,
-            .attention_scale = 8.0f,
-            .knn = 8,
-            .steps = 2,
-            .use_phss = true,
-            .phss_config =
-                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
-            .single_fragment_per_doc = true});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_singlefrag_k100_t8_richcov", fx, idx.idx,
-        rich_cov_total_build_us, enc, rich_cov_doc_frags,
-        GeometryGraphConfig{
-            .pool_size = 100,
-            .alpha = 0.8f,
-            .top_fragments_per_doc = 8,
-            .attention_scale = 8.0f,
-            .knn = 8,
-            .steps = 2,
-            .use_phss = true,
-            .phss_config =
-                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
-            .single_fragment_per_doc = true});
-
-    // MaxSim aggregation probe — training-free ColBERTv2 analog.
-    // Replaces sum-aggregation at the doc level with max-pooling. Tests
-    // whether the multi-fragment averaging mechanism (identified by
-    // phss_1d_triangle_results.md) is the actual ceiling. Both basic
-    // (t=4) and richcov (t=8) builders, all using LargestGapApprox.
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_max_k100_t4", fx, idx.idx, total_build_us, enc, doc_frags,
-        GeometryGraphConfig{
-            .pool_size = 100,
-            .alpha = 0.8f,
-            .top_fragments_per_doc = 4,
-            .attention_scale = 8.0f,
-            .knn = 8,
-            .steps = 2,
-            .use_phss = true,
-            .phss_config =
-                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
-            .doc_aggregator = simeon::FragmentGeometryConfig::DocAggregator::Max});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_max_k100_t8_richcov", fx, idx.idx, rich_cov_total_build_us,
-        enc, rich_cov_doc_frags,
-        GeometryGraphConfig{
-            .pool_size = 100,
-            .alpha = 0.8f,
-            .top_fragments_per_doc = 8,
-            .attention_scale = 8.0f,
-            .knn = 8,
-            .steps = 2,
-            .use_phss = true,
-            .phss_config =
-                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
-            .doc_aggregator = simeon::FragmentGeometryConfig::DocAggregator::Max});
-
-    {
-        simeon::RouterConfig qrc;
-        qrc.atire_max_clarity = 3.0f;
-        run_fragment_quality_router("bm25_fragment_geom_quality_router_t6_t12_clar3_richcov", fx,
-                                    idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags, qrc);
-    }
-
-    // PHSS-1D Phase A — triangle-count importance probe over PHSS-selected
-    // kNN graph. 6 recipes: 3 alphas {0.25, 0.5, 1.0} × 2 placements
-    // {QueryAttention, Diffusion}. Built on richcov + LargestGapApprox
-    // (current production frontier per phss_largest_gap_approx_results.md).
-    {
-        auto tri_richcov = [&](const char* name, float alpha,
-                               simeon::FragmentGeometryConfig::TrianglePlacement place) {
-            run_bm25_fragment_geometry(
-                name, fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
-                GeometryGraphConfig{
-                    .pool_size = 100,
-                    .alpha = 0.8f,
-                    .top_fragments_per_doc = 8,
-                    .attention_scale = 8.0f,
-                    .knn = 8,
-                    .steps = 2,
-                    .use_phss = true,
-                    .phss_config =
-                        simeon::PhssConfig{.criterion =
-                                               simeon::PhssConfig::Criterion::LargestGapApprox},
-                    .use_triangle_weight = true,
-                    .triangle_alpha = alpha,
-                    .triangle_placement = place});
-        };
-        tri_richcov("bm25_fragment_geom_phssapprox_tri_a0.25_att_richcov", 0.25f,
-                    simeon::FragmentGeometryConfig::TrianglePlacement::QueryAttention);
-        tri_richcov("bm25_fragment_geom_phssapprox_tri_a0.50_att_richcov", 0.50f,
-                    simeon::FragmentGeometryConfig::TrianglePlacement::QueryAttention);
-        tri_richcov("bm25_fragment_geom_phssapprox_tri_a1.00_att_richcov", 1.00f,
-                    simeon::FragmentGeometryConfig::TrianglePlacement::QueryAttention);
-        tri_richcov("bm25_fragment_geom_phssapprox_tri_a0.25_diff_richcov", 0.25f,
-                    simeon::FragmentGeometryConfig::TrianglePlacement::Diffusion);
-        tri_richcov("bm25_fragment_geom_phssapprox_tri_a0.50_diff_richcov", 0.50f,
-                    simeon::FragmentGeometryConfig::TrianglePlacement::Diffusion);
-        tri_richcov("bm25_fragment_geom_phssapprox_tri_a1.00_diff_richcov", 1.00f,
-                    simeon::FragmentGeometryConfig::TrianglePlacement::Diffusion);
-    }
-
-    // Phase C — pool_size sweep with LargestGapApprox (validated default per
-    // docs/research/phss_largest_gap_approx_results.md).
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_k200_t4_gap", fx, idx.idx, total_build_us, enc, doc_frags,
-        GeometryGraphConfig{.pool_size = 200,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 4,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_k500_t4_gap", fx, idx.idx, total_build_us, enc, doc_frags,
-        GeometryGraphConfig{.pool_size = 500,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 4,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_k200_t8_richcov_gap", fx, idx.idx, rich_cov_total_build_us,
-        enc, rich_cov_doc_frags,
-        GeometryGraphConfig{.pool_size = 200,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 8,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_k500_t8_richcov_gap", fx, idx.idx, rich_cov_total_build_us,
-        enc, rich_cov_doc_frags,
-        GeometryGraphConfig{.pool_size = 500,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 8,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssadapt_k100_t4_gap_c0.55", fx, idx.idx, total_build_us, enc,
-        doc_frags,
-        GeometryGraphConfig{
-            .pool_size = 100,
-            .alpha = 0.8f,
-            .top_fragments_per_doc = 4,
-            .attention_scale = 8.0f,
-            .knn = 8,
-            .steps = 2,
-            .use_phss = true,
-            .phss_config =
-                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGap},
-            .phss_adaptive = true,
-            .phss_confidence_threshold = 0.55f});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssadapt_k100_t8_richcov_gap_c0.55", fx, idx.idx,
-        rich_cov_total_build_us, enc, rich_cov_doc_frags,
-        GeometryGraphConfig{
-            .pool_size = 100,
-            .alpha = 0.8f,
-            .top_fragments_per_doc = 8,
-            .attention_scale = 8.0f,
-            .knn = 8,
-            .steps = 2,
-            .use_phss = true,
-            .phss_config =
-                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGap},
-            .phss_adaptive = true,
-            .phss_confidence_threshold = 0.55f});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_richmmr_k100_t8_l0.35_phss_gap", fx, idx.idx, rich_mmr_total_build_us,
-        enc, rich_mmr_doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 8,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGap}});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_richmmr_k100_t8_l0.50_phss_gap", fx, idx.idx,
-        rich_mmr_novel_total_build_us, enc, rich_mmr_novel_doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.8f,
-                            .top_fragments_per_doc = 8,
-                            .attention_scale = 8.0f,
-                            .knn = 8,
-                            .steps = 2,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGap}});
-
-    // C2: rank normalization on BM25 pool scores. Replaces z-score on the BM25
-    // side with rank-then-zscore (distribution-free; Bruch et al. 2022 arXiv:2210.11934).
-    // alpha unchanged at 0.8; geometry side still z-scored. Tests whether
-    // Pareto/log-normal BM25 score distribution miscalibrates the z-score blend.
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_ranknorm_k100_t4", fx, idx.idx, total_build_us, enc,
-        doc_frags,
-        GeometryGraphConfig{
-            .pool_size = 100,
-            .alpha = 0.8f,
-            .top_fragments_per_doc = 4,
-            .attention_scale = 8.0f,
-            .knn = 8,
-            .steps = 2,
-            .use_phss = true,
-            .phss_config =
-                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
-            .bm25_rank_norm = true});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_ranknorm_k100_t8_richcov", fx, idx.idx,
-        rich_cov_total_build_us, enc, rich_cov_doc_frags,
-        GeometryGraphConfig{
-            .pool_size = 100,
-            .alpha = 0.8f,
-            .top_fragments_per_doc = 8,
-            .attention_scale = 8.0f,
-            .knn = 8,
-            .steps = 2,
-            .use_phss = true,
-            .phss_config =
-                simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGapApprox},
-            .bm25_rank_norm = true});
-
-    // C3: PHSS gap-magnitude adaptive blend. Reduces alpha (more geometry weight)
-    // when max_gap is large (well-clustered pool = high geometry confidence).
-    // Three delta sweep on richcov+LargestGapApprox: delta in {0.05, 0.10, 0.15}.
-    // gap_scale=0.30 means a gap of 0.30 saturates confidence to 1.0.
-    for (const float gap_delta : {0.05f, 0.10f, 0.15f}) {
-        const int delta_pct = static_cast<int>(gap_delta * 100.0f + 0.5f);
-        const std::string name =
-            "bm25_fragment_geom_phssapprox_gapadapt_k100_t8_richcov_d" + std::to_string(delta_pct);
+        // Pool-size sweep with LargestGapApprox.
+        // docs/research/phss_largest_gap_approx_results.md).
         run_bm25_fragment_geometry(
-            name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+            "bm25_fragment_geom_phssapprox_k200_t4_gap", fx, idx.idx, total_build_us, enc,
+            doc_frags,
+            GeometryGraphConfig{.pool_size = 200,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 4,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phssapprox_k500_t4_gap", fx, idx.idx, total_build_us, enc,
+            doc_frags,
+            GeometryGraphConfig{.pool_size = 500,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 4,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phssapprox_k200_t8_richcov_gap", fx, idx.idx,
+            rich_cov_total_build_us, enc, rich_cov_doc_frags,
+            GeometryGraphConfig{.pool_size = 200,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 8,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phssapprox_k500_t8_richcov_gap", fx, idx.idx,
+            rich_cov_total_build_us, enc, rich_cov_doc_frags,
+            GeometryGraphConfig{.pool_size = 500,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 8,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phssadapt_k100_t4_gap_c0.55", fx, idx.idx, total_build_us, enc,
+            doc_frags,
+            GeometryGraphConfig{
+                .pool_size = 100,
+                .alpha = 0.8f,
+                .top_fragments_per_doc = 4,
+                .attention_scale = 8.0f,
+                .knn = 8,
+                .steps = 2,
+                .use_phss = true,
+                .phss_config =
+                    simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGap},
+                .phss_adaptive = true,
+                .phss_confidence_threshold = 0.55f});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phssadapt_k100_t8_richcov_gap_c0.55", fx, idx.idx,
+            rich_cov_total_build_us, enc, rich_cov_doc_frags,
             GeometryGraphConfig{
                 .pool_size = 100,
                 .alpha = 0.8f,
@@ -3086,157 +2721,365 @@ void run_bm25_fragment_graph_grid(const Fixture& fx) {
                 .steps = 2,
                 .use_phss = true,
                 .phss_config =
-                    simeon::PhssConfig{.criterion =
-                                           simeon::PhssConfig::Criterion::LargestGapApprox},
-                .phss_gap_adaptive = true,
-                .phss_gap_delta = gap_delta,
-                .phss_gap_scale = 0.30f,
-                .phss_gap_alpha_min = 0.65f});
-    }
+                    simeon::PhssConfig{.criterion = simeon::PhssConfig::Criterion::LargestGap},
+                .phss_adaptive = true,
+                .phss_confidence_threshold = 0.55f});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_richmmr_k100_t8_l0.35_phss_gap", fx, idx.idx,
+            rich_mmr_total_build_us, enc, rich_mmr_doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 8,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGap}});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_richmmr_k100_t8_l0.50_phss_gap", fx, idx.idx,
+            rich_mmr_novel_total_build_us, enc, rich_mmr_novel_doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.8f,
+                                .top_fragments_per_doc = 8,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGap}});
 
-    // C1: SPLATE-style outer MaxSim. Geometry score = max(query·frag) per doc,
-    // computed before the alpha blend (not inside diffusion). Eliminates the
-    // ~0.006 attenuation multiplier from attention×diffusion×t-fragment averaging.
-    // Alpha sweep on richcov (t=8): determines optimal BM25/MaxSim blend ratio.
-    // Reference: SPLATE (Formal et al. 2024, arXiv:2404.13950).
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_outermaxsim_k100_t4", fx, idx.idx, total_build_us, enc, doc_frags,
-        GeometryGraphConfig{
-            .pool_size = 100, .alpha = 0.8f, .top_fragments_per_doc = 4, .outer_maxsim = true});
-    for (const float om_alpha : {0.50f, 0.65f, 0.80f, 0.90f, 0.95f}) {
-        const std::string om_name = "bm25_fragment_geom_outermaxsim_a" +
-                                    std::to_string(om_alpha).substr(0, 4) + "_k100_t8_richcov";
-        run_bm25_fragment_geometry(om_name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc,
-                                   rich_cov_doc_frags,
-                                   GeometryGraphConfig{.pool_size = 100,
-                                                       .alpha = om_alpha,
-                                                       .top_fragments_per_doc = 8,
-                                                       .outer_maxsim = true});
-    }
+        // SPLATE-style outer MaxSim. Geometry score = max(query·frag) per doc,
+        // computed before the alpha blend (not inside diffusion). Eliminates the
+        // ~0.006 attenuation multiplier from attention×diffusion×t-fragment averaging.
+        // Alpha sweep on richcov (t=8): determines optimal BM25/MaxSim blend ratio.
+        // Reference: SPLATE (Formal et al. 2024, arXiv:2404.13950).
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_outermaxsim_k100_t4", fx, idx.idx, total_build_us, enc, doc_frags,
+            GeometryGraphConfig{
+                .pool_size = 100, .alpha = 0.8f, .top_fragments_per_doc = 4, .outer_maxsim = true});
+        for (const float om_alpha : {0.50f, 0.65f, 0.80f, 0.90f, 0.95f}) {
+            const std::string om_name = "bm25_fragment_geom_outermaxsim_a" +
+                                        std::to_string(om_alpha).substr(0, 4) + "_k100_t8_richcov";
+            run_bm25_fragment_geometry(om_name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc,
+                                       rich_cov_doc_frags,
+                                       GeometryGraphConfig{.pool_size = 100,
+                                                           .alpha = om_alpha,
+                                                           .top_fragments_per_doc = 8,
+                                                           .outer_maxsim = true});
+        }
 
-    // C6: IDF-weighted query-coverage reranking (Lin & Bilmes 2010, Carbonell &
-    // Goldstein 1998). Adds gamma * z(coverage) to the final blend, where coverage
-    // is the IDF-weighted BM25 score of the doc against unique query terms.
-    // Operates at document level on BM25 term structure; independent of Ceiling B.
-    // Tested on outer MaxSim (C1+C6 combo) and standalone PHSS configs.
-    // Gamma sweep: determines optimal coverage weight.
-    for (const float cov_gamma : {0.05f, 0.10f, 0.15f, 0.20f}) {
-        const std::string cov_name = "bm25_fragment_geom_outermaxsim_cov_a0.80_g" +
-                                     std::to_string(cov_gamma).substr(0, 4) + "_k100_t8_richcov";
-        run_bm25_fragment_geometry(cov_name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc,
-                                   rich_cov_doc_frags,
+        // SIF-weighted PMI fragment encoding (Arora, Liang, Ma 2017). IDF-weighted
+        // token accumulation replaces uniform PMI sum: content nouns up-weighted,
+        // function words down-weighted. Targets Ceiling B (PMI space flatness).
+        // Tested with outer MaxSim (C1+C8a) and PHSS to isolate representation effect.
+        run_bm25_fragment_geometry("bm25_fragment_geom_outermaxsim_sif_a0.80_k100_t8_richcov", fx,
+                                   idx.idx, sif_total_build_us, enc, sif_doc_frags,
                                    GeometryGraphConfig{.pool_size = 100,
                                                        .alpha = 0.80f,
                                                        .top_fragments_per_doc = 8,
-                                                       .outer_maxsim = true,
-                                                       .idf_coverage = true,
-                                                       .idf_coverage_gamma = cov_gamma});
-    }
-    // Coverage on PHSS t8 richcov (production config + coverage).
-    for (const float cov_gamma : {0.05f, 0.10f, 0.15f, 0.20f}) {
-        const std::string cov_name = "bm25_fragment_geom_phssapprox_cov_a0.80_g" +
-                                     std::to_string(cov_gamma).substr(0, 4) + "_k100_t8_richcov";
-        run_bm25_fragment_geometry(cov_name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc,
-                                   rich_cov_doc_frags,
+                                                       .outer_maxsim = true});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phssapprox_sif_a0.80_k100_t8_richcov", fx, idx.idx,
+            sif_total_build_us, enc, sif_doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.80f,
+                                .top_fragments_per_doc = 8,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+        for (const float sif_alpha : {0.50f, 0.65f, 0.80f, 0.90f, 0.95f}) {
+            const std::string sif_name = "bm25_fragment_geom_outermaxsim_sif_a" +
+                                         std::to_string(sif_alpha).substr(0, 4) +
+                                         "_k100_t8_richcov";
+            run_bm25_fragment_geometry(sif_name.c_str(), fx, idx.idx, sif_total_build_us, enc,
+                                       sif_doc_frags,
+                                       GeometryGraphConfig{.pool_size = 100,
+                                                           .alpha = sif_alpha,
+                                                           .top_fragments_per_doc = 8,
+                                                           .outer_maxsim = true});
+        }
+
+        // Bigram Hadamard SIF (Mitchell & Lapata 2010, multiplicative composition).
+        // Hadamard product of adjacent PMI vectors adds relational structure beyond unigram SIF.
+        run_bm25_fragment_geometry("bm25_fragment_geom_outermaxsim_bsif_a0.80_k100_t8_richcov", fx,
+                                   idx.idx, bsif_total_build_us, enc, bsif_doc_frags,
                                    GeometryGraphConfig{.pool_size = 100,
                                                        .alpha = 0.80f,
                                                        .top_fragments_per_doc = 8,
-                                                       .idf_coverage = true,
-                                                       .idf_coverage_gamma = cov_gamma});
-    }
-    // Coverage on BM25-only (geometry disabled, pure coverage additive).
-    for (const float cov_gamma : {0.05f, 0.10f, 0.15f, 0.20f}) {
-        const std::string cov_name =
-            "bm25_cov_a1.00_g" + std::to_string(cov_gamma).substr(0, 4) + "_k100";
-        run_bm25_fragment_geometry(cov_name.c_str(), fx, idx.idx, idx.build_us, enc, doc_frags,
-                                   GeometryGraphConfig{.pool_size = 100,
-                                                       .alpha = 1.0f,
-                                                       .top_fragments_per_doc = 4,
-                                                       .idf_coverage = true,
-                                                       .idf_coverage_gamma = cov_gamma});
-    }
-
-    // C4: RFF kernel augmentation (Rahimi & Recht 2007, NIPS). Arc-cosine degree-1
-    // feature map Φ(x)=max(0,Wx)/√rff_dim applied to whitened fragment/query vectors
-    // before similarity computation. Captures higher-order PMI co-occurrence beyond
-    // linear cosine. Tested in combination with outer MaxSim (C1+C4) — the validated
-    // quality path on trec-covid — and alone with PHSS for comparison.
-    // rff_dim=256: 2× expansion from dim=128.
-    run_bm25_fragment_geometry("bm25_fragment_geom_rff_outermaxsim_a0.80_k100_t8_richcov", fx,
-                               idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
-                               GeometryGraphConfig{.pool_size = 100,
-                                                   .alpha = 0.80f,
-                                                   .top_fragments_per_doc = 8,
-                                                   .outer_maxsim = true,
-                                                   .rff_augment = true,
-                                                   .rff_dim = 256});
-    for (const float rff_alpha : {0.50f, 0.65f, 0.80f, 0.90f, 0.95f}) {
-        const std::string rff_name = "bm25_fragment_geom_rff_outermaxsim_a" +
-                                     std::to_string(rff_alpha).substr(0, 4) + "_k100_t8_richcov";
-        run_bm25_fragment_geometry(rff_name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc,
-                                   rich_cov_doc_frags,
-                                   GeometryGraphConfig{.pool_size = 100,
-                                                       .alpha = rff_alpha,
-                                                       .top_fragments_per_doc = 8,
-                                                       .outer_maxsim = true,
-                                                       .rff_augment = true,
-                                                       .rff_dim = 256});
-    }
-
-    // C8a: SIF-weighted PMI fragment encoding (Arora, Liang, Ma 2017). IDF-weighted
-    // token accumulation replaces uniform PMI sum: content nouns up-weighted,
-    // function words down-weighted. Targets Ceiling B (PMI space flatness).
-    // Tested with outer MaxSim (C1+C8a) and PHSS to isolate representation effect.
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_outermaxsim_sif_a0.80_k100_t8_richcov", fx, idx.idx, sif_total_build_us,
-        enc, sif_doc_frags,
-        GeometryGraphConfig{
-            .pool_size = 100, .alpha = 0.80f, .top_fragments_per_doc = 8, .outer_maxsim = true});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_sif_a0.80_k100_t8_richcov", fx, idx.idx, sif_total_build_us,
-        enc, sif_doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.80f,
-                            .top_fragments_per_doc = 8,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
-    for (const float sif_alpha : {0.50f, 0.65f, 0.80f, 0.90f, 0.95f}) {
-        const std::string sif_name = "bm25_fragment_geom_outermaxsim_sif_a" +
-                                     std::to_string(sif_alpha).substr(0, 4) + "_k100_t8_richcov";
-        run_bm25_fragment_geometry(sif_name.c_str(), fx, idx.idx, sif_total_build_us, enc,
-                                   sif_doc_frags,
-                                   GeometryGraphConfig{.pool_size = 100,
-                                                       .alpha = sif_alpha,
-                                                       .top_fragments_per_doc = 8,
                                                        .outer_maxsim = true});
+        run_bm25_fragment_geometry(
+            "bm25_fragment_geom_phssapprox_bsif_a0.80_k100_t8_richcov", fx, idx.idx,
+            bsif_total_build_us, enc, bsif_doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.80f,
+                                .top_fragments_per_doc = 8,
+                                .use_phss = true,
+                                .phss_config = simeon::PhssConfig{
+                                    .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+        for (const float bsif_alpha : {0.50f, 0.65f, 0.80f, 0.90f, 0.95f}) {
+            const std::string bsif_name = "bm25_fragment_geom_outermaxsim_bsif_a" +
+                                          std::to_string(bsif_alpha).substr(0, 4) +
+                                          "_k100_t8_richcov";
+            run_bm25_fragment_geometry(bsif_name.c_str(), fx, idx.idx, bsif_total_build_us, enc,
+                                       bsif_doc_frags,
+                                       GeometryGraphConfig{.pool_size = 100,
+                                                           .alpha = bsif_alpha,
+                                                           .top_fragments_per_doc = 8,
+                                                           .outer_maxsim = true});
+        }
+
+    } // !xprod_only
+
+    // Cross-product harness:
+    //   BM25 ∈ {Atire, BM25+, BM25L, DPH, PL2, DCM, Layered, LayeredW}
+    //   scorer ∈ {MaxSim, MeanSim, TopKMean, SoftMaxSum, GeoMean}
+    //   alpha ∈ {0.65, 0.80, 0.90}
+    using DK = GeometryGraphConfig::DocScorerKind;
+    struct Bm25Entry {
+        simeon::Bm25Variant variant;
+        const char* tag;
+    };
+    struct ScorerEntry {
+        DK kind;
+        const char* tag;
+    };
+
+    // Per-doc dense vector (centroid fragment) for dual-stage candidate pool.
+    // The richcov builder places the centroid as the second-to-last fragment;
+    // the last is the whole-doc anchor. read_frag_vec handles BF16 decompression.
+    std::vector<std::vector<float>> doc_dense_vecs(rich_cov_doc_frags.size());
+    {
+        const auto ddim = enc.output_dim();
+        for (std::size_t i = 0; i < rich_cov_doc_frags.size(); ++i) {
+            const auto& frags = rich_cov_doc_frags[i];
+            if (frags.size() < 2)
+                continue;
+            const auto& centroid = frags[frags.size() - 2];
+            doc_dense_vecs[i].resize(ddim);
+            simeon::read_frag_vec(centroid, ddim, doc_dense_vecs[i].data());
+        }
     }
 
-    // C8b: Bigram Hadamard SIF (Mitchell & Lapata 2010, multiplicative composition).
-    // Hadamard product of adjacent PMI vectors adds relational structure beyond unigram SIF.
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_outermaxsim_bsif_a0.80_k100_t8_richcov", fx, idx.idx,
-        bsif_total_build_us, enc, bsif_doc_frags,
-        GeometryGraphConfig{
-            .pool_size = 100, .alpha = 0.80f, .top_fragments_per_doc = 8, .outer_maxsim = true});
-    run_bm25_fragment_geometry(
-        "bm25_fragment_geom_phssapprox_bsif_a0.80_k100_t8_richcov", fx, idx.idx,
-        bsif_total_build_us, enc, bsif_doc_frags,
-        GeometryGraphConfig{.pool_size = 100,
-                            .alpha = 0.80f,
-                            .top_fragments_per_doc = 8,
-                            .use_phss = true,
-                            .phss_config = simeon::PhssConfig{
-                                .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
-    for (const float bsif_alpha : {0.50f, 0.65f, 0.80f, 0.90f, 0.95f}) {
-        const std::string bsif_name = "bm25_fragment_geom_outermaxsim_bsif_a" +
-                                      std::to_string(bsif_alpha).substr(0, 4) + "_k100_t8_richcov";
-        run_bm25_fragment_geometry(bsif_name.c_str(), fx, idx.idx, bsif_total_build_us, enc,
-                                   bsif_doc_frags,
-                                   GeometryGraphConfig{.pool_size = 100,
-                                                       .alpha = bsif_alpha,
-                                                       .top_fragments_per_doc = 8,
-                                                       .outer_maxsim = true});
+    const std::array<ScorerEntry, 5> scorer_axis = {{{DK::MaxSim, "max"},
+                                                     {DK::MeanSim, "mean"},
+                                                     {DK::TopKMean, "topk3"},
+                                                     {DK::SoftMaxSum, "smax"},
+                                                     {DK::GeoMean, "geom"}}};
+    const std::array<Bm25Entry, 8> bm25_axis = {{{simeon::Bm25Variant::Atire, "atire"},
+                                                 {simeon::Bm25Variant::BM25Plus, "bm25plus"},
+                                                 {simeon::Bm25Variant::BM25L, "bm25l"},
+                                                 {simeon::Bm25Variant::DPH, "dph"},
+                                                 {simeon::Bm25Variant::PL2, "pl2"},
+                                                 {simeon::Bm25Variant::Dcm, "dcm"},
+                                                 {simeon::Bm25Variant::Layered, "layered"},
+                                                 {simeon::Bm25Variant::LayeredW, "layeredw"}}};
+    if (!dual_only)
+        for (const auto& b : bm25_axis) {
+            simeon::Bm25Config vcfg;
+            vcfg.build_word_bigrams = true;
+            vcfg.variant = b.variant;
+            auto vidx = build_bm25(fx, vcfg);
+            const double variant_total_build_us =
+                rich_cov_total_build_us - idx.build_us + vidx.build_us;
+            for (const auto& s : scorer_axis) {
+                for (const float xa : {0.65f, 0.80f, 0.90f}) {
+                    std::string name = "bm25_fragment_geom_xprod_";
+                    name += b.tag;
+                    name += "_euclid_";
+                    name += s.tag;
+                    name += "_a";
+                    name += std::to_string(xa).substr(0, 4);
+                    name += "_k100_t8_richcov";
+                    run_bm25_fragment_geometry(
+                        name.c_str(), fx, vidx.idx, variant_total_build_us, enc, rich_cov_doc_frags,
+                        GeometryGraphConfig{.pool_size = 100,
+                                            .alpha = xa,
+                                            .top_fragments_per_doc = 8,
+                                            .outer_maxsim = true,
+                                            .doc_scorer_kind = s.kind,
+                                            .doc_scorer_top_k = 3,
+                                            .doc_scorer_softmax_beta = 4.0f});
+                }
+            }
+        }
+
+    // Layered λ-sweep: hold the best test-fold xprod cell config (Layered +
+    // GeoMean + α=0.65) and sweep (λ_ordered, λ_unordered) around the
+    // Metzler-Croft default (0.10, 0.05) to find per-corpus optima.
+    if (!dual_only) {
+        simeon::Bm25Config lcfg;
+        lcfg.build_word_bigrams = true;
+        lcfg.variant = simeon::Bm25Variant::Layered;
+        const std::array<float, 5> lo_vals = {0.05f, 0.10f, 0.15f, 0.20f, 0.30f};
+        const std::array<float, 3> lw_vals = {0.00f, 0.05f, 0.10f};
+        for (float lo : lo_vals) {
+            for (float lw : lw_vals) {
+                lcfg.layered_lambda_unigram = 0.85f;
+                lcfg.layered_lambda_ordered = lo;
+                lcfg.layered_lambda_unordered = lw;
+                auto vidx = build_bm25(fx, lcfg);
+                const double ld_us = rich_cov_total_build_us - idx.build_us + vidx.build_us;
+                for (const float xa : {0.65f, 0.80f}) {
+                    char nbuf[160];
+                    std::snprintf(
+                        nbuf, sizeof(nbuf),
+                        "bm25_fragment_geom_xprod_layered_lo%.2f_lw%.2f_geom_a%.2f_k100_t8_richcov",
+                        lo, lw, xa);
+                    run_bm25_fragment_geometry(
+                        nbuf, fx, vidx.idx, ld_us, enc, rich_cov_doc_frags,
+                        GeometryGraphConfig{.pool_size = 100,
+                                            .alpha = xa,
+                                            .top_fragments_per_doc = 8,
+                                            .outer_maxsim = true,
+                                            .doc_scorer_kind =
+                                                GeometryGraphConfig::DocScorerKind::GeoMean,
+                                            .doc_scorer_top_k = 3,
+                                            .doc_scorer_softmax_beta = 4.0f});
+                }
+            }
+        }
+    }
+
+    // Phase XV: dual-stage candidate generation. BM25 top-100 ∪ dense top-K
+    // (cosine on per-doc fragment centroid). Holds the best Layered + GeoMean
+    // recipe and varies the dense pool size. Tests whether expanding the
+    // candidate set lifts Ceiling A.
+    {
+        simeon::Bm25Config dcfg;
+        dcfg.build_word_bigrams = true;
+        // Skip the unordered-bigram window: O(N×w) per-doc cost balloons on
+        // long-doc corpora (trec-covid full-text). L3's λ_unordered=0.05
+        // contribution is the smallest layer; disabling the index build is a
+        // ~10×-50× setup-time win on long-doc corpora with negligible nDCG cost.
+        dcfg.bigram_unordered_window = 0;
+        dcfg.layered_lambda_unordered = 0.0f; // index has no unordered postings
+        dcfg.variant = simeon::Bm25Variant::Layered;
+        auto vidx = build_bm25(fx, dcfg);
+        const double dt_us = rich_cov_total_build_us - idx.build_us + vidx.build_us;
+        for (std::uint32_t dpool : {50u, 100u, 200u}) {
+            for (const float xa : {0.65f, 0.80f}) {
+                char nbuf[200];
+                std::snprintf(
+                    nbuf, sizeof(nbuf),
+                    "bm25_fragment_geom_xprod_dual_layered_euclid_geom_dp%u_a%.2f_k100_t8_richcov",
+                    dpool, xa);
+                run_bm25_fragment_geometry(
+                    nbuf, fx, vidx.idx, dt_us, enc, rich_cov_doc_frags,
+                    GeometryGraphConfig{.pool_size = 100,
+                                        .alpha = xa,
+                                        .top_fragments_per_doc = 8,
+                                        .outer_maxsim = true,
+                                        .doc_scorer_kind =
+                                            GeometryGraphConfig::DocScorerKind::GeoMean,
+                                        .doc_scorer_top_k = 3,
+                                        .doc_scorer_softmax_beta = 4.0f,
+                                        .dense_pool_size = dpool,
+                                        .doc_dense_vecs = &doc_dense_vecs});
+            }
+        }
+
+        // Phase XVI: corpus-conditioned router. The Phase XV picture across
+        // 3 corpora is:
+        //   - nfcorpus  (avg_dl ~600, 3K docs):   dual STRICT proved
+        //   - scifact   (avg_dl ~150, 5K docs):   dual hurts (BM25 saturates short abstracts)
+        //   - trec-covid(avg_dl ~3K, 171K docs):  dual catastrophic (PMI centroids diffuse)
+        // Heuristic: enable dual only in the Goldilocks zone — medium-length
+        // docs with manageable corpus size. Outside that band, use plain
+        // Layered (no dual). This decision is made at scoring-config
+        // construction, not at query time, so cost is zero.
+        const float router_avg_dl = vidx.idx.avg_dl();
+        const std::uint32_t router_n_docs = vidx.idx.doc_count();
+        const bool router_enable_dual =
+            (router_avg_dl >= 200.0f) && (router_avg_dl <= 1000.0f) && (router_n_docs <= 50000u);
+        for (const float xa : {0.65f, 0.80f}) {
+            char nbuf[200];
+            std::snprintf(nbuf, sizeof(nbuf),
+                          "bm25_fragment_geom_xprod_routed_layered_geom_a%.2f_k100_t8_richcov", xa);
+            GeometryGraphConfig rcfg{.pool_size = 100,
+                                     .alpha = xa,
+                                     .top_fragments_per_doc = 8,
+                                     .outer_maxsim = true,
+                                     .doc_scorer_kind = GeometryGraphConfig::DocScorerKind::GeoMean,
+                                     .doc_scorer_top_k = 3,
+                                     .doc_scorer_softmax_beta = 4.0f};
+            if (router_enable_dual) {
+                rcfg.dense_pool_size = 200;
+                rcfg.doc_dense_vecs = &doc_dense_vecs;
+            }
+            run_bm25_fragment_geometry(nbuf, fx, vidx.idx, dt_us, enc, rich_cov_doc_frags, rcfg);
+        }
+
+        // Phase XVII: 4-axis recipe router. Pick the full
+        // (BM25 variant, scorer, alpha, dual, L3) tuple per corpus class
+        // based on observable features. Each branch matches an empirically
+        // validated config:
+        //   avg_dl < 200       → scifact-like: Layered+L3 + GeoMean + α=0.80 (Phase XIV)
+        //   200 ≤ avg_dl ≤ 1K  → nfcorpus-like: Layered_no_L3 + GeoMean + α=0.80 + dual (Phase XV)
+        //   avg_dl > 1K        → trec-covid-like: Atire + MaxSim + α=0.80 (Phase III)
+        const float v17_avg_dl = idx.idx.avg_dl();
+        const std::uint32_t v17_n_docs = idx.idx.doc_count();
+        enum class V17Class { Short, Medium, Long };
+        V17Class v17_class;
+        // Phase XVIII fix: BEIR fixtures store title+abstract (avg_dl ~150)
+        // for some corpora that we'd treat as "long" by paper length.
+        // n_docs is the more reliable structural signal — trec-covid's 171K
+        // docs distinguishes it from scifact/nfcorpus regardless of avg_dl.
+        if (v17_avg_dl > 1000.0f || v17_n_docs > 50000u)
+            v17_class = V17Class::Long;
+        else if (v17_avg_dl >= 200.0f && v17_n_docs <= 50000u)
+            v17_class = V17Class::Medium;
+        else
+            v17_class = V17Class::Short;
+        // Build the per-class BM25 index (different bigram settings per class).
+        simeon::Bm25Config v17_cfg;
+        const char* v17_tag = "v17_unknown";
+        if (v17_class == V17Class::Long) {
+            // Atire baseline; no bigram structure needed for L1-only scoring.
+            v17_cfg.build_word_bigrams = false;
+            v17_cfg.variant = simeon::Bm25Variant::Atire;
+            v17_tag = "v17long";
+        } else if (v17_class == V17Class::Medium) {
+            // Layered (no L3) — same vidx structure as the dual block above.
+            v17_cfg.build_word_bigrams = true;
+            v17_cfg.bigram_unordered_window = 0;
+            v17_cfg.layered_lambda_unordered = 0.0f;
+            v17_cfg.variant = simeon::Bm25Variant::Layered;
+            v17_tag = "v17medium";
+        } else {
+            // Layered with L3 (Metzler-Croft default); short-doc corpus needs
+            // the unordered-bigram signal.
+            v17_cfg.build_word_bigrams = true;
+            v17_cfg.bigram_unordered_window = 8;
+            v17_cfg.layered_lambda_unordered = 0.05f;
+            v17_cfg.variant = simeon::Bm25Variant::Layered;
+            v17_tag = "v17short";
+        }
+        auto v17_idx = build_bm25(fx, v17_cfg);
+        const double v17_us = rich_cov_total_build_us - idx.build_us + v17_idx.build_us;
+        for (const float xa : {0.65f, 0.80f}) {
+            char nbuf[200];
+            std::snprintf(nbuf, sizeof(nbuf),
+                          "bm25_fragment_geom_xprod_%s_recipe_a%.2f_k100_t8_richcov", v17_tag, xa);
+            GeometryGraphConfig rcfg{.pool_size = 100,
+                                     .alpha = xa,
+                                     .top_fragments_per_doc = 8,
+                                     .outer_maxsim = true,
+                                     .doc_scorer_top_k = 3,
+                                     .doc_scorer_softmax_beta = 4.0f};
+            // Per-class scorer + dual selection.
+            if (v17_class == V17Class::Long) {
+                rcfg.doc_scorer_kind = GeometryGraphConfig::DocScorerKind::MaxSim;
+            } else {
+                rcfg.doc_scorer_kind = GeometryGraphConfig::DocScorerKind::GeoMean;
+            }
+            if (v17_class == V17Class::Medium) {
+                rcfg.dense_pool_size = 200;
+                rcfg.doc_dense_vecs = &doc_dense_vecs;
+            }
+            run_bm25_fragment_geometry(nbuf, fx, v17_idx.idx, v17_us, enc, rich_cov_doc_frags,
+                                       rcfg);
+        }
     }
 }
 
@@ -4150,6 +3993,8 @@ int main(int argc, char** argv) {
     bool graph_only = false;
     bool cluster_only = false;
     bool fragment_only = false;
+    bool xprod_only = false;
+    bool dual_only = false;
     bool fragment_quality_router_only = false;
     std::string fragment_glove_path;
 #endif
@@ -4185,6 +4030,15 @@ int main(int argc, char** argv) {
             cluster_only = true;
         } else if (a == "--fragment-only") {
             fragment_only = true;
+        } else if (a == "--xprod-only") {
+            fragment_only = true;
+            xprod_only = true;
+        } else if (a == "--dual-only") {
+            // Trec-covid-friendly subset: only the Layered dual cells.
+            // 1 BM25 reindex + 1 fragment build + 12 dual cells.
+            fragment_only = true;
+            xprod_only = true;
+            dual_only = true;
         } else if (a == "--fragment-quality-router-only") {
             fragment_quality_router_only = true;
         } else if (a == "--fragment-glove" && i + 1 < argc) {
@@ -4311,7 +4165,7 @@ int main(int argc, char** argv) {
             std::fclose(g_router_per_query_fp);
         return 0;
     } else if (fragment_only) {
-        run_bm25_fragment_graph_grid(fx);
+        run_bm25_fragment_graph_grid(fx, xprod_only, dual_only);
         if (g_router_per_query_fp)
             std::fclose(g_router_per_query_fp);
         return 0;

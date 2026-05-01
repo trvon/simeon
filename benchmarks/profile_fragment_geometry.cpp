@@ -240,11 +240,6 @@ int main(int argc, char** argv) {
                 mean_of(profiles, [](const auto& p) { return p.phss_select_death_sort_us; }));
     std::printf("phss_select_criterion_mean_us\t%.3f\n",
                 mean_of(profiles, [](const auto& p) { return p.phss_select_criterion_us; }));
-    std::printf("triangle_count_mean_us\t%.3f\n",
-                mean_of(profiles, [](const auto& p) { return p.triangle_count_us; }));
-    std::printf("triangle_count_total_mean\t%.3f\n", mean_of(profiles, [](const auto& p) {
-                    return static_cast<double>(p.triangle_count_total);
-                }));
     std::printf("query_attention_mean_us\t%.3f\n",
                 mean_of(profiles, [](const auto& p) { return p.query_attention_us; }));
     std::printf("adjacency_mean_us\t%.3f\n",

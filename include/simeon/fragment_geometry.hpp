@@ -1,12 +1,12 @@
 #pragma once
 
 #include <cstdint>
-#include <limits>
 #include <span>
 #include <string_view>
 #include <vector>
 
 #include "simeon/persistent_homology.hpp"
+#include "simeon/text_rank.hpp"
 
 namespace simeon {
 
@@ -38,6 +38,29 @@ struct SemanticFragment {
 };
 
 // ---------------------------------------------------------------------------
+// Per-document shared prep — TextRank ranking + per-sentence/anchor signatures.
+// Built once per doc, consumed by multiple fragment builders so the corpus pass
+// is O(N) total instead of O(N × builders). Sentence text is a string_view into
+// the caller's `doc` buffer; the buffer must outlive the prep.
+// ---------------------------------------------------------------------------
+
+struct DocPrep {
+    std::vector<RankedSentence> ranked;         // top-K, sorted by score
+    std::vector<SparseSignature> sentence_sigs; // parallel to `ranked` (1× signature_terms)
+    SparseSignature anchor_sig_1x;              // 1× signature_terms (SIF/BSIF/Poincaré anchor)
+    SparseSignature anchor_sig_2x;              // 2× signature_terms (rich-family anchor)
+    std::uint32_t fragment_signature_terms = 0;
+    std::uint32_t top_sentence_fragments = 0;
+};
+
+// Build a DocPrep for `doc`. Reusable by all rich-family and richcov-family
+// fragment builders. `position_weight` matches the existing per-builder default
+// (0.0 = pure TextRank score, >0 = blend with positional prior).
+DocPrep prepare_doc(std::string_view doc, const Bm25Index& idx,
+                    std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
+                    float position_weight = 0.0f);
+
+// ---------------------------------------------------------------------------
 // Configuration for fragment-geometry scoring.
 // ---------------------------------------------------------------------------
 
@@ -60,32 +83,6 @@ struct FragmentGeometryConfig {
     // Number of diffusion propagation steps.
     std::uint32_t steps = 2;
 
-    // BM25-side adaptive gating (legacy; kept for parity with research).
-    bool adaptive = false;
-    float adaptive_idf_lo = 2.0f;
-    float adaptive_idf_hi = 5.0f;
-    float adaptive_decay_lo = 0.25f;
-    float adaptive_decay_hi = 0.95f;
-    float adaptive_alpha_lo = 0.70f;
-    float adaptive_alpha_hi = 0.98f;
-    float adaptive_scale_lo = 4.0f;
-    float adaptive_scale_hi = 10.0f;
-    std::uint32_t adaptive_knn_lo = 4;
-    std::uint32_t adaptive_knn_hi = 16;
-    std::uint32_t adaptive_steps_lo = 1;
-    std::uint32_t adaptive_steps_hi = 3;
-
-    // Query-side geometry gating (legacy; kept for parity with research).
-    bool geometry_signal_adaptive = false;
-    float geometry_alpha_lo = 0.65f;
-    float geometry_alpha_hi = 0.98f;
-    float geometry_scale_lo = 3.0f;
-    float geometry_scale_hi = 10.0f;
-    std::uint32_t geometry_knn_lo = 4;
-    std::uint32_t geometry_knn_hi = 16;
-    std::uint32_t geometry_steps_lo = 1;
-    std::uint32_t geometry_steps_hi = 3;
-
     // Persistent Homology Scale Selection (PHSS).
     // When true, compute 0D persistent homology on the fragment similarity
     // graph and use the selected scale to determine which edges to keep,
@@ -98,110 +95,33 @@ struct FragmentGeometryConfig {
     bool phss_adaptive = false;
     float phss_confidence_threshold = 0.55f;
 
-    // PHSS-1D Phase A — per-fragment triangle-count importance probe.
-    // After the kNN graph is built (PHSS-selected or fixed), count triangles
-    // each fragment participates in and apply weight w_i = 1 +
-    // triangle_alpha * log1p(tri_count[i]). The weight multiplies either the
-    // post-attention seed mass (QueryAttention placement) or the
-    // post-diffusion mass before doc aggregation (Diffusion placement).
-    enum class TrianglePlacement : std::uint8_t {
-        None,
-        QueryAttention,
-        Diffusion,
-    };
-    bool use_triangle_weight = false;
-    float triangle_alpha = 0.0f;
-    TrianglePlacement triangle_placement = TrianglePlacement::None;
-
-    // MaxSim aggregation probe (training-free ColBERTv2 analog).
-    // Sum (default): geom_pool[doc] += mass[fragment] — averages per-fragment
-    //   signal across the t fragments per doc, smoothing variance.
-    // Max: geom_pool[doc] = max(geom_pool[doc], mass[fragment]) — preserves
-    //   the strongest per-fragment match per doc, addressing the multi-
-    //   fragment averaging bottleneck identified by phss_1d_triangle_results.md.
-    enum class DocAggregator : std::uint8_t {
-        Sum,
-        Max,
-    };
-    DocAggregator doc_aggregator = DocAggregator::Sum;
-
-    // Plan 2 self-KB candidate-set expansion (Phase A probe).
-    // When non-empty, after the BM25 top-K pool is built, union it with the
-    // precomputed top-N doc-doc neighbors of each pool member. Re-rank the
-    // expanded pool with the existing geometry pipeline. Addresses the
-    // BM25-pool R@100 ceiling (Bottleneck 2) at the offline-precomputation
-    // layer instead of the per-query rerank layer.
-    //
-    // doc_doc_neighbors[d] = top-N neighbor IDs of doc d (precomputed).
-    // Empty span = no expansion (default; pure first-pass top-K).
-    std::span<const std::vector<std::uint32_t>> doc_doc_neighbors{};
-
-    // Plan 4 — Single-fragment-per-doc builder. At query time, keep only
-    // the argmax query-similar fragment per doc (suppress all others to
-    // zero mass via a -inf qsim). Addresses the multi-fragment averaging
-    // bottleneck (phss_1d_triangle_results.md mechanism) at a different
-    // attack point than MaxSim: MaxSim aggregates across fragments; this
-    // filter selects a single fragment before aggregation.
-    bool single_fragment_per_doc = false;
-
-    // C2: Rank normalization for the BM25 pool leg. When true, replaces
-    // z-score normalization on the BM25 side with rank-based normalization
-    // (sort descending, assign -rank, then z-score the ranks). This is
-    // distribution-free and scale-invariant, avoiding the Gaussian assumption
-    // of z-score on Pareto/log-normal BM25 score distributions.
-    // The geometry leg is still z-scored. alpha is unchanged.
-    bool bm25_rank_norm = false;
-
-    // C3: PHSS gap-magnitude adaptive blend. When true and use_phss is true,
-    // the BM25 blend weight is reduced (more geometry weight) when the PHSS
-    // LargestGap magnitude is large, indicating a well-clustered fragment pool.
-    // query_alpha = clamp(alpha - (max_gap / phss_gap_scale) * phss_gap_delta,
-    //                     phss_gap_alpha_min, alpha)
-    // Set phss_gap_delta > 0 to reduce alpha on high-confidence pools (default).
-    bool phss_gap_adaptive = false;
-    float phss_gap_delta = 0.10f;     // max alpha reduction at full confidence
-    float phss_gap_scale = 0.30f;     // gap magnitude that saturates confidence (≈1.0)
-    float phss_gap_alpha_min = 0.65f; // floor for adapted alpha
-
-    // Phase B tunables for self-KB expansion.
-    // Cap neighbors used per pool member at query time (0 = use all available
-    // in the precomputed graph). Smaller cap reduces expansion cost while
-    // keeping R@100 lift if the top neighbors carry most of the signal.
-    std::uint32_t selfkb_neighbors_per_pool_doc = 0;
-    // BM25-relevance filter: only add neighbor `n` if bm25_scores[n] > this
-    // threshold. Removes zero-query-overlap neighbors that cause top-10
-    // ranking noise. Default -inf = no filter (Phase A behavior).
-    float selfkb_min_bm25_score = -std::numeric_limits<float>::infinity();
-    // Topology confidence gate (Component C per plan): skip expansion when
-    // BM25 pool score decay is below this threshold (flat / diffuse pools).
-    // 0 = always expand (Phase A behavior). Sweep on dev fold to pick.
-    float selfkb_gate_score_decay_min = 0.0f;
-
-    // C1: SPLATE-style outer MaxSim. When true, bypass PHSS+diffusion and
-    // compute the geometry score as max cosine similarity over the doc's
-    // whitened fragments. MaxSim operates at the outermost layer (before the
-    // alpha blend), not inside the diffusion stack. Eliminates the ~0.006
-    // effective multiplier from attention × diffusion² × t-fragment averaging.
+    // SPLATE-style outer MaxSim (Formal et al. 2024). When true, bypass
+    // PHSS+diffusion and compute the geometry score as max cosine similarity
+    // over the doc's whitened fragments. MaxSim operates at the outermost
+    // layer (before the alpha blend), not inside the diffusion stack.
     bool outer_maxsim = false;
 
-    // C6: IDF-weighted query-coverage reranking. When true, adds a third term
-    // gamma * z(coverage) to the final blend, where coverage(d,q) is the
-    // IDF-weighted BM25 score of the document against the unique query terms
-    // (captures how many unique query concepts each pool document addresses).
-    // Operates at the document level on BM25 term structure; independent of
-    // the geometry leg and Ceiling B.
-    bool idf_coverage = false;
-    float idf_coverage_gamma = 0.10f;
+    // Per-doc aggregation over fragment qsims when outer_maxsim is enabled.
+    enum class DocScorerKind : std::uint8_t {
+        MaxSim = 0,     // max qsim per doc
+        MeanSim = 1,    // mean qsim per doc
+        TopKMean = 2,   // mean of top-K qsims, K = doc_scorer_top_k
+        SoftMaxSum = 3, // softmax-weighted sum, β = doc_scorer_softmax_beta
+        GeoMean = 4,    // geometric mean — penalizes weak fragments
+    };
+    DocScorerKind doc_scorer_kind = DocScorerKind::MaxSim;
+    std::uint32_t doc_scorer_top_k = 3;
+    float doc_scorer_softmax_beta = 4.0f;
 
-    // C4: Random Fourier Feature kernel augmentation. When true, applies an
-    // arc-cosine degree-1 random feature map Φ(x) = max(0, Wx)/√rff_dim
-    // (W ~ N(0,1)) to the whitened fragment and query vectors before similarity
-    // computation. Approximates the arc-cosine kernel, capturing higher-order
-    // PMI co-occurrence structure beyond linear cosine. W is cached
-    // thread-locally for amortized per-query cost. rff_dim must be a multiple
-    // of the original dim; default 256 (2× expansion from dim=128).
-    bool rff_augment = false;
-    std::uint32_t rff_dim = 256;
+    // Dual-stage candidate generation. When dense_pool_size > 0 AND
+    // doc_dense_vecs != nullptr, the BM25 top-pool_size pool is augmented
+    // with the top-dense_pool_size docs by cosine(query_vec, doc_dense_vec).
+    // The unified pool (deduplicated, BM25 score retained for the dense-only
+    // arrivals) is then reranked by the existing geometry pipeline. Each
+    // entry in `*doc_dense_vecs` must be either empty (skip) or `enc.output_dim()`
+    // floats; doc_dense_vecs->size() must equal the corpus doc count.
+    std::uint32_t dense_pool_size = 0;
+    const std::vector<std::vector<float>>* doc_dense_vecs = nullptr;
 };
 
 struct FragmentGeometryProfile {
@@ -220,9 +140,6 @@ struct FragmentGeometryProfile {
     double phss_select_survivor_us = 0.0;
     double phss_select_death_sort_us = 0.0;
     double phss_select_criterion_us = 0.0;
-    // PHSS-1D triangle counter (Phase A).
-    double triangle_count_us = 0.0;
-    std::uint64_t triangle_count_total = 0;
     double query_attention_us = 0.0;
     double adjacency_us = 0.0;
     double diffuse_us = 0.0;
@@ -280,7 +197,7 @@ std::vector<SemanticFragment> build_doc_semantic_fragments_rich_budgeted(
     float sentence_overlap_cap, std::uint32_t max_sentence_keep, float anchor_overlap_cap,
     float anchor_novelty_floor, std::uint32_t max_anchor_keep);
 
-// C8a: SIF-weighted PMI fragments + richcov overlap caps (Arora et al. 2017).
+// SIF-weighted PMI fragments + richcov overlap caps (Arora et al. 2017).
 // IDF-weighted token accumulation replaces uniform sum: content nouns upweighted,
 // function words downweighted. Falls back to standard richcov on non-PMI encoders.
 std::vector<SemanticFragment>
@@ -289,12 +206,51 @@ build_doc_semantic_fragments_richcov_sif(const Encoder& enc, std::string_view do
                                          std::uint32_t fragment_signature_terms,
                                          float sentence_overlap_cap, float anchor_overlap_cap);
 
-// C8b: Bigram Hadamard SIF fragments (Mitchell & Lapata 2010, multiplicative composition).
+// Bigram Hadamard SIF fragments (Mitchell & Lapata 2010, multiplicative composition).
 // Adjacent token pairs contribute pmi(a) ⊙ pmi(b) * bigram_weight * sqrt(idf(a)*idf(b)).
 // Falls back to standard richcov on non-PMI encoders.
 std::vector<SemanticFragment> build_doc_semantic_fragments_richcov_bsif(
     const Encoder& enc, std::string_view doc, const Bm25Index& idx,
     std::uint32_t top_sentence_fragments, std::uint32_t fragment_signature_terms,
+    float sentence_overlap_cap, float anchor_overlap_cap, float bigram_weight = 0.5f);
+
+// ---------------------------------------------------------------------------
+// Shared-prep fragment builders. Each takes a `DocPrep` produced by
+// `prepare_doc()` and reuses its TextRank ranking + per-sentence/anchor
+// signatures across multiple builders. The encoder-specific work (per-fragment
+// vector encoding + centroid normalization) is the only per-builder cost.
+// ---------------------------------------------------------------------------
+
+std::vector<SemanticFragment> build_doc_semantic_fragments_from_prep(const Encoder& enc,
+                                                                     std::string_view doc,
+                                                                     const DocPrep& prep);
+
+std::vector<SemanticFragment> build_doc_semantic_fragments_rich_from_prep(const Encoder& enc,
+                                                                          std::string_view doc,
+                                                                          const DocPrep& prep);
+
+std::vector<SemanticFragment>
+build_doc_semantic_fragments_rich_covered_from_prep(const Encoder& enc, std::string_view doc,
+                                                    const DocPrep& prep, float sentence_overlap_cap,
+                                                    float anchor_overlap_cap);
+
+std::vector<SemanticFragment>
+build_doc_semantic_fragments_rich_mmr_from_prep(const Encoder& enc, std::string_view doc,
+                                                const DocPrep& prep, float sentence_overlap_cap,
+                                                float anchor_overlap_cap, float redundancy_lambda,
+                                                float sentence_min_score, float anchor_min_score);
+
+std::vector<SemanticFragment> build_doc_semantic_fragments_rich_budgeted_from_prep(
+    const Encoder& enc, std::string_view doc, const DocPrep& prep, float sentence_overlap_cap,
+    std::uint32_t max_sentence_keep, float anchor_overlap_cap, float anchor_novelty_floor,
+    std::uint32_t max_anchor_keep);
+
+std::vector<SemanticFragment> build_doc_semantic_fragments_richcov_sif_from_prep(
+    const Encoder& enc, const Bm25Index& idx, std::string_view doc, const DocPrep& prep,
+    float sentence_overlap_cap, float anchor_overlap_cap);
+
+std::vector<SemanticFragment> build_doc_semantic_fragments_richcov_bsif_from_prep(
+    const Encoder& enc, const Bm25Index& idx, std::string_view doc, const DocPrep& prep,
     float sentence_overlap_cap, float anchor_overlap_cap, float bigram_weight = 0.5f);
 
 // ---------------------------------------------------------------------------
@@ -324,5 +280,10 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
 // Halves peak memory for fragment vectors (2× per fragment dim).
 void compress_fragments_to_bf16(std::span<std::vector<SemanticFragment>> doc_frags,
                                 std::uint32_t dim);
+
+// Read a fragment's vector into `dst`, decompressing from BF16 if `frag.vec`
+// is empty and `frag.vec_bf16` is populated. `dst` must have space for `dim`
+// floats. If the fragment is uninitialized, `dst` is zero-filled.
+void read_frag_vec(const SemanticFragment& frag, std::uint32_t dim, float* dst);
 
 } // namespace simeon

@@ -156,6 +156,7 @@ install_headers(
     'include/simeon/matryoshka.hpp',
     'include/simeon/pmi.hpp',
     'include/simeon/glove_embeddings.hpp',
+    'include/simeon/manifold.hpp',
     'include/simeon/query_router.hpp',
     'include/simeon/prf.hpp',
     'include/simeon/concept_mining.hpp',
