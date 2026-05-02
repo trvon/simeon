@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string_view>
 
-#include "simeon/hasher.hpp"  // splitmix64_mix
+#include "simeon/hasher.hpp" // splitmix64_mix
 
 namespace simeon {
 
@@ -21,16 +21,18 @@ struct TabulationTables {
 void fill_tables(std::uint64_t seed, TabulationTables& t) noexcept {
     // Seed -> 6 stream offsets. Each table entry is one splitmix64 mix of
     // the stream-offset seed, advanced by index.
-    std::uint64_t s = seed ^ 0x636F66666565313FULL;  // arbitrary salt
+    std::uint64_t s = seed ^ 0x636F66666565313FULL; // arbitrary salt
     auto fill = [&](std::array<std::uint64_t, 256>& tbl) {
         for (std::uint32_t i = 0; i < 256; ++i) {
             s = splitmix64_mix(s + i);
             tbl[i] = s;
         }
-        s = splitmix64_mix(s ^ 0x9E3779B97F4A7C15ULL);  // separate streams
+        s = splitmix64_mix(s ^ 0x9E3779B97F4A7C15ULL); // separate streams
     };
-    for (auto& p : t.primary) fill(p);
-    for (auto& d : t.derived) fill(d);
+    for (auto& p : t.primary)
+        fill(p);
+    for (auto& d : t.derived)
+        fill(d);
 }
 
 const TabulationTables& tables_for(std::uint64_t seed) noexcept {
@@ -47,7 +49,8 @@ const TabulationTables& tables_for(std::uint64_t seed) noexcept {
     thread_local std::size_t next_slot = 0;
 
     for (auto& slot : cache) {
-        if (slot.valid && slot.seed == seed) return slot.tables;
+        if (slot.valid && slot.seed == seed)
+            return slot.tables;
     }
     Slot& target = cache[next_slot];
     next_slot = (next_slot + 1) % kSlots;
@@ -57,11 +60,11 @@ const TabulationTables& tables_for(std::uint64_t seed) noexcept {
     return target.tables;
 }
 
-}  // namespace
+} // namespace
 
 std::uint64_t mixed_tabulation_hash(std::string_view s, std::uint64_t seed) noexcept {
     const TabulationTables& t = tables_for(seed);
-    const auto* data = reinterpret_cast<const std::uint8_t*>(s.data());
+    const auto* data = static_cast<const std::uint8_t*>(static_cast<const void*>(s.data()));
     const std::size_t n = s.size();
 
     // Primary mix: each byte XORs in T[i & 3][b].
@@ -81,4 +84,4 @@ std::uint64_t mixed_tabulation_hash(std::string_view s, std::uint64_t seed) noex
     return h;
 }
 
-}  // namespace simeon
+} // namespace simeon

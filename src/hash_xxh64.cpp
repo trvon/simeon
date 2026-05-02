@@ -26,7 +26,7 @@ inline std::uint64_t rotl64(std::uint64_t x, int r) noexcept {
 inline std::uint64_t read64(const std::uint8_t* p) noexcept {
     std::uint64_t v;
     std::memcpy(&v, p, sizeof(v));
-    return v;  // host endian — XXH64 is defined little-endian; correct on x86/arm64.
+    return v; // host endian — XXH64 is defined little-endian; correct on x86/arm64.
 }
 
 inline std::uint32_t read32(const std::uint8_t* p) noexcept {
@@ -47,10 +47,10 @@ inline std::uint64_t merge_accumulator(std::uint64_t acc, std::uint64_t val) noe
     return acc * PRIME64_1 + PRIME64_4;
 }
 
-}  // namespace
+} // namespace
 
 std::uint64_t xxh64_hash(std::string_view s, std::uint64_t seed) noexcept {
-    const auto* p = reinterpret_cast<const std::uint8_t*>(s.data());
+    const auto* p = static_cast<const std::uint8_t*>(static_cast<const void*>(s.data()));
     const std::size_t len = s.size();
     const std::uint8_t* const end = p + len;
 
@@ -62,10 +62,14 @@ std::uint64_t xxh64_hash(std::string_view s, std::uint64_t seed) noexcept {
         std::uint64_t v4 = seed - PRIME64_1;
         const std::uint8_t* const limit = end - 32;
         while (p <= limit) {
-            v1 = round(v1, read64(p));      p += 8;
-            v2 = round(v2, read64(p));      p += 8;
-            v3 = round(v3, read64(p));      p += 8;
-            v4 = round(v4, read64(p));      p += 8;
+            v1 = round(v1, read64(p));
+            p += 8;
+            v2 = round(v2, read64(p));
+            p += 8;
+            v3 = round(v3, read64(p));
+            p += 8;
+            v4 = round(v4, read64(p));
+            p += 8;
         }
         h = rotl64(v1, 1) + rotl64(v2, 7) + rotl64(v3, 12) + rotl64(v4, 18);
         h = merge_accumulator(h, v1);
@@ -102,4 +106,4 @@ std::uint64_t xxh64_hash(std::string_view s, std::uint64_t seed) noexcept {
     return h;
 }
 
-}  // namespace simeon
+} // namespace simeon

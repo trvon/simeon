@@ -10,11 +10,12 @@
 //   - Fallback: byte-at-a-time table-driven (slice-by-1, ~1KB table).
 
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <string_view>
 
-#include "simeon/hasher.hpp"  // for splitmix64_mix
+#include "simeon/hasher.hpp" // for splitmix64_mix
 
 #if defined(__SSE4_2__)
 #include <nmmintrin.h>
@@ -44,45 +45,50 @@ constexpr std::array<std::uint32_t, 256> make_crc32c_table() {
 
 constexpr std::array<std::uint32_t, 256> CRC32C_TABLE = make_crc32c_table();
 
-[[maybe_unused]] std::uint32_t crc32c_software(std::uint32_t crc, const std::uint8_t* p,
+[[nodiscard]] inline std::uint64_t load_u64_unaligned(const char* p) noexcept {
+    std::array<std::byte, sizeof(std::uint64_t)> bytes{};
+    std::memcpy(bytes.data(), p, bytes.size());
+    return std::bit_cast<std::uint64_t>(bytes);
+}
+
+[[maybe_unused]] std::uint32_t crc32c_software(std::uint32_t crc, const char* p,
                                                std::size_t n) noexcept {
     for (std::size_t i = 0; i < n; ++i) {
-        crc = CRC32C_TABLE[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+        const auto byte = static_cast<std::uint8_t>(p[i]);
+        crc = CRC32C_TABLE[(crc ^ byte) & 0xFFu] ^ (crc >> 8);
     }
     return crc;
 }
 
 #if defined(__SSE4_2__)
-std::uint32_t crc32c_hw(std::uint32_t crc, const std::uint8_t* p, std::size_t n) noexcept {
+std::uint32_t crc32c_hw(std::uint32_t crc, const char* p, std::size_t n) noexcept {
     while (n >= 8) {
-        std::uint64_t chunk;
-        std::memcpy(&chunk, p, 8);
+        const std::uint64_t chunk = load_u64_unaligned(p);
         crc = static_cast<std::uint32_t>(_mm_crc32_u64(crc, chunk));
         p += 8;
         n -= 8;
     }
     while (n--) {
-        crc = _mm_crc32_u8(crc, *p++);
+        crc = _mm_crc32_u8(crc, static_cast<std::uint8_t>(*p++));
     }
     return crc;
 }
 #elif defined(__ARM_FEATURE_CRC32)
-std::uint32_t crc32c_hw(std::uint32_t crc, const std::uint8_t* p, std::size_t n) noexcept {
+std::uint32_t crc32c_hw(std::uint32_t crc, const char* p, std::size_t n) noexcept {
     while (n >= 8) {
-        std::uint64_t chunk;
-        std::memcpy(&chunk, p, 8);
+        const std::uint64_t chunk = load_u64_unaligned(p);
         crc = __crc32cd(crc, chunk);
         p += 8;
         n -= 8;
     }
     while (n--) {
-        crc = __crc32cb(crc, *p++);
+        crc = __crc32cb(crc, static_cast<std::uint8_t>(*p++));
     }
     return crc;
 }
 #endif
 
-std::uint32_t crc32c(std::uint32_t crc_in, const std::uint8_t* p, std::size_t n) noexcept {
+std::uint32_t crc32c(std::uint32_t crc_in, const char* p, std::size_t n) noexcept {
     std::uint32_t crc = ~crc_in;
 #if defined(__SSE4_2__) || defined(__ARM_FEATURE_CRC32)
     crc = crc32c_hw(crc, p, n);
@@ -92,11 +98,10 @@ std::uint32_t crc32c(std::uint32_t crc_in, const std::uint8_t* p, std::size_t n)
     return ~crc;
 }
 
-}  // namespace
+} // namespace
 
 std::uint64_t crc32c_hash(std::string_view s, std::uint64_t seed) noexcept {
-    const auto* p = reinterpret_cast<const std::uint8_t*>(s.data());
-    const std::uint32_t crc = crc32c(static_cast<std::uint32_t>(seed), p, s.size());
+    const std::uint32_t crc = crc32c(static_cast<std::uint32_t>(seed), s.data(), s.size());
     // Expand 32-bit checksum to 64 bits via SplitMix64 finalization, mixing
     // in the high 32 bits of the seed and the length so different seeds /
     // lengths yield different 64-bit hashes even when the CRC collides.
@@ -104,4 +109,4 @@ std::uint64_t crc32c_hash(std::string_view s, std::uint64_t seed) noexcept {
     return splitmix64_mix(packed ^ seed ^ (static_cast<std::uint64_t>(s.size()) << 24));
 }
 
-}  // namespace simeon
+} // namespace simeon
