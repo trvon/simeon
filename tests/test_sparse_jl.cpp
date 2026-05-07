@@ -18,13 +18,15 @@ std::vector<std::int32_t> random_sketch(std::uint32_t dim, std::uint32_t seed) {
     std::mt19937 rng(seed);
     std::uniform_int_distribution<std::int32_t> dist(-32, 32);
     std::vector<std::int32_t> v(dim);
-    for (auto& x : v) x = dist(rng);
+    for (auto& x : v)
+        x = dist(rng);
     return v;
 }
 
 float l2(const float* p, std::uint32_t n) {
     double s = 0.0;
-    for (std::uint32_t i = 0; i < n; ++i) s += static_cast<double>(p[i]) * p[i];
+    for (std::uint32_t i = 0; i < n; ++i)
+        s += static_cast<double>(p[i]) * p[i];
     return static_cast<float>(std::sqrt(s));
 }
 
@@ -46,7 +48,7 @@ void test_sparse_jl_distortion_within_eps() {
     Projection p(sketch_dim, output_dim, ProjectionMode::SparseJL, /*seed*/ 42, eps);
 
     std::vector<float> proj_a(output_dim), proj_b(output_dim);
-    std::vector<float> diff_in(sketch_dim);  // float view of input difference
+    std::vector<float> diff_in(sketch_dim); // float view of input difference
     std::vector<float> proj_diff(output_dim);
 
     double sum_sq_distortion = 0.0;
@@ -55,18 +57,21 @@ void test_sparse_jl_distortion_within_eps() {
         auto a = random_sketch(sketch_dim, 1234 + k);
         auto b = random_sketch(sketch_dim, 9876 + k);
         std::vector<std::int32_t> d(sketch_dim);
-        for (std::uint32_t i = 0; i < sketch_dim; ++i) d[i] = a[i] - b[i];
+        for (std::uint32_t i = 0; i < sketch_dim; ++i)
+            d[i] = a[i] - b[i];
 
         const float in_norm = l2_sketch(d.data(), sketch_dim);
-        if (in_norm == 0.0f) continue;
+        if (in_norm == 0.0f)
+            continue;
 
         p.apply(d.data(), proj_diff.data());
         const float out_norm = l2(proj_diff.data(), output_dim);
 
-        const float ratio = out_norm / in_norm;
-        const float dist = std::fabs(ratio - 1.0f);
+        const double ratio = static_cast<double>(out_norm) / static_cast<double>(in_norm);
+        const double dist = std::fabs(ratio - 1.0);
         sum_sq_distortion += dist * dist;
-        if (dist <= eps) ++in_bound;
+        if (dist <= static_cast<double>(eps))
+            ++in_bound;
     }
     // JL is a probabilistic guarantee — most pairs (≥ 80% with eps=0.10 and
     // s=ceil(0.10 * 1024) = 103 nonzeros per row) should land within bound.
@@ -81,14 +86,15 @@ void test_sparse_jl_column_has_exact_s_nonzeros() {
     constexpr std::uint32_t output_dim = 64;
     constexpr float eps = 0.25f;
     // Kane–Nelson column-sparsity: each input column gets s = ceil(eps*k).
-    constexpr std::uint32_t expected_s = 16;  // ceil(0.25 * 64)
+    constexpr std::uint32_t expected_s = 16; // ceil(0.25 * 64)
 
     Projection p(sketch_dim, output_dim, ProjectionMode::SparseJL, /*seed*/ 7, eps);
 
     for (std::uint32_t col = 0; col < sketch_dim; ++col) {
         std::uint32_t nonzero = 0;
         for (std::uint32_t row = 0; row < output_dim; ++row) {
-            if (p.entry(row, col) != 0.0f) ++nonzero;
+            if (p.entry(row, col) != 0.0f)
+                ++nonzero;
         }
         assert(nonzero == expected_s);
     }
@@ -147,7 +153,7 @@ void test_sparse_jl_rejects_invalid_eps() {
     assert(threw);
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     test_sparse_jl_distortion_within_eps();

@@ -303,7 +303,6 @@ std::string normalize_ws_lower(std::string_view text) {
     return out;
 }
 
-#ifdef SIMEON_RESEARCH_BENCH
 enum class AuxFieldMode : std::uint8_t {
     None,
     TextRankTitle,
@@ -936,8 +935,6 @@ build_softmatch_query(const simeon::Bm25Index& idx, const simeon::PmiEmbeddings&
               [](const auto& a, const auto& b) { return a.first < b.first; });
     return weighted;
 }
-
-#endif // SIMEON_RESEARCH_BENCH
 
 std::vector<std::pair<std::string, std::string>> read_tsv2(const std::string& path) {
     std::ifstream in(path);
@@ -1604,7 +1601,7 @@ float topk_jaccard_from_scores(const std::vector<float>& a, const std::vector<fl
         sa.insert(did);
     std::uint32_t inter = 0;
     for (const auto& [did, score] : tb) {
-        void;
+        (void)score;
         if (sa.find(did) != sa.end())
             ++inter;
     }
@@ -1704,7 +1701,7 @@ void zscore_pool_values(std::vector<float>& values,
     mean /= static_cast<double>(pool.size());
     double var = 0.0;
     for (const auto& [did, score] : pool) {
-        void;
+        (void)score;
         const double d = static_cast<double>(values[did]) - mean;
         var += d * d;
     }
@@ -1751,7 +1748,7 @@ void run_pool_lexical_evidence_rerank(const char* name, const Fixture& fx,
         const auto qsig = build_sparse_signature(idx, fx.query_texts[qi], 48);
         const auto phrases = build_query_phrase_nodes(idx, fx.query_texts[qi]);
         for (const auto& [did, score] : pool) {
-            void;
+            (void)score;
             overlap[did] = weighted_containment(qsig, doc_sigs[did]);
             if (!phrases.empty()) {
                 auto pw = compute_doc_phrase_weights(doc_hashes[did], phrases, 8);
@@ -1762,7 +1759,7 @@ void run_pool_lexical_evidence_rerank(const char* name, const Fixture& fx,
         zscore_pool_values(phrase, std::span<const std::pair<std::uint32_t, float>>(pool));
         std::fill(fused.begin(), fused.end(), -std::numeric_limits<float>::infinity());
         for (const auto& [did, score] : pool) {
-            void;
+            (void)score;
             fused[did] = bm25_z[did] + overlap_weight * overlap[did] + phrase_weight * phrase[did];
         }
         rankings[qi].reserve(nd);
@@ -2069,6 +2066,7 @@ void dump_generator_winner_features_if_env(const Fixture& fx, const simeon::Bm25
         rel[q.q][q.d] = q.rel;
 
     simeon::QueryRouter router(feature_idx);
+    const std::array<const simeon::Bm25Index*, 1> pool_span{&feature_idx};
     std::array<std::vector<float>, 4> scores{
         std::vector<float>(nd, 0.0f), std::vector<float>(nd, 0.0f), std::vector<float>(nd, 0.0f),
         std::vector<float>(nd, 0.0f)};
@@ -2128,7 +2126,9 @@ void dump_generator_winner_features_if_env(const Fixture& fx, const simeon::Bm25
         const float rm3_margin2 = top2_margin_from_scores(scores[2]);
         const float z_equal_margin2 = top2_margin_from_scores(scores[3]);
         const float rm3_minus_bm25_margin2 = rm3_margin2 - bm25_margin2;
-        const auto f = router.features(fx.query_texts[qi]);
+        const auto f = router.features_with_pool(
+            fx.query_texts[qi],
+            std::span<const simeon::Bm25Index* const>(pool_span.data(), pool_span.size()), 50);
         std::fprintf(fp,
                      "{\"qi\":%u,\"qid\":\"%s\",\"winner\":\"%s\","
                      "\"ndcg_bm25\":%.6f,\"ndcg_bm25f\":%.6f,"
@@ -2144,7 +2144,9 @@ void dump_generator_winner_features_if_env(const Fixture& fx, const simeon::Bm25
                      "\"z_equal_margin2\":%.6f,\"rm3_minus_bm25_margin2\":%.6f,"
                      "\"oov_rate\":%.6f,\"avg_idf\":%.6f,\"max_idf\":%.6f,"
                      "\"min_idf\":%.6f,\"idf_stddev\":%.6f,\"n_terms\":%u,"
-                     "\"avg_term_chars\":%.6f,\"scq_sum\":%.6f,"
+                     "\"avg_term_chars\":%.6f,\"score_decay_rate\":%.6f,"
+                     "\"score_normalized_var\":%.6f,\"top_k_score_entropy\":%.6f,"
+                     "\"nqc\":%.6f,\"wig_full\":%.6f,\"scq_sum\":%.6f,"
                      "\"simplified_clarity\":%.6f}\n",
                      qi, fx.query_ids[qi].c_str(), names[best], ndcgs[0], ndcgs[1], ndcgs[2],
                      ndcgs[3], bm25_rm3_jaccard10, bm25_rm3_jaccard50, bm25_rm3_jaccard100,
@@ -2153,7 +2155,8 @@ void dump_generator_winner_features_if_env(const Fixture& fx, const simeon::Bm25
                      bm25_entropy10, rm3_entropy10, z_equal_entropy10, rm3_minus_bm25_entropy10,
                      bm25_margin2, rm3_margin2, z_equal_margin2, rm3_minus_bm25_margin2, f.oov_rate,
                      f.avg_idf, f.max_idf, f.min_idf, f.idf_stddev, f.n_terms, f.avg_term_chars,
-                     f.scq_sum, f.simplified_clarity);
+                     f.score_decay_rate, f.score_normalized_var, f.top_k_score_entropy, f.nqc,
+                     f.wig_full, f.scq_sum, f.simplified_clarity);
     }
     std::fclose(fp);
 }
@@ -2944,7 +2947,7 @@ void run_first_generator_slice_oracles(const Fixture& fx, const Bm25WithTiming& 
         double sum_sim = 0.0;
         std::size_t n_top = 0;
         for (const auto& [did, score] : top200) {
-            void;
+            (void)score;
             float sim = dot(qemb, simeon_dembs.data() + did * sdim, sdim);
             simeon_sims[did] = sim;
             sum_sim += sim;
@@ -2957,7 +2960,7 @@ void run_first_generator_slice_oracles(const Fixture& fx, const Bm25WithTiming& 
         double mean_sim = sum_sim / n_top;
         double var_sim = 0.0;
         for (const auto& [did, score] : top200) {
-            void;
+            (void)score;
             double diff = simeon_sims[did] - mean_sim;
             var_sim += diff * diff;
         }
@@ -2966,7 +2969,7 @@ void run_first_generator_slice_oracles(const Fixture& fx, const Bm25WithTiming& 
         // Penalize docs with z(sim) < −0.5.
         zscore_inplace(bm25);
         for (const auto& [did, score] : top200) {
-            void;
+            (void)score;
             float zsim = (simeon_sims[did] - static_cast<float>(mean_sim)) / sd_sim;
             if (zsim < -0.5f) {
                 float penalty = 0.3f * (-zsim - 0.5f) * lambda;
@@ -3072,6 +3075,7 @@ void run_first_generator_slice_oracles(const Fixture& fx, const Bm25WithTiming& 
     // Adds avg_idf extremes to RM3 pool (TREC-COVID < 2.5, NFCorpus > 3.8)
     // that the simple entropy gate misses.
     simeon::QueryRouter qrouter(bm25.idx);
+    const std::array<const simeon::Bm25Index*, 1> qpp_pool_span{&bm25.idx};
     ScoreFn gen_arch_router_v2 = [&](std::uint32_t qi, std::vector<float>& out) {
         std::vector<float> tmp(nd, 0.0f);
         gen_bm25(qi, tmp);
@@ -3110,6 +3114,66 @@ void run_first_generator_slice_oracles(const Fixture& fx, const Bm25WithTiming& 
     run_generator_observed("observed_ordering_entropy_length_router", fx,
                            bm25.build_us + bm25f_lead.build_us + simeon_build_us,
                            gen_entropy_length_router);
+
+    // QPP hard-gate sweep over the entropy+length backbone. The search is:
+    //   Lead for long ultra-peaked queries;
+    //   otherwise choose BM25 only for short/easy queries identified by
+    //   post-retrieval BM25 shape predictors; default to diverse RM3.
+    ScoreFn gen_entropy_length_decay_router = [&](std::uint32_t qi, std::vector<float>& out) {
+        const auto feat = qrouter.features_with_pool(
+            fx.query_texts[qi],
+            std::span<const simeon::Bm25Index* const>(qpp_pool_span.data(), qpp_pool_span.size()),
+            50);
+        const float ent = feat.top_k_score_entropy;
+        simeon::AdapterEvidence ev;
+        if (ent < 0.05f && feat.n_terms > 30u)
+            arch_lead.score_indexed(fx.query_texts[qi], qi, ev, out);
+        else if (ent < 0.8560725f && feat.n_terms < 30u && feat.score_decay_rate < 0.1297675f)
+            arch_bm25.score_indexed(fx.query_texts[qi], qi, ev, out);
+        else
+            arch_rm3.score_indexed(fx.query_texts[qi], qi, ev, out);
+    };
+    run_generator_observed("observed_ordering_entropy_length_decay_router", fx,
+                           bm25.build_us + bm25f_lead.build_us + simeon_build_us,
+                           gen_entropy_length_decay_router);
+
+    ScoreFn gen_entropy_length_var_wig_router = [&](std::uint32_t qi, std::vector<float>& out) {
+        const auto feat = qrouter.features_with_pool(
+            fx.query_texts[qi],
+            std::span<const simeon::Bm25Index* const>(qpp_pool_span.data(), qpp_pool_span.size()),
+            50);
+        const float ent = feat.top_k_score_entropy;
+        simeon::AdapterEvidence ev;
+        if (ent < 0.05f && feat.n_terms > 30u)
+            arch_lead.score_indexed(fx.query_texts[qi], qi, ev, out);
+        else if (ent < 0.6791081f && feat.n_terms < 30u && feat.score_normalized_var > 0.3499235f &&
+                 feat.wig_full > 3.0773578f)
+            arch_bm25.score_indexed(fx.query_texts[qi], qi, ev, out);
+        else
+            arch_rm3.score_indexed(fx.query_texts[qi], qi, ev, out);
+    };
+    run_generator_observed("observed_ordering_entropy_length_var_wig_router", fx,
+                           bm25.build_us + bm25f_lead.build_us + simeon_build_us,
+                           gen_entropy_length_var_wig_router);
+
+    ScoreFn gen_entropy_length_nqc_wig_router = [&](std::uint32_t qi, std::vector<float>& out) {
+        const auto feat = qrouter.features_with_pool(
+            fx.query_texts[qi],
+            std::span<const simeon::Bm25Index* const>(qpp_pool_span.data(), qpp_pool_span.size()),
+            50);
+        const float ent = feat.top_k_score_entropy;
+        simeon::AdapterEvidence ev;
+        if (ent < 0.05f && feat.n_terms > 30u)
+            arch_lead.score_indexed(fx.query_texts[qi], qi, ev, out);
+        else if (ent < 0.8926631f && feat.n_terms < 30u && feat.nqc > 1.2376532f &&
+                 feat.wig_full > 3.0773578f)
+            arch_bm25.score_indexed(fx.query_texts[qi], qi, ev, out);
+        else
+            arch_rm3.score_indexed(fx.query_texts[qi], qi, ev, out);
+    };
+    run_generator_observed("observed_ordering_entropy_length_nqc_wig_router", fx,
+                           bm25.build_us + bm25f_lead.build_us + simeon_build_us,
+                           gen_entropy_length_nqc_wig_router);
 
     // SelfAssessRouter: score all 4, pick best by assess_quality.
     ScoreFn gen_arch_self = [&](std::uint32_t qi, std::vector<float>& out) {

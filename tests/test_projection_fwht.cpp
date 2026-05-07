@@ -16,13 +16,15 @@ std::vector<std::int32_t> random_sketch(std::uint32_t dim, std::uint32_t seed) {
     std::mt19937 rng(seed);
     std::uniform_int_distribution<std::int32_t> dist(-32, 32);
     std::vector<std::int32_t> v(dim);
-    for (auto& x : v) x = dist(rng);
+    for (auto& x : v)
+        x = dist(rng);
     return v;
 }
 
 float l2_f(const float* p, std::uint32_t n) {
     double s = 0.0;
-    for (std::uint32_t i = 0; i < n; ++i) s += static_cast<double>(p[i]) * p[i];
+    for (std::uint32_t i = 0; i < n; ++i)
+        s += static_cast<double>(p[i]) * p[i];
     return static_cast<float>(std::sqrt(s));
 }
 
@@ -36,7 +38,7 @@ float l2_i(const std::int32_t* p, std::uint32_t n) {
 }
 
 void test_fwht_distortion_within_bound() {
-    constexpr std::uint32_t sketch_dim = 1024;  // already a power of 2
+    constexpr std::uint32_t sketch_dim = 1024; // already a power of 2
     constexpr std::uint32_t output_dim = 256;
     constexpr std::uint32_t pairs = 80;
 
@@ -50,17 +52,20 @@ void test_fwht_distortion_within_bound() {
         auto a = random_sketch(sketch_dim, 1234 + k);
         auto b = random_sketch(sketch_dim, 9876 + k);
         std::vector<std::int32_t> d(sketch_dim);
-        for (std::uint32_t i = 0; i < sketch_dim; ++i) d[i] = a[i] - b[i];
+        for (std::uint32_t i = 0; i < sketch_dim; ++i)
+            d[i] = a[i] - b[i];
 
         const float in_norm = l2_i(d.data(), sketch_dim);
-        if (in_norm == 0.0f) continue;
+        if (in_norm == 0.0f)
+            continue;
         p.apply(d.data(), proj_diff.data());
         const float out_norm = l2_f(proj_diff.data(), output_dim);
 
-        const float ratio = out_norm / in_norm;
-        const float dist = std::fabs(ratio - 1.0f);
+        const double ratio = static_cast<double>(out_norm) / static_cast<double>(in_norm);
+        const double dist = std::fabs(ratio - 1.0);
         sum_sq_distortion += dist * dist;
-        if (dist <= bound) ++in_bound;
+        if (dist <= static_cast<double>(bound))
+            ++in_bound;
     }
     const double rms = std::sqrt(sum_sq_distortion / pairs);
     // Subsampled-WHT distortion at k=256 over n=1024: textbook bound is
@@ -139,8 +144,7 @@ void test_fwht_dense_matrix_matches_apply() {
     for (std::uint32_t r = 0; r < output_dim; ++r) {
         double acc = 0.0;
         for (std::uint32_t c = 0; c < sketch_dim; ++c) {
-            acc += static_cast<double>(p.entry(r, c)) *
-                   static_cast<double>(v[c]);
+            acc += static_cast<double>(p.entry(r, c)) * static_cast<double>(v[c]);
         }
         via_dense[r] = static_cast<float>(acc);
     }
@@ -167,7 +171,7 @@ void test_fwht_rejects_oversized_output() {
     assert(threw);
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     test_fwht_distortion_within_bound();
