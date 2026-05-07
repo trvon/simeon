@@ -83,6 +83,8 @@ not relevance labels.
   - query/title/body overlap
   - rebuttal cue density
   - relative concision
+- optional claim/premise mode adds opening-window alignment between the query's
+  title/body split and the candidate's first 35 content words
 
 This is still corpus-structured, but it no longer depends on the exact `a ↔ b`
 ID pair.

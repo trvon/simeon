@@ -207,6 +207,20 @@ std::unordered_set<std::string> ArguanaTextPairAdapter::content_set(std::string_
     return out;
 }
 
+std::unordered_set<std::string>
+ArguanaTextPairAdapter::content_set_first_words(std::string_view text, std::uint32_t max_words) {
+    std::unordered_set<std::string> out;
+    auto words = word_tokens(text);
+    const std::uint32_t n =
+        std::min<std::uint32_t>(max_words, static_cast<std::uint32_t>(words.size()));
+    for (std::uint32_t i = 0; i < n; ++i) {
+        auto& tok = words[i];
+        if (tok.size() > 2 && !stopword(tok))
+            out.insert(std::move(tok));
+    }
+    return out;
+}
+
 float ArguanaTextPairAdapter::jaccard_set(const std::unordered_set<std::string>& a,
                                           const std::unordered_set<std::string>& b) {
     if (a.empty() && b.empty())
@@ -250,6 +264,7 @@ void ArguanaTextPairAdapter::seed_doc(std::string_view /*doc_id*/, std::string_v
     doc.normalized = normalize_ws_lower(doc_text);
     doc.tokens = word_tokens(doc_text);
     doc.content = content_set(doc_text);
+    doc.first35_content = content_set_first_words(doc_text, 35);
     docs_.push_back(std::move(doc));
 }
 
@@ -307,12 +322,16 @@ AdapterEvidence ArguanaTextPairAdapter::process_query(std::string_view /*query_i
         const float q_j = jaccard_set(q_content, doc.content);
         const float body_j = jaccard_set(body_content, doc.content);
         const float title_j = jaccard_set(title_content, doc.content);
+        const float title35_j = jaccard_set(title_content, doc.first35_content);
+        const float body35_j = jaccard_set(body_content, doc.first35_content);
         const float cue = static_cast<float>(cue_count(doc.content)) / 10.0f;
         const float shorter =
             (static_cast<float>(self->content.size()) - static_cast<float>(doc.content.size())) /
             std::max(1.0f, static_cast<float>(self->content.size()));
-        const float raw = -0.5f * prox + dist_penalty + 5.0f * q_j - body_j + title_j + 0.5f * cue +
-                          0.5f * shorter;
+        float raw = -0.5f * prox + dist_penalty + 5.0f * q_j - body_j + title_j + 0.5f * cue +
+                    0.5f * shorter;
+        if (claim_premise_mode_)
+            raw += 2.5f * title35_j + 1.0f * body35_j;
         cand.push_back({doc.index, raw});
     }
     if (cand.empty())

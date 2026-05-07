@@ -9,7 +9,7 @@ Current empirical anchors:
 
 - best universal row: `observed_ordering_entropy_length_qpp_router = 0.4169`
 - best adapter-only system: ArguAna pair-ID adapter `= 0.4529`
-- best adapter + routing system: `observed_ordering_arguana_text_pair_adapter_ensemble = 0.4745`
+- best adapter + routing system: `observed_ordering_arguana_claim_premise_adapter_ensemble = 0.4780`
 
 ## Rejected design
 
@@ -104,9 +104,10 @@ interface and one branching discipline:
 - reuse the same universal fallback when the adapter is silent
 
 Under this definition, the ArguAna pair-ID adapter is the first proof of concept
-for the interface, and the ArguAna text-pair adapter is the first proof that a
-non-id structural branch can still produce a large macro jump. Neither is yet a
-fully general adapter family.
+for the interface, the ArguAna text-pair adapter is the first proof that a
+non-id structural branch can still produce a large macro jump, and the
+claim/premise variant shows that better internal structure matching can still
+move the row further. None of these is yet a fully general adapter family.
 
 ## Open problem
 

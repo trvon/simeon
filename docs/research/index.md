@@ -47,6 +47,7 @@ the published simeon numbers.
 - **Entropy+length 2-way router:** see [phase71_entropy_length_router.md](phase71_entropy_length_router.md).
 - **QPP hard-router refinement:** see [phase72_qpp_hard_router.md](phase72_qpp_hard_router.md).
 - **ArguAna text-pair adapter ensemble:** see [phase73_arguana_text_pair_adapter_ensemble.md](phase73_arguana_text_pair_adapter_ensemble.md).
+- **ArguAna claim/premise adapter ensemble:** see [phase74_arguana_claim_premise_adapter_ensemble.md](phase74_arguana_claim_premise_adapter_ensemble.md).
 - **Research dashboard (all numbers):** see [research_dashboard.md](research_dashboard.md).
 - **Paperbridge synthesis + next directions:** see [paperbridge_synthesis_next.md](paperbridge_synthesis_next.md).
 - **Corpus adapter library design:** see [corpus_adapter_design.md](corpus_adapter_design.md).

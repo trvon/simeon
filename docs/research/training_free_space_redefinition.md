@@ -74,7 +74,7 @@ Definitions:
 bm25_only                                0.3941
 observed_ordering_entropy_length_router  0.4141
 observed_ordering_entropy_length_qpp_router 0.4169
-observed_ordering_arguana_text_pair_adapter_ensemble 0.4745
+observed_ordering_arguana_claim_premise_adapter_ensemble 0.4780
 oracle_bm25_pool_k100                    0.7423
 oracle_union_4way_k100                   0.8089
 ```
@@ -124,6 +124,7 @@ failure. The best evidence comes from:
 
 - pair-ID adapter gains
 - text-pair adapter ensemble gains
+- claim/premise adapter ensemble gains
 - argument-retrieval literature
 - stance-aware retrieval literature
 

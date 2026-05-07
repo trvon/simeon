@@ -122,14 +122,17 @@ private:
 //   2. clusters candidates by a shared first-N-token header;
 //   3. emits weighted DocRelation scores for the cluster using overlap,
 //      rebuttal-cue, and locality features.
+// Optional claim/premise mode adds opening-window alignment between the query's
+// title/body split and the candidate's first 35 content words.
 //
 // Unlike ArguanaAdapter, this does not use the exact a↔b id pair. It is still
 // corpus-structured, but the signal comes from observable text only.
 // ---------------------------------------------------------------------------
 class ArguanaTextPairAdapter final : public CorpusAdapter {
 public:
-    explicit ArguanaTextPairAdapter(std::uint32_t prefix_terms = 5) noexcept
-        : prefix_terms_(prefix_terms) {}
+    explicit ArguanaTextPairAdapter(std::uint32_t prefix_terms = 5,
+                                    bool claim_premise_mode = false) noexcept
+        : prefix_terms_(prefix_terms), claim_premise_mode_(claim_premise_mode) {}
 
     void seed_doc(std::string_view doc_id, std::string_view doc_text, std::uint32_t doc_index);
 
@@ -145,14 +148,18 @@ private:
         std::string normalized;
         std::vector<std::string> tokens;
         std::unordered_set<std::string> content;
+        std::unordered_set<std::string> first35_content;
     };
 
     std::uint32_t prefix_terms_ = 5;
+    bool claim_premise_mode_ = false;
     std::vector<SeededDoc> docs_;
 
     static std::string normalize_ws_lower(std::string_view text);
     static std::vector<std::string> word_tokens(std::string_view text);
     static std::unordered_set<std::string> content_set(std::string_view text);
+    static std::unordered_set<std::string> content_set_first_words(std::string_view text,
+                                                                   std::uint32_t max_words);
     static float jaccard_set(const std::unordered_set<std::string>& a,
                              const std::unordered_set<std::string>& b);
     static std::uint32_t cue_count(const std::unordered_set<std::string>& toks);

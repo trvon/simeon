@@ -162,7 +162,7 @@ public:
 |---|---|---|
 | `TextAdapter` | Lead-64 tokens | Default |
 | `ArguanaAdapter` | Debate pair IDs | LXV (0.4529) |
-| `ArguanaTextPairAdapter` | Debate-neighborhood text relations | LXXIII (0.4745 overall ensemble) |
+| `ArguanaTextPairAdapter` | Debate-neighborhood text relations; optional claim/premise mode | LXXIV (0.4780 overall ensemble) |
 | `KeyphraseAdapter` | RAKE-style from query | Proposed |
 
 ## Users extend by

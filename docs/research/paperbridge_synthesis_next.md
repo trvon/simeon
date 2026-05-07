@@ -30,7 +30,8 @@ The current universal winner is `observed_ordering_entropy_length_qpp_router`
 
 However, the latest gain over the previous universal winner is only `+0.0028`.
 That is large enough to validate the QPP direction, but the subsequent
-ArguAna text-pair adapter ensemble moves macro to `0.4745`, confirming that the
+ArguAna text-pair adapter ensemble moves macro to `0.4745`, and the
+claim/premise refinement moves it to `0.4780`, confirming that the
 larger remaining gains come from structural branches rather than more router
 micro-tuning.
 
@@ -57,16 +58,18 @@ The structural-gap story is now literature-backed:
 - stance-aware expansion is a real retrieval behavior, not a metaphor
 - best-counterargument retrieval needs simultaneous similarity and dissimilarity,
   not just topic distance
-- attackability is a sentence-level property that may supply missing structure
+- attackability is a plausible structural cue, but naive attackability-weighting
+  regressed our current adapter branch
 
 This is the right frame for why structural adapters dominate universal lexical
 polishing on ArguAna.
 
 ### 4. Generator / representation changes are now more promising than extra gates
 
-The QPP hard-router refinement succeeded, but only marginally. The papers on
-verbose-query term weighting, counterargument retrieval, and document expansion
-all point to a stronger class of interventions than "one more gate":
+The QPP hard-router refinement succeeded, but only marginally. The claim/premise
+adapter refinement then produced the next real lift. Together with the papers on
+verbose-query term weighting, counterargument retrieval, and document expansion,
+this points to a stronger class of interventions than "one more gate":
 
 - change the query representation
 - change the argument representation
@@ -83,9 +86,9 @@ secondary adapter evidence for TREC-COVID, FiQA, and NFCorpus.
 | Phase | Question | Minimal design |
 |---|---|---|
 | LXXIII | Can query shaping beat router-only gains on long or noisy queries? | Detect verbose queries, then test term ranking / concept weighting / dependency-based pruning before retrieval |
-| LXXIV | Can we approximate counterargument structure without leakage? | Treat ArguAna as argument retrieval; search for observable stance / claim / premise / attackability signals and fuse as adapter evidence |
-| LXXV | Can document or candidate expansion beat the current universal ceiling? | Compare local-context analysis and document expansion against RM3-diverse on corpora where exposure or representation still dominates |
-| LXXVI | Do query-salience adapters help entity-heavy corpora? | Compare RAKE / TextRank / YAKE query phrases against local-context-analysis-style co-occurrence evidence |
+| LXXV | Can we approximate counterargument structure without leakage on non-ArguAna corpora? | Transfer claim/premise-aware structural evidence beyond ArguAna-specific page neighborhoods |
+| LXXVI | Can document or candidate expansion beat the current universal ceiling? | Compare local-context analysis and document expansion against RM3-diverse on corpora where exposure or representation still dominates |
+| LXXVII | Do query-salience adapters help entity-heavy corpora? | Compare RAKE / TextRank / YAKE query phrases against local-context-analysis-style co-occurrence evidence |
 
 ## Priority order
 

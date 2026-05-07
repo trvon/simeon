@@ -3077,8 +3077,11 @@ void run_first_generator_slice_oracles(const Fixture& fx, const Bm25WithTiming& 
     simeon::QueryRouter qrouter(bm25.idx);
     const std::array<const simeon::Bm25Index*, 1> qpp_pool_span{&bm25.idx};
     simeon::ArguanaTextPairAdapter arch_argu_text_pair;
+    simeon::ArguanaTextPairAdapter arch_argu_claim_premise_pair(5, true);
     for (std::uint32_t di = 0; di < fx.doc_ids.size(); ++di)
         arch_argu_text_pair.seed_doc(fx.doc_ids[di], fx.doc_texts[di], di);
+    for (std::uint32_t di = 0; di < fx.doc_ids.size(); ++di)
+        arch_argu_claim_premise_pair.seed_doc(fx.doc_ids[di], fx.doc_texts[di], di);
 
     ScoreFn gen_arch_router_v2 = [&](std::uint32_t qi, std::vector<float>& out) {
         std::vector<float> tmp(nd, 0.0f);
@@ -3164,6 +3167,31 @@ void run_first_generator_slice_oracles(const Fixture& fx, const Bm25WithTiming& 
     run_generator_observed("observed_ordering_arguana_text_pair_adapter_ensemble", fx,
                            bm25.build_us + bm25f_lead.build_us + simeon_build_us,
                            gen_arguana_text_pair_adapter_ensemble);
+
+    ScoreFn gen_arguana_claim_premise_adapter_ensemble = [&](std::uint32_t qi,
+                                                             std::vector<float>& out) {
+        const auto feat = qrouter.features_with_pool(
+            fx.query_texts[qi],
+            std::span<const simeon::Bm25Index* const>(qpp_pool_span.data(), qpp_pool_span.size()),
+            50);
+        if (feat.top_k_score_entropy < 0.05f && feat.n_terms > 30u) {
+            auto ev =
+                arch_argu_claim_premise_pair.process_query(fx.query_ids[qi], fx.query_texts[qi]);
+            if (!ev.relations.empty()) {
+                const float neg_inf = -std::numeric_limits<float>::infinity();
+                std::fill(out.begin(), out.end(), neg_inf);
+                for (const auto& rel : ev.relations) {
+                    if (rel.target_doc < out.size())
+                        out[rel.target_doc] = rel.weight;
+                }
+                return;
+            }
+        }
+        gen_entropy_length_qpp_router(qi, out);
+    };
+    run_generator_observed("observed_ordering_arguana_claim_premise_adapter_ensemble", fx,
+                           bm25.build_us + bm25f_lead.build_us + simeon_build_us,
+                           gen_arguana_claim_premise_adapter_ensemble);
 
     // SelfAssessRouter: score all 4, pick best by assess_quality.
     ScoreFn gen_arch_self = [&](std::uint32_t qi, std::vector<float>& out) {

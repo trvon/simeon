@@ -4,7 +4,7 @@
 
 | Scope | System / row | Macro nDCG@10 | Δ vs BM25 |
 |---|---|---:|---:|
-| Best overall | `observed_ordering_arguana_text_pair_adapter_ensemble` | **0.4745** | **+0.0804** |
+| Best overall | `observed_ordering_arguana_claim_premise_adapter_ensemble` | **0.4780** | **+0.0839** |
 | Best adapter | ArguAna pair-ID adapter | 0.4529 | +0.0588 |
 | Best universal | `observed_ordering_entropy_length_qpp_router` | **0.4169** | **+0.0228** |
 | Best scorer | `observed_ordering_rm3_diverse_k10_b0.25` | 0.4108 | +0.0167 |
@@ -16,12 +16,12 @@
 ```text
 BM25 baseline:         0.3941
 Best universal:        0.4169    (+0.0228)
-Best with adapter:     0.4745    (+0.0804)
+Best with adapter:     0.4780    (+0.0839)
 BM25 oracle@100:       0.7423
 4-way union oracle@100 0.8089
 
 Universal gap:         0.7423 - 0.4169 = 0.3254
-Adapter gap:           0.7423 - 0.4745 = 0.2678
+Adapter gap:           0.7423 - 0.4780 = 0.2643
 ```
 
 Interpretation:
@@ -37,7 +37,7 @@ Interpretation:
 | `A` | +0.0588 | ArguAna pair-ID adapter |
 | `S` | +0.0167 | diversity-aware RM3 |
 | `F` | +0.0228 | entropy+length QPP hard router |
-| `A + F` | +0.0804 | ArguAna text-pair adapter ensemble |
+| `A + F` | +0.0839 | ArguAna claim/premise adapter ensemble |
 
 Observation: `A` alone still exceeds `G + S + F` as an observed macro lift.
 
@@ -64,7 +64,8 @@ Observation: `A` alone still exceeds `G + S + F` as an observed macro lift.
 | LVI | gated ensemble | 0.4086 | 3-way entropy hard gate |
 | LXV | ArguAna adapter | 0.4529 | pair-ID structure |
 | LXVII | adapter-aware ensemble | 0.4634 | pair-ID adapter + entropy router |
-| LXXIII | ArguAna text-pair adapter ensemble | **0.4745** | non-id structural branch + QPP router fallback |
+| LXXIII | ArguAna text-pair adapter ensemble | 0.4745 | non-id structural branch + QPP router fallback |
+| LXXIV | ArguAna claim/premise adapter ensemble | **0.4780** | claim/premise-aware opening-window alignment |
 | LXXI | entropy+length router | 0.4141 | verbose-query lead escape hatch |
 | LXXII | entropy+length QPP router | **0.4169** | BM25 rescue gate from NQC + WIG |
 
