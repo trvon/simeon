@@ -48,6 +48,28 @@ const ConceptEntry* ConceptIndex::find(std::uint64_t concept_hash) const noexcep
     return it == concepts_.end() ? nullptr : &it->second;
 }
 
+void ConceptIndex::collect_doc_concepts(std::string_view doc_text,
+                                        const std::function<void(std::uint64_t, float)>& fn) const {
+    if (concepts_.empty() || doc_text.empty())
+        return;
+
+    std::vector<std::uint64_t> words;
+    WordHashSink sink{};
+    sink.out = &words;
+    sink.family = hash_family_;
+    sink.seed = hash_seed_;
+    const auto tcfg = word_only_cfg();
+    tokenize(doc_text, tcfg, sink);
+
+    for (std::size_t i = 1; i < words.size(); ++i) {
+        const std::uint64_t bh = hash_bigram(words[i - 1], words[i]);
+        auto it = concepts_.find(bh);
+        if (it != concepts_.end()) {
+            fn(bh, it->second.pmi);
+        }
+    }
+}
+
 void ConceptIndex::score(std::string_view query, std::span<float> out_scores) const {
     if (concepts_.empty() || out_scores.size() != doc_count_)
         return;

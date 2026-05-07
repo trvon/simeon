@@ -8,13 +8,16 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -26,6 +29,7 @@
 #include "simeon/aho_corasick.hpp"
 #include "simeon/bm25.hpp"
 #include "simeon/concept_mining.hpp"
+#include "simeon/corpus_adapter.hpp"
 #include "simeon/fragment_geometry.hpp"
 #include "simeon/fusion.hpp"
 #include "simeon/glove_embeddings.hpp"
@@ -36,6 +40,7 @@
 #include "simeon/pq.hpp"
 #include "simeon/prf.hpp"
 #include "simeon/query_router.hpp"
+#include "simeon/retrieval_strategy.hpp"
 #include "simeon/simd.hpp"
 #include "simeon/simeon.hpp"
 #include "simeon/text_rank.hpp"
@@ -67,6 +72,236 @@ struct Fixture {
 // chosen recipe, query features, and per-query metrics. Lets post-hoc analysis
 // run without re-executing the bench.
 FILE* g_router_per_query_fp = nullptr;
+
+bool env_truthy(const char* name) {
+    const char* raw = std::getenv(name);
+    return raw && *raw && std::string_view(raw) != "0";
+}
+
+bool arguana_diagnostics_enabled() {
+    return env_truthy("SIMEON_ARGUANA_DIAGNOSTICS");
+}
+
+// -----------------------------------------------------------------------------
+// Research-only ArguAna corpus-structure diagnostics. These helpers intentionally
+// live in the benchmark binary rather than the library: they encode BEIR ArguAna
+// fixture structure used to locate the candidate-pool ceiling, not a general
+// retrieval algorithm. Keep default benchmark output production-facing; enable
+// these rows only with SIMEON_ARGUANA_DIAGNOSTICS=1.
+// -----------------------------------------------------------------------------
+
+struct BenchStringTokenSink final : simeon::NGramEmitter {
+    std::vector<std::string>* out = nullptr;
+    void on_token(std::string_view tok, float) override { out->emplace_back(tok); }
+};
+
+std::vector<std::string> bench_word_tokens(std::string_view text) {
+    std::vector<std::string> out;
+    BenchStringTokenSink sink{};
+    sink.out = &out;
+    simeon::tokenize(text, simeon::TokenizerConfig{0, 0, false, true}, sink);
+    return out;
+}
+
+enum class BenchLanguageProfile : std::uint8_t { English, Spanish, French };
+
+BenchLanguageProfile bench_language_profile_from_env() {
+    const char* raw = std::getenv("SIMEON_LANGUAGE_PROFILE");
+    if (!raw || !*raw)
+        return BenchLanguageProfile::English;
+    std::string v;
+    for (const unsigned char ch : std::string_view(raw)) {
+        if (!std::isspace(ch))
+            v.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    if (v == "es" || v == "spa" || v == "spanish")
+        return BenchLanguageProfile::Spanish;
+    if (v == "fr" || v == "fra" || v == "fre" || v == "french")
+        return BenchLanguageProfile::French;
+    return BenchLanguageProfile::English;
+}
+
+const std::unordered_set<std::string_view>& bench_stopwords(BenchLanguageProfile lang) {
+    static const std::unordered_set<std::string_view> kEnglish = {
+        "a",     "an",     "and",   "are", "as",  "at",   "be",   "by",   "for",   "from", "in",
+        "into",  "is",     "it",    "of",  "on",  "or",   "that", "the",  "their", "this", "to",
+        "was",   "were",   "with",  "we",  "our", "you",  "your", "have", "has",   "had",  "will",
+        "would", "should", "could", "can", "do",  "does", "did",  "they", "them",
+    };
+    static const std::unordered_set<std::string_view> kSpanish = {
+        "un",    "una",      "unos",    "unas",    "y",     "o",      "de",   "del",
+        "la",    "las",      "el",      "los",     "en",    "por",    "para", "con",
+        "sin",   "que",      "se",      "es",      "son",   "ser",    "fue",  "fueron",
+        "como",  "al",       "lo",      "su",      "sus",   "este",   "esta", "estos",
+        "estas", "nosotros", "nuestro", "nuestra", "puede", "pueden",
+    };
+    static const std::unordered_set<std::string_view> kFrench = {
+        "un",  "une",  "des",   "et",    "ou",   "de",    "du",   "la",      "le",
+        "les", "en",   "par",   "pour",  "avec", "sans",  "que",  "qui",     "se",
+        "est", "sont", "etre",  "comme", "au",   "aux",   "son",  "sa",      "ses",
+        "ce",  "cet",  "cette", "ces",   "nous", "notre", "peut", "peuvent",
+    };
+    switch (lang) {
+        case BenchLanguageProfile::Spanish:
+            return kSpanish;
+        case BenchLanguageProfile::French:
+            return kFrench;
+        case BenchLanguageProfile::English:
+        default:
+            return kEnglish;
+    }
+}
+
+bool bench_stopword(std::string_view token, BenchLanguageProfile lang) {
+    return bench_stopwords(lang).contains(token);
+}
+
+std::unordered_set<std::string> bench_content_set(std::string_view text,
+                                                  BenchLanguageProfile lang) {
+    std::unordered_set<std::string> out;
+    for (auto& tok : bench_word_tokens(text)) {
+        if (tok.size() > 2 && !bench_stopword(tok, lang))
+            out.insert(std::move(tok));
+    }
+    return out;
+}
+
+std::unordered_set<std::string> bench_content_set_first_words(std::string_view text,
+                                                              BenchLanguageProfile lang,
+                                                              std::uint32_t max_words) {
+    std::unordered_set<std::string> out;
+    auto words = bench_word_tokens(text);
+    const std::uint32_t n =
+        std::min<std::uint32_t>(max_words, static_cast<std::uint32_t>(words.size()));
+    for (std::uint32_t i = 0; i < n; ++i) {
+        auto& tok = words[i];
+        if (tok.size() > 2 && !bench_stopword(tok, lang))
+            out.insert(std::move(tok));
+    }
+    return out;
+}
+
+float jaccard_set(const std::unordered_set<std::string>& a,
+                  const std::unordered_set<std::string>& b) {
+    if (a.empty() && b.empty())
+        return 0.0f;
+    const auto* small = &a;
+    const auto* large = &b;
+    if (small->size() > large->size())
+        std::swap(small, large);
+    std::uint32_t inter = 0;
+    for (const auto& x : *small) {
+        if (large->contains(x))
+            ++inter;
+    }
+    const std::uint32_t uni = static_cast<std::uint32_t>(a.size() + b.size() - inter);
+    return uni ? static_cast<float>(inter) / static_cast<float>(uni) : 0.0f;
+}
+
+std::string arguana_topic_stem(std::string_view id) {
+    const std::size_t dash = id.rfind('-');
+    if (dash == std::string_view::npos)
+        return std::string(id);
+    const std::string_view tail = id.substr(dash + 1);
+    if (tail.size() >= 5 && (tail.substr(0, 3) == "pro" || tail.substr(0, 3) == "con") &&
+        (tail.back() == 'a' || tail.back() == 'b')) {
+        bool digits = true;
+        for (std::size_t i = 3; i + 1 < tail.size(); ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(tail[i]))) {
+                digits = false;
+                break;
+            }
+        }
+        if (digits)
+            return std::string(id.substr(0, dash));
+    }
+    return std::string(id);
+}
+
+struct ArguanaPointKey {
+    std::string topic;
+    std::string_view stance;
+    std::string_view point;
+    bool valid = false;
+};
+
+ArguanaPointKey arguana_point_key(std::string_view id) {
+    const std::size_t dash = id.rfind('-');
+    if (dash == std::string_view::npos)
+        return {};
+    const std::string_view tail = id.substr(dash + 1);
+    if (tail.size() < 5 || (tail.substr(0, 3) != "pro" && tail.substr(0, 3) != "con") ||
+        (tail.back() != 'a' && tail.back() != 'b'))
+        return {};
+    for (std::size_t i = 3; i + 1 < tail.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(tail[i])))
+            return {};
+    }
+    return ArguanaPointKey{std::string(id.substr(0, dash)), tail.substr(0, 3),
+                           tail.substr(3, tail.size() - 4), true};
+}
+
+const std::unordered_set<std::string_view>& bench_cues(BenchLanguageProfile lang) {
+    static const std::unordered_set<std::string_view> kEnglish = {
+        "not",      "no",        "never",      "however", "but",          "although", "despite",
+        "instead",  "rather",    "whereas",    "while",   "counterpoint", "fail",     "fails",
+        "failed",   "unlikely",  "cannot",     "less",    "insufficient", "wrong",    "problem",
+        "problems", "expensive", "harm",       "harmful", "risk",         "risks",    "impossible",
+        "oppose",   "opposing",  "opposition",
+    };
+    static const std::unordered_set<std::string_view> kSpanish = {
+        "no",        "nunca",      "jamas",     "sin embargo",  "pero",       "aunque",
+        "a pesar",   "en cambio",  "mientras",  "contrapunto",  "fracasa",    "fallo",
+        "fallan",    "improbable", "menos",     "insuficiente", "incorrecto", "problema",
+        "problemas", "caro",       "danino",    "riesgo",       "riesgos",    "imposible",
+        "opone",     "opuesto",    "oposicion",
+    };
+    static const std::unordered_set<std::string_view> kFrench = {
+        "non",         "ne",         "jamais",      "cependant",  "mais",  "bien",       "malgre",
+        "plutot",      "tandis",     "contrepoint", "echoue",     "echec", "improbable", "moins",
+        "insuffisant", "faux",       "probleme",    "problemes",  "cher",  "nocif",      "risque",
+        "risques",     "impossible", "oppose",      "opposition",
+    };
+    switch (lang) {
+        case BenchLanguageProfile::Spanish:
+            return kSpanish;
+        case BenchLanguageProfile::French:
+            return kFrench;
+        case BenchLanguageProfile::English:
+        default:
+            return kEnglish;
+    }
+}
+
+std::uint32_t cue_count(const std::unordered_set<std::string>& toks, BenchLanguageProfile lang) {
+    const auto& cues = bench_cues(lang);
+    std::uint32_t n = 0;
+    for (const auto& tok : toks) {
+        if (cues.contains(tok))
+            ++n;
+    }
+    return n;
+}
+
+std::string normalize_ws_lower(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    bool in_space = true;
+    for (unsigned char ch : text) {
+        if (std::isspace(ch)) {
+            if (!in_space) {
+                out.push_back(' ');
+                in_space = true;
+            }
+        } else {
+            out.push_back(static_cast<char>(std::tolower(ch)));
+            in_space = false;
+        }
+    }
+    if (!out.empty() && out.back() == ' ')
+        out.pop_back();
+    return out;
+}
 
 #ifdef SIMEON_RESEARCH_BENCH
 enum class AuxFieldMode : std::uint8_t {
@@ -465,6 +700,25 @@ std::vector<std::string> build_textrank_titles(const Fixture& fx) {
     return out;
 }
 
+std::vector<std::string> build_lead_token_field(const Fixture& fx, std::uint32_t max_tokens) {
+    std::vector<std::string> out;
+    out.reserve(fx.doc_texts.size());
+    std::vector<std::string> toks;
+    for (const auto& doc : fx.doc_texts) {
+        tokenize_words(doc, toks);
+        std::string lead;
+        const std::uint32_t n =
+            std::min<std::uint32_t>(max_tokens, static_cast<std::uint32_t>(toks.size()));
+        for (std::uint32_t i = 0; i < n; ++i) {
+            if (!lead.empty())
+                lead.push_back(' ');
+            lead += toks[i];
+        }
+        out.push_back(std::move(lead));
+    }
+    return out;
+}
+
 std::vector<std::string> build_ac_dictionary(const Fixture& fx) {
     simeon::TextRank ranker;
     std::unordered_map<std::string, std::uint32_t> phrase_df;
@@ -833,8 +1087,11 @@ struct Metrics {
 };
 
 // Per-query: scored[i] is (score, doc_idx). Higher score = better rank.
-Metrics score_rankings(const std::vector<std::vector<std::pair<float, std::uint32_t>>>& rankings,
-                       const Fixture& fx) {
+// `per_query_ndcg` (if non-null) is filled with one nDCG@10 value per query
+// in fx order; queries without qrels get NaN (matches the n_eval skip).
+Metrics
+score_rankings_full(const std::vector<std::vector<std::pair<float, std::uint32_t>>>& rankings,
+                    const Fixture& fx, std::vector<double>* per_query_ndcg = nullptr) {
     // Bucket qrels by query.
     std::unordered_map<std::uint32_t, std::unordered_map<std::uint32_t, std::uint32_t>> rel;
     for (const auto& q : fx.qrels)
@@ -842,6 +1099,8 @@ Metrics score_rankings(const std::vector<std::vector<std::pair<float, std::uint3
 
     double ndcg10_sum = 0.0, p10_sum = 0.0, r10_sum = 0.0, r100_sum = 0.0, mrr10_sum = 0.0;
     std::size_t n_eval = 0;
+    if (per_query_ndcg)
+        per_query_ndcg->assign(rankings.size(), std::numeric_limits<double>::quiet_NaN());
 
     for (std::uint32_t qi = 0; qi < rankings.size(); ++qi) {
         auto it = rel.find(qi);
@@ -885,7 +1144,10 @@ Metrics score_rankings(const std::vector<std::vector<std::pair<float, std::uint3
         for (std::size_t r = 0; r < rels.size() && r < 10; ++r) {
             idcg += static_cast<double>(rels[r]) / std::log2(static_cast<double>(r) + 2.0);
         }
-        ndcg10_sum += idcg > 0.0 ? dcg / idcg : 0.0;
+        const double q_ndcg = idcg > 0.0 ? dcg / idcg : 0.0;
+        ndcg10_sum += q_ndcg;
+        if (per_query_ndcg)
+            (*per_query_ndcg)[qi] = q_ndcg;
         p10_sum += static_cast<double>(hits10) / 10.0;
 
         const double denom10 = static_cast<double>(std::min<std::size_t>(10, qrel.size()));
@@ -897,6 +1159,38 @@ Metrics score_rankings(const std::vector<std::vector<std::pair<float, std::uint3
 
     const double n = static_cast<double>(n_eval == 0 ? 1 : n_eval);
     return {ndcg10_sum / n, p10_sum / n, r10_sum / n, r100_sum / n, mrr10_sum / n, n_eval};
+}
+
+Metrics score_rankings(const std::vector<std::vector<std::pair<float, std::uint32_t>>>& rankings,
+                       const Fixture& fx) {
+    return score_rankings_full(rankings, fx, nullptr);
+}
+
+// If env var SIMEON_PER_QUERY_DUMP is set, write per-query nDCG to
+// ${SIMEON_PER_QUERY_DUMP}.${config_name}.jsonl with one line per query:
+// {"qi":N,"qid":"...","n_qrels":N,"ndcg":0.xxxx}
+void dump_per_query_ndcg_if_env(const char* config_name, const Fixture& fx,
+                                const std::vector<double>& per_query_ndcg) {
+    const char* base = std::getenv("SIMEON_PER_QUERY_DUMP");
+    if (!base || !*base)
+        return;
+    std::string path = std::string(base) + "." + config_name + ".jsonl";
+    std::FILE* fp = std::fopen(path.c_str(), "w");
+    if (!fp)
+        return;
+    // Per-query qrel count for downstream filtering / interpretation.
+    std::unordered_map<std::uint32_t, std::uint32_t> n_qrels_per_q;
+    for (const auto& q : fx.qrels)
+        ++n_qrels_per_q[q.q];
+    for (std::uint32_t qi = 0; qi < per_query_ndcg.size(); ++qi) {
+        const double v = per_query_ndcg[qi];
+        if (!std::isfinite(v))
+            continue;
+        const std::uint32_t nq = n_qrels_per_q.count(qi) ? n_qrels_per_q[qi] : 0u;
+        std::fprintf(fp, "{\"qi\":%u,\"qid\":\"%s\",\"n_qrels\":%u,\"ndcg\":%.6f}\n", qi,
+                     qi < fx.query_ids.size() ? fx.query_ids[qi].c_str() : "", nq, v);
+    }
+    std::fclose(fp);
 }
 
 // Optional per-config timings. Zero means "not measured" — emit() omits the field.
@@ -1108,6 +1402,2212 @@ void run_bm25(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
     t.query_us = elapsed_us(t0);
     // BM25 has no per-doc fixed footprint (variable inverted-index size); emit 0.
     emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+// Oracle upper bound for any reranker over the BM25 top-K candidate pool.
+// For each query: take the BM25 top-K, score each pool member by its qrel
+// value (graded relevance preserved), score everything else as -inf. The
+// resulting nDCG@10 is the supremum of nDCG@10(reranker(BM25_top_K)) over
+// all permutations, i.e. the achievable ceiling of any candidate-set-bound
+// rerank strategy. Quantifies "Ceiling A" (the candidate-pool determinism
+// bound) for the first time as a per-corpus per-fold number.
+void run_oracle_pool(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
+                     double build_us, std::uint32_t pool_size = 100) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+
+    // Bucket qrels by query index for O(1) lookup during scoring.
+    std::unordered_map<std::uint32_t, std::unordered_map<std::uint32_t, std::uint32_t>> rel;
+    for (const auto& q : fx.qrels)
+        rel[q.q][q.d] = q.rel;
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> bm25_scores(nd, 0.0f);
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        idx.score(fx.query_texts[qi], bm25_scores);
+        auto pool = simeon::top_k(bm25_scores, pool_size);
+        rankings[qi].assign(nd, std::pair<float, std::uint32_t>{neg_inf, 0});
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi][di].second = di;
+        // Score pool members by their qrel (0 if not in qrels). Outside-pool
+        // docs keep -inf so they sort last.
+        const auto rit = rel.find(qi);
+        for (const auto& [did, _bm] : pool) {
+            float g = 0.0f;
+            if (rit != rel.end()) {
+                const auto qit = rit->second.find(did);
+                if (qit != rit->second.end())
+                    g = static_cast<float>(qit->second);
+            }
+            rankings[qi][did].first = g;
+        }
+    }
+    t.query_us = elapsed_us(t0);
+    std::vector<double> per_q;
+    auto m = score_rankings_full(rankings, fx, &per_q);
+    dump_per_query_ndcg_if_env(name, fx, per_q);
+    emit(name, fx, m, 0, t);
+}
+
+using ScoreFn = std::function<void(std::uint32_t, std::vector<float>&)>;
+
+void run_generator_slice_oracle(const char* name, const Fixture& fx, double build_us,
+                                std::uint32_t pool_size, ScoreFn score_fn) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+
+    std::unordered_map<std::uint32_t, std::unordered_map<std::uint32_t, std::uint32_t>> rel;
+    for (const auto& q : fx.qrels)
+        rel[q.q][q.d] = q.rel;
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> scores(nd, 0.0f);
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        std::fill(scores.begin(), scores.end(), 0.0f);
+        score_fn(qi, scores);
+        auto pool = simeon::top_k(scores, pool_size);
+        rankings[qi].assign(nd, std::pair<float, std::uint32_t>{neg_inf, 0});
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi][di].second = di;
+        const auto rit = rel.find(qi);
+        for (const auto& [did, _score] : pool) {
+            float g = 0.0f;
+            if (rit != rel.end()) {
+                const auto qit = rit->second.find(did);
+                if (qit != rit->second.end())
+                    g = static_cast<float>(qit->second);
+            }
+            rankings[qi][did].first = g;
+        }
+    }
+    t.query_us = elapsed_us(t0);
+    std::vector<double> per_q;
+    auto m = score_rankings_full(rankings, fx, &per_q);
+    dump_per_query_ndcg_if_env(name, fx, per_q);
+    emit(name, fx, m, 0, t);
+}
+
+void run_union_generator_slice_oracle(const char* name, const Fixture& fx, double build_us,
+                                      std::uint32_t pool_size,
+                                      std::span<const ScoreFn> generators) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+
+    std::unordered_map<std::uint32_t, std::unordered_map<std::uint32_t, std::uint32_t>> rel;
+    for (const auto& q : fx.qrels)
+        rel[q.q][q.d] = q.rel;
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> scores(nd, 0.0f);
+    std::vector<std::uint8_t> in_pool(nd, 0u);
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        std::fill(in_pool.begin(), in_pool.end(), 0u);
+        for (const auto& gen : generators) {
+            std::fill(scores.begin(), scores.end(), 0.0f);
+            gen(qi, scores);
+            for (const auto& [did, _score] : simeon::top_k(scores, pool_size))
+                in_pool[did] = 1u;
+        }
+        rankings[qi].assign(nd, std::pair<float, std::uint32_t>{neg_inf, 0});
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi][di].second = di;
+        const auto rit = rel.find(qi);
+        for (std::uint32_t did = 0; did < nd; ++did) {
+            if (!in_pool[did])
+                continue;
+            float g = 0.0f;
+            if (rit != rel.end()) {
+                const auto qit = rit->second.find(did);
+                if (qit != rit->second.end())
+                    g = static_cast<float>(qit->second);
+            }
+            rankings[qi][did].first = g;
+        }
+    }
+    t.query_us = elapsed_us(t0);
+    std::vector<double> per_q;
+    auto m = score_rankings_full(rankings, fx, &per_q);
+    dump_per_query_ndcg_if_env(name, fx, per_q);
+    emit(name, fx, m, 0, t);
+}
+
+void run_generator_observed(const char* name, const Fixture& fx, double build_us,
+                            ScoreFn generator) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> scores(nd, 0.0f);
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        std::fill(scores.begin(), scores.end(), 0.0f);
+        generator(qi, scores);
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(scores[di], di);
+    }
+    t.query_us = elapsed_us(t0);
+    std::vector<double> per_q;
+    auto m = score_rankings_full(rankings, fx, &per_q);
+    dump_per_query_ndcg_if_env(name, fx, per_q);
+    emit(name, fx, m, 0, t);
+}
+
+void run_union_generator_weighted_z(const char* name, const Fixture& fx, double build_us,
+                                    std::span<const ScoreFn> generators,
+                                    std::span<const float> weights) {
+    if (generators.size() != weights.size())
+        throw std::runtime_error("weighted_z generator/weight size mismatch");
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> scores(nd, 0.0f);
+    std::vector<float> fused(nd, 0.0f);
+
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        std::fill(fused.begin(), fused.end(), 0.0f);
+        for (std::size_t gi = 0; gi < generators.size(); ++gi) {
+            std::fill(scores.begin(), scores.end(), 0.0f);
+            generators[gi](qi, scores);
+            zscore_inplace(scores);
+            for (std::uint32_t di = 0; di < nd; ++di)
+                fused[di] += weights[gi] * scores[di];
+        }
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(fused[di], di);
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+float topk_jaccard_from_scores(const std::vector<float>& a, const std::vector<float>& b,
+                               std::uint32_t k) {
+    auto ta = simeon::top_k(a, std::min<std::uint32_t>(k, static_cast<std::uint32_t>(a.size())));
+    auto tb = simeon::top_k(b, std::min<std::uint32_t>(k, static_cast<std::uint32_t>(b.size())));
+    if (ta.empty() && tb.empty())
+        return 1.0f;
+    std::unordered_set<std::uint32_t> sa;
+    sa.reserve(ta.size() * 2);
+    for (const auto& [did, score] : ta)
+        sa.insert(did);
+    std::uint32_t inter = 0;
+    for (const auto& [did, score] : tb) {
+        void;
+        if (sa.find(did) != sa.end())
+            ++inter;
+    }
+    const std::uint32_t uni = static_cast<std::uint32_t>(ta.size() + tb.size()) - inter;
+    return uni == 0 ? 0.0f : static_cast<float>(inter) / static_cast<float>(uni);
+}
+
+constexpr float topk_score_decay_from_scores(const std::vector<float>& s, std::uint32_t k) {
+    auto t = simeon::top_k(s, std::min<std::uint32_t>(k, static_cast<std::uint32_t>(s.size())));
+    if (t.size() < 2)
+        return 0.0f;
+    const float top = t.front().second;
+    const float kth = t.back().second;
+    const float denom = std::max(1e-6f, std::fabs(top));
+    return (top - kth) / denom;
+}
+
+float pearson_over_union_pool(const std::vector<float>& a, const std::vector<float>& b,
+                              std::uint32_t k) {
+    auto ta = simeon::top_k(a, std::min<std::uint32_t>(k, static_cast<std::uint32_t>(a.size())));
+    auto tb = simeon::top_k(b, std::min<std::uint32_t>(k, static_cast<std::uint32_t>(b.size())));
+    std::unordered_set<std::uint32_t> pool;
+    pool.reserve((ta.size() + tb.size()) * 2);
+    for (const auto& [did, score] : ta)
+        pool.insert(did);
+    for (const auto& [did, score] : tb)
+        pool.insert(did);
+    if (pool.size() < 2)
+        return 0.0f;
+    double ma = 0.0, mb = 0.0;
+    for (std::uint32_t did : pool) {
+        ma += a[did];
+        mb += b[did];
+    }
+    ma /= static_cast<double>(pool.size());
+    mb /= static_cast<double>(pool.size());
+    double num = 0.0, va = 0.0, vb = 0.0;
+    for (std::uint32_t did : pool) {
+        const double da = static_cast<double>(a[did]) - ma;
+        const double db = static_cast<double>(b[did]) - mb;
+        num += da * db;
+        va += da * da;
+        vb += db * db;
+    }
+    const double den = std::sqrt(va * vb);
+    return den <= 1e-12 ? 0.0f : static_cast<float>(num / den);
+}
+
+float topk_softmax_entropy_from_scores(const std::vector<float>& s, std::uint32_t k) {
+    auto t = simeon::top_k(s, std::min<std::uint32_t>(k, static_cast<std::uint32_t>(s.size())));
+    if (t.size() < 2)
+        return 0.0f;
+    const float mx = t.front().second;
+    double sum = 0.0;
+    std::vector<double> weights;
+    weights.reserve(t.size());
+    for (const auto& [did, score] : t) {
+        (void)did;
+        const double w = std::exp(static_cast<double>(score - mx));
+        weights.push_back(w);
+        sum += w;
+    }
+    if (sum <= 0.0)
+        return 0.0f;
+    double h = 0.0;
+    for (double w : weights) {
+        const double p = w / sum;
+        if (p > 0.0)
+            h -= p * std::log(p);
+    }
+    return static_cast<float>(h / std::log(static_cast<double>(weights.size())));
+}
+
+constexpr float top2_margin_from_scores(const std::vector<float>& s) {
+    auto t = simeon::top_k(s, std::min<std::uint32_t>(2, static_cast<std::uint32_t>(s.size())));
+    if (t.size() < 2)
+        return 0.0f;
+    const float denom = std::max(1e-6f, std::fabs(t[0].second));
+    return (t[0].second - t[1].second) / denom;
+}
+
+constexpr float top1_same_from_scores(const std::vector<float>& a, const std::vector<float>& b) {
+    auto ta = simeon::top_k(a, std::min<std::uint32_t>(1, static_cast<std::uint32_t>(a.size())));
+    auto tb = simeon::top_k(b, std::min<std::uint32_t>(1, static_cast<std::uint32_t>(b.size())));
+    if (ta.empty() || tb.empty())
+        return 0.0f;
+    return ta.front().first == tb.front().first ? 1.0f : 0.0f;
+}
+
+void zscore_pool_values(std::vector<float>& values,
+                        std::span<const std::pair<std::uint32_t, float>> pool) {
+    if (pool.empty())
+        return;
+    double mean = 0.0;
+    for (const auto& [did, score] : pool)
+        mean += values[did];
+    mean /= static_cast<double>(pool.size());
+    double var = 0.0;
+    for (const auto& [did, score] : pool) {
+        void;
+        const double d = static_cast<double>(values[did]) - mean;
+        var += d * d;
+    }
+    const double sd = std::sqrt(var / static_cast<double>(pool.size()));
+    if (sd <= 1e-9) {
+        for (const auto& [did, score] : pool)
+            values[did] = 0.0f;
+        return;
+    }
+    for (const auto& [did, score] : pool)
+        values[did] = static_cast<float>((static_cast<double>(values[did]) - mean) / sd);
+}
+
+void run_pool_lexical_evidence_rerank(const char* name, const Fixture& fx,
+                                      const simeon::Bm25Index& idx, double build_us,
+                                      float overlap_weight, float phrase_weight,
+                                      std::uint32_t pool_k) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<SparseSignature> doc_sigs;
+    doc_sigs.reserve(nd);
+    std::vector<std::vector<std::uint64_t>> doc_hashes(nd);
+    auto prep0 = Clock::now();
+    for (std::uint32_t di = 0; di < nd; ++di) {
+        doc_sigs.push_back(build_sparse_signature(idx, fx.doc_texts[di], 64));
+        build_doc_hash_tokens(idx, fx.doc_texts[di], doc_hashes[di]);
+    }
+    t.index_build_us += elapsed_us(prep0);
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> bm25(nd, 0.0f), bm25_z(nd, 0.0f), overlap(nd, 0.0f), phrase(nd, 0.0f),
+        fused(nd, -std::numeric_limits<float>::infinity());
+
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        std::fill(bm25.begin(), bm25.end(), 0.0f);
+        idx.score(fx.query_texts[qi], bm25);
+        auto pool = simeon::top_k(bm25, std::min<std::uint32_t>(pool_k, nd));
+        bm25_z = bm25;
+        zscore_inplace(bm25_z);
+        std::fill(overlap.begin(), overlap.end(), 0.0f);
+        std::fill(phrase.begin(), phrase.end(), 0.0f);
+        const auto qsig = build_sparse_signature(idx, fx.query_texts[qi], 48);
+        const auto phrases = build_query_phrase_nodes(idx, fx.query_texts[qi]);
+        for (const auto& [did, score] : pool) {
+            void;
+            overlap[did] = weighted_containment(qsig, doc_sigs[did]);
+            if (!phrases.empty()) {
+                auto pw = compute_doc_phrase_weights(doc_hashes[did], phrases, 8);
+                phrase[did] = std::accumulate(pw.begin(), pw.end(), 0.0f);
+            }
+        }
+        zscore_pool_values(overlap, std::span<const std::pair<std::uint32_t, float>>(pool));
+        zscore_pool_values(phrase, std::span<const std::pair<std::uint32_t, float>>(pool));
+        std::fill(fused.begin(), fused.end(), -std::numeric_limits<float>::infinity());
+        for (const auto& [did, score] : pool) {
+            void;
+            fused[did] = bm25_z[did] + overlap_weight * overlap[did] + phrase_weight * phrase[did];
+        }
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(fused[di], di);
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+// =========================================================================
+// Consolidated helpers shared across research ScoreFns (Phases LII–LXIX).
+// A single copy of each algorithm, parameterised, testable, no duplication.
+// =========================================================================
+
+// Greedy MMR selection: from `candidates` (top-K BM25), select `sel_k` docs
+// maximising BM25 × simeon_sim_q − β × max_sim_to_already_selected.
+// Returns (selected_doc_ids, selected_bm25_scores).
+struct MmrResult {
+    std::vector<std::uint32_t> ids;
+    std::vector<float> bm25_scores;
+};
+MmrResult mmr_select_docs(const std::vector<std::pair<std::uint32_t, float>>& candidates,
+                          const std::vector<float>& cand_sim, // simeon sim per candidate
+                          const std::vector<float>& simeon_dembs, std::uint32_t sdim,
+                          std::uint32_t sel_k, float beta) {
+    const auto n = candidates.size();
+    std::vector<bool> used(n, false);
+    std::vector<std::uint32_t> sel_dids, sel_ids;
+    std::vector<float> sel_bm25;
+    for (std::uint32_t sel = 0; sel < sel_k && sel < n; ++sel) {
+        float best_mmr = -1e9f;
+        std::size_t best_i = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (used[i])
+                continue;
+            float reward = candidates[i].second * std::max(0.0f, cand_sim[i]);
+            float penalty = 0.0f;
+            for (std::size_t j = 0; j < sel_dids.size(); ++j) {
+                float sim = dot(simeon_dembs.data() + candidates[i].first * sdim,
+                                simeon_dembs.data() + sel_dids[j] * sdim, sdim);
+                if (sim > penalty)
+                    penalty = sim;
+            }
+            float mmr = reward - beta * penalty;
+            if (mmr > best_mmr) {
+                best_mmr = mmr;
+                best_i = i;
+            }
+        }
+        used[best_i] = true;
+        sel_dids.push_back(candidates[best_i].first);
+        sel_ids.push_back(candidates[best_i].first);
+        sel_bm25.push_back(candidates[best_i].second);
+    }
+    return {std::move(sel_ids), std::move(sel_bm25)};
+}
+
+// Tokenize query into words, hash each via idx.hash_term().
+// Returns the term hashes in arbitrary order.
+std::vector<std::uint64_t> hash_query_words(std::string_view query, const simeon::Bm25Index& idx) {
+    struct Sink : simeon::NGramEmitter {
+        std::vector<std::uint64_t>* hashes = nullptr;
+        const simeon::Bm25Index* idx_ptr = nullptr;
+        void on_token(std::string_view tok, float) override {
+            if (hashes && idx_ptr)
+                hashes->push_back(idx_ptr->hash_term(tok));
+        }
+    };
+    std::vector<std::uint64_t> out;
+    simeon::TokenizerConfig tcfg;
+    tcfg.emit_word = true;
+    tcfg.emit_char = false;
+    Sink sink;
+    sink.hashes = &out;
+    sink.idx_ptr = &idx;
+    simeon::tokenize(query, tcfg, sink);
+    return out;
+}
+
+// Blend original query hashes with RM expansion terms (α=0.5), score via
+// weighted-hash path.  out_scores must be pre-zeroed and sized to doc_count().
+void score_rm_blended(const simeon::Bm25Index& idx, std::span<const std::uint64_t> q_hashes,
+                      std::span<const std::pair<std::uint64_t, float>> rm_terms,
+                      std::span<float> out_scores) {
+    constexpr float alpha = 0.5f;
+    std::unordered_map<std::uint64_t, float> combined;
+    combined.reserve(q_hashes.size() + rm_terms.size());
+    if (!q_hashes.empty()) [[likely]] {
+        const float q_total = static_cast<float>(q_hashes.size());
+        for (std::uint64_t h : q_hashes)
+            combined[h] += (1.0f - alpha) * (1.0f / q_total);
+    }
+    for (const auto& [h, w] : rm_terms)
+        combined[h] += alpha * w;
+
+    std::vector<std::pair<std::uint64_t, float>> weighted;
+    weighted.reserve(combined.size());
+    for (const auto& [h, w] : combined)
+        weighted.emplace_back(h, w);
+    std::sort(weighted.begin(), weighted.end());
+    idx.score_weighted_hashes(weighted, out_scores);
+}
+
+// Compute simeon-weighted + MMR-diverse doc weights from BM25 top-candidates.
+// Returns (selected_doc_ids, doc_weights).  Empty if no feedback docs found.
+struct DocWeightResult {
+    std::vector<std::uint32_t> ids;
+    std::vector<float> weights;
+};
+DocWeightResult compute_diverse_feedback_weights(const simeon::Bm25Index& idx,
+                                                 const std::vector<float>& first_pass_scores,
+                                                 const std::vector<float>& simeon_dembs,
+                                                 const std::vector<float>& simeon_qembs,
+                                                 std::uint32_t qi, std::uint32_t sdim,
+                                                 std::uint32_t candidate_k, std::uint32_t select_k,
+                                                 float mmr_beta) {
+    auto tk = simeon::top_k(first_pass_scores, candidate_k);
+    if (tk.empty())
+        return {};
+    const float* qemb = simeon_qembs.data() + qi * sdim;
+    std::vector<float> cand_sim(tk.size(), 0.0f);
+    for (std::size_t i = 0; i < tk.size(); ++i)
+        cand_sim[i] = dot(qemb, simeon_dembs.data() + tk[i].first * sdim, sdim);
+
+    auto mmr = mmr_select_docs(tk, cand_sim, simeon_dembs, sdim, select_k, mmr_beta);
+    if (mmr.ids.empty())
+        return {};
+
+    float bm25_sum = 0.0f;
+    for (float s : mmr.bm25_scores)
+        bm25_sum += s;
+    std::vector<float> doc_weights(mmr.ids.size(), 0.0f);
+    float w_sum = 0.0f;
+    for (std::size_t i = 0; i < mmr.ids.size(); ++i) {
+        float sim_q = dot(qemb, simeon_dembs.data() + mmr.ids[i] * sdim, sdim);
+        doc_weights[i] = (mmr.bm25_scores[i] / bm25_sum) * std::max(0.0f, sim_q);
+        w_sum += doc_weights[i];
+    }
+    if (w_sum > 0.0f)
+        for (float& w : doc_weights)
+            w /= w_sum;
+    else
+        return {};
+
+    return {std::move(mmr.ids), std::move(doc_weights)};
+}
+
+// -------------------------------------------------------------------------
+// End consolidated helpers
+// -------------------------------------------------------------------------
+
+void run_shape_risk_z_fusion(const char* name, const Fixture& fx, double build_us, ScoreFn gen_bm25,
+                             ScoreFn gen_bm25f, ScoreFn gen_rm3, bool hard_gate) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> raw_bm25(nd, 0.0f), raw_bm25f(nd, 0.0f), raw_rm3(nd, 0.0f);
+    std::vector<float> z_bm25(nd, 0.0f), z_bm25f(nd, 0.0f), z_rm3(nd, 0.0f), z_equal(nd, 0.0f),
+        fused(nd, 0.0f);
+
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        std::fill(raw_bm25.begin(), raw_bm25.end(), 0.0f);
+        std::fill(raw_bm25f.begin(), raw_bm25f.end(), 0.0f);
+        std::fill(raw_rm3.begin(), raw_rm3.end(), 0.0f);
+        gen_bm25(qi, raw_bm25);
+        gen_bm25f(qi, raw_bm25f);
+        gen_rm3(qi, raw_rm3);
+
+        z_bm25 = raw_bm25;
+        z_bm25f = raw_bm25f;
+        z_rm3 = raw_rm3;
+        zscore_inplace(z_bm25);
+        zscore_inplace(z_bm25f);
+        zscore_inplace(z_rm3);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            z_equal[di] = z_bm25[di] + z_bm25f[di] + z_rm3[di];
+
+        const float bm25_margin2 = top2_margin_from_scores(raw_bm25);
+        const float bm25_rm3_jaccard100 = topk_jaccard_from_scores(raw_bm25, raw_rm3, 100);
+        float lambda = 0.0f;
+        if (hard_gate) {
+            lambda = (bm25_margin2 >= 0.01939f && bm25_rm3_jaccard100 <= 0.7544f) ? 1.0f : 0.0f;
+        } else {
+            const float confidence = std::clamp(bm25_margin2 / 0.01939f, 0.0f, 1.0f);
+            const float drift = std::clamp((0.7544f - bm25_rm3_jaccard100) / 0.2544f, 0.0f, 1.0f);
+            lambda = confidence * drift;
+        }
+        for (std::uint32_t di = 0; di < nd; ++di)
+            fused[di] = (1.0f - lambda) * z_bm25[di] + lambda * z_equal[di];
+
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(fused[di], di);
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+void dump_structural_winner_features_if_env(const Fixture& fx, const simeon::Bm25Index& feature_idx,
+                                            ScoreFn gen_bm25, ScoreFn gen_lead64,
+                                            ScoreFn gen_shape_risk) {
+    const char* path = std::getenv("SIMEON_STRUCT_WINNER_DUMP");
+    if (!path || !*path)
+        return;
+    std::FILE* fp = std::fopen(path, "w");
+    if (!fp)
+        return;
+
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::unordered_map<std::uint32_t, std::unordered_map<std::uint32_t, std::uint32_t>> rel;
+    for (const auto& q : fx.qrels)
+        rel[q.q][q.d] = q.rel;
+
+    simeon::QueryRouter router(feature_idx);
+    std::array<std::vector<float>, 3> scores{
+        std::vector<float>(nd, 0.0f), std::vector<float>(nd, 0.0f), std::vector<float>(nd, 0.0f)};
+    constexpr std::array<const char*, 3> names{"bm25", "lead64", "shape_risk"};
+
+    auto q_ndcg = [&](std::uint32_t qi, const std::vector<float>& s) -> double {
+        std::vector<std::pair<float, std::uint32_t>> ranking;
+        ranking.reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            ranking.emplace_back(s[di], di);
+        std::vector<std::vector<std::pair<float, std::uint32_t>>> one_rankings(1);
+        one_rankings[0] = std::move(ranking);
+        Fixture one_fx;
+        one_fx.query_ids.push_back(fx.query_ids[qi]);
+        one_fx.query_texts.push_back(fx.query_texts[qi]);
+        one_fx.doc_ids = fx.doc_ids;
+        one_fx.doc_texts = fx.doc_texts;
+        one_fx.ref_dim = fx.ref_dim;
+        one_fx.ref_model = fx.ref_model;
+        const auto rit = rel.find(qi);
+        if (rit != rel.end()) {
+            for (const auto& [d, r] : rit->second)
+                one_fx.qrels.push_back(Fixture::Qrel{0, d, r});
+        }
+        return score_rankings(one_rankings, one_fx).ndcg_at_10;
+    };
+
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        for (auto& s : scores)
+            std::fill(s.begin(), s.end(), 0.0f);
+        gen_bm25(qi, scores[0]);
+        gen_lead64(qi, scores[1]);
+        gen_shape_risk(qi, scores[2]);
+        std::array<double, 3> ndcgs{};
+        std::uint32_t best = 0;
+        for (std::uint32_t i = 0; i < ndcgs.size(); ++i) {
+            ndcgs[i] = q_ndcg(qi, scores[i]);
+            if (ndcgs[i] > ndcgs[best])
+                best = i;
+        }
+        const float bm25_lead_jaccard10 = topk_jaccard_from_scores(scores[0], scores[1], 10);
+        const float bm25_lead_jaccard50 = topk_jaccard_from_scores(scores[0], scores[1], 50);
+        const float bm25_lead_jaccard100 = topk_jaccard_from_scores(scores[0], scores[1], 100);
+        const float bm25_lead_corr100 = pearson_over_union_pool(scores[0], scores[1], 100);
+        const float bm25_lead_top1_same = top1_same_from_scores(scores[0], scores[1]);
+        const float bm25_margin2 = top2_margin_from_scores(scores[0]);
+        const float lead_margin2 = top2_margin_from_scores(scores[1]);
+        const float lead_minus_bm25_margin2 = lead_margin2 - bm25_margin2;
+        const float bm25_entropy10 = topk_softmax_entropy_from_scores(scores[0], 10);
+        const float lead_entropy10 = topk_softmax_entropy_from_scores(scores[1], 10);
+        const float lead_minus_bm25_entropy10 = lead_entropy10 - bm25_entropy10;
+        const auto f = router.features(fx.query_texts[qi]);
+        std::fprintf(fp,
+                     "{\"qi\":%u,\"qid\":\"%s\",\"winner\":\"%s\","
+                     "\"ndcg_bm25\":%.6f,\"ndcg_lead64\":%.6f,\"ndcg_shape_risk\":%.6f,"
+                     "\"bm25_lead_jaccard10\":%.6f,\"bm25_lead_jaccard50\":%.6f,"
+                     "\"bm25_lead_jaccard100\":%.6f,\"bm25_lead_corr100\":%.6f,"
+                     "\"bm25_lead_top1_same\":%.6f,\"bm25_margin2\":%.6f,"
+                     "\"lead_margin2\":%.6f,\"lead_minus_bm25_margin2\":%.6f,"
+                     "\"bm25_entropy10\":%.6f,\"lead_entropy10\":%.6f,"
+                     "\"lead_minus_bm25_entropy10\":%.6f,\"oov_rate\":%.6f,"
+                     "\"avg_idf\":%.6f,\"max_idf\":%.6f,\"min_idf\":%.6f,"
+                     "\"idf_stddev\":%.6f,\"n_terms\":%u,\"avg_term_chars\":%.6f,"
+                     "\"scq_sum\":%.6f,\"simplified_clarity\":%.6f}\n",
+                     qi, fx.query_ids[qi].c_str(), names[best], ndcgs[0], ndcgs[1], ndcgs[2],
+                     bm25_lead_jaccard10, bm25_lead_jaccard50, bm25_lead_jaccard100,
+                     bm25_lead_corr100, bm25_lead_top1_same, bm25_margin2, lead_margin2,
+                     lead_minus_bm25_margin2, bm25_entropy10, lead_entropy10,
+                     lead_minus_bm25_entropy10, f.oov_rate, f.avg_idf, f.max_idf, f.min_idf,
+                     f.idf_stddev, f.n_terms, f.avg_term_chars, f.scq_sum, f.simplified_clarity);
+    }
+    std::fclose(fp);
+}
+
+void dump_generator_winner_features_if_env(const Fixture& fx, const simeon::Bm25Index& feature_idx,
+                                           ScoreFn gen_bm25, ScoreFn gen_bm25f, ScoreFn gen_rm3,
+                                           ScoreFn gen_z_equal) {
+    const char* path = std::getenv("SIMEON_GENERATOR_WINNER_DUMP");
+    if (!path || !*path)
+        return;
+    std::FILE* fp = std::fopen(path, "w");
+    if (!fp)
+        return;
+
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::unordered_map<std::uint32_t, std::unordered_map<std::uint32_t, std::uint32_t>> rel;
+    for (const auto& q : fx.qrels)
+        rel[q.q][q.d] = q.rel;
+
+    simeon::QueryRouter router(feature_idx);
+    std::array<std::vector<float>, 4> scores{
+        std::vector<float>(nd, 0.0f), std::vector<float>(nd, 0.0f), std::vector<float>(nd, 0.0f),
+        std::vector<float>(nd, 0.0f)};
+    constexpr std::array<const char*, 4> names{"bm25", "bm25f", "rm3", "z_equal"};
+
+    auto q_ndcg = [&](std::uint32_t qi, const std::vector<float>& s) -> double {
+        std::vector<std::pair<float, std::uint32_t>> ranking;
+        ranking.reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            ranking.emplace_back(s[di], di);
+        std::vector<std::vector<std::pair<float, std::uint32_t>>> one_rankings(1);
+        one_rankings[0] = std::move(ranking);
+        Fixture one_fx;
+        one_fx.query_ids.push_back(fx.query_ids[qi]);
+        one_fx.query_texts.push_back(fx.query_texts[qi]);
+        one_fx.doc_ids = fx.doc_ids;
+        one_fx.doc_texts = fx.doc_texts;
+        one_fx.ref_dim = fx.ref_dim;
+        one_fx.ref_model = fx.ref_model;
+        const auto rit = rel.find(qi);
+        if (rit != rel.end()) {
+            for (const auto& [d, r] : rit->second)
+                one_fx.qrels.push_back(Fixture::Qrel{0, d, r});
+        }
+        return score_rankings(one_rankings, one_fx).ndcg_at_10;
+    };
+
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        for (auto& s : scores)
+            std::fill(s.begin(), s.end(), 0.0f);
+        gen_bm25(qi, scores[0]);
+        gen_bm25f(qi, scores[1]);
+        gen_rm3(qi, scores[2]);
+        gen_z_equal(qi, scores[3]);
+        std::array<double, 4> ndcgs{};
+        std::uint32_t best = 0;
+        for (std::uint32_t i = 0; i < ndcgs.size(); ++i) {
+            ndcgs[i] = q_ndcg(qi, scores[i]);
+            if (ndcgs[i] > ndcgs[best])
+                best = i;
+        }
+        const float bm25_rm3_jaccard10 = topk_jaccard_from_scores(scores[0], scores[2], 10);
+        const float bm25_rm3_jaccard50 = topk_jaccard_from_scores(scores[0], scores[2], 50);
+        const float bm25_rm3_jaccard100 = topk_jaccard_from_scores(scores[0], scores[2], 100);
+        const float bm25_bm25f_jaccard10 = topk_jaccard_from_scores(scores[0], scores[1], 10);
+        const float bm25_bm25f_jaccard50 = topk_jaccard_from_scores(scores[0], scores[1], 50);
+        const float bm25_rm3_corr100 = pearson_over_union_pool(scores[0], scores[2], 100);
+        const float bm25_rm3_top1_same = top1_same_from_scores(scores[0], scores[2]);
+        const float bm25_decay10 = topk_score_decay_from_scores(scores[0], 10);
+        const float rm3_decay10 = topk_score_decay_from_scores(scores[2], 10);
+        const float rm3_minus_bm25_decay10 = rm3_decay10 - bm25_decay10;
+        const float bm25_entropy10 = topk_softmax_entropy_from_scores(scores[0], 10);
+        const float rm3_entropy10 = topk_softmax_entropy_from_scores(scores[2], 10);
+        const float z_equal_entropy10 = topk_softmax_entropy_from_scores(scores[3], 10);
+        const float rm3_minus_bm25_entropy10 = rm3_entropy10 - bm25_entropy10;
+        const float bm25_margin2 = top2_margin_from_scores(scores[0]);
+        const float rm3_margin2 = top2_margin_from_scores(scores[2]);
+        const float z_equal_margin2 = top2_margin_from_scores(scores[3]);
+        const float rm3_minus_bm25_margin2 = rm3_margin2 - bm25_margin2;
+        const auto f = router.features(fx.query_texts[qi]);
+        std::fprintf(fp,
+                     "{\"qi\":%u,\"qid\":\"%s\",\"winner\":\"%s\","
+                     "\"ndcg_bm25\":%.6f,\"ndcg_bm25f\":%.6f,"
+                     "\"ndcg_rm3\":%.6f,\"ndcg_z_equal\":%.6f,"
+                     "\"bm25_rm3_jaccard10\":%.6f,\"bm25_rm3_jaccard50\":%.6f,"
+                     "\"bm25_rm3_jaccard100\":%.6f,\"bm25_bm25f_jaccard10\":%.6f,"
+                     "\"bm25_bm25f_jaccard50\":%.6f,\"bm25_rm3_corr100\":%.6f,"
+                     "\"bm25_rm3_top1_same\":%.6f,\"bm25_decay10\":%.6f,"
+                     "\"rm3_decay10\":%.6f,\"rm3_minus_bm25_decay10\":%.6f,"
+                     "\"bm25_entropy10\":%.6f,\"rm3_entropy10\":%.6f,"
+                     "\"z_equal_entropy10\":%.6f,\"rm3_minus_bm25_entropy10\":%.6f,"
+                     "\"bm25_margin2\":%.6f,\"rm3_margin2\":%.6f,"
+                     "\"z_equal_margin2\":%.6f,\"rm3_minus_bm25_margin2\":%.6f,"
+                     "\"oov_rate\":%.6f,\"avg_idf\":%.6f,\"max_idf\":%.6f,"
+                     "\"min_idf\":%.6f,\"idf_stddev\":%.6f,\"n_terms\":%u,"
+                     "\"avg_term_chars\":%.6f,\"scq_sum\":%.6f,"
+                     "\"simplified_clarity\":%.6f}\n",
+                     qi, fx.query_ids[qi].c_str(), names[best], ndcgs[0], ndcgs[1], ndcgs[2],
+                     ndcgs[3], bm25_rm3_jaccard10, bm25_rm3_jaccard50, bm25_rm3_jaccard100,
+                     bm25_bm25f_jaccard10, bm25_bm25f_jaccard50, bm25_rm3_corr100,
+                     bm25_rm3_top1_same, bm25_decay10, rm3_decay10, rm3_minus_bm25_decay10,
+                     bm25_entropy10, rm3_entropy10, z_equal_entropy10, rm3_minus_bm25_entropy10,
+                     bm25_margin2, rm3_margin2, z_equal_margin2, rm3_minus_bm25_margin2, f.oov_rate,
+                     f.avg_idf, f.max_idf, f.min_idf, f.idf_stddev, f.n_terms, f.avg_term_chars,
+                     f.scq_sum, f.simplified_clarity);
+    }
+    std::fclose(fp);
+}
+
+// Phase XLV: 4-generator winner dump including simeon embedding features.
+void dump_4gen_winner_features_if_env(const Fixture& fx, const simeon::Bm25Index& feature_idx,
+                                      ScoreFn gen_bm25, ScoreFn gen_bm25f, ScoreFn gen_rm3,
+                                      ScoreFn gen_simeon, ScoreFn gen_4way_z) {
+    const char* path = std::getenv("SIMEON_4GEN_WINNER_DUMP");
+    if (!path || !*path)
+        return;
+    std::FILE* fp = std::fopen(path, "w");
+    if (!fp)
+        return;
+
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::unordered_map<std::uint32_t, std::unordered_map<std::uint32_t, std::uint32_t>> rel;
+    for (const auto& q : fx.qrels)
+        rel[q.q][q.d] = q.rel;
+
+    simeon::QueryRouter router(feature_idx);
+    std::array<std::vector<float>, 5> scores{
+        std::vector<float>(nd, 0.0f), std::vector<float>(nd, 0.0f), std::vector<float>(nd, 0.0f),
+        std::vector<float>(nd, 0.0f), std::vector<float>(nd, 0.0f)};
+    constexpr std::array<const char*, 5> names{"bm25", "bm25f", "rm3", "simeon", "4way_z"};
+
+    auto q_ndcg = [&](std::uint32_t qi, const std::vector<float>& s) -> double {
+        std::vector<std::pair<float, std::uint32_t>> ranking;
+        ranking.reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            ranking.emplace_back(s[di], di);
+        std::vector<std::vector<std::pair<float, std::uint32_t>>> one_rankings(1);
+        one_rankings[0] = std::move(ranking);
+        Fixture one_fx;
+        one_fx.query_ids.push_back(fx.query_ids[qi]);
+        one_fx.query_texts.push_back(fx.query_texts[qi]);
+        one_fx.doc_ids = fx.doc_ids;
+        one_fx.doc_texts = fx.doc_texts;
+        one_fx.ref_dim = fx.ref_dim;
+        one_fx.ref_model = fx.ref_model;
+        const auto rit = rel.find(qi);
+        if (rit != rel.end()) {
+            for (const auto& [d, r] : rit->second)
+                one_fx.qrels.push_back(Fixture::Qrel{0, d, r});
+        }
+        return score_rankings(one_rankings, one_fx).ndcg_at_10;
+    };
+
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        for (auto& s : scores)
+            std::fill(s.begin(), s.end(), 0.0f);
+        gen_bm25(qi, scores[0]);
+        gen_bm25f(qi, scores[1]);
+        gen_rm3(qi, scores[2]);
+        gen_simeon(qi, scores[3]);
+        gen_4way_z(qi, scores[4]);
+        std::array<double, 5> ndcgs{};
+        std::uint32_t best = 0;
+        for (std::uint32_t i = 0; i < ndcgs.size(); ++i) {
+            ndcgs[i] = q_ndcg(qi, scores[i]);
+            if (ndcgs[i] > ndcgs[best])
+                best = i;
+        }
+        const float bm25_rm3_jaccard50 = topk_jaccard_from_scores(scores[0], scores[2], 50);
+        const float bm25_rm3_corr100 = pearson_over_union_pool(scores[0], scores[2], 100);
+        const float bm25_simeon_jaccard50 = topk_jaccard_from_scores(scores[0], scores[3], 50);
+        const float bm25_simeon_corr100 = pearson_over_union_pool(scores[0], scores[3], 100);
+        const float bm25_simeon_top1_same = top1_same_from_scores(scores[0], scores[3]);
+        const float bm25_decay10 = topk_score_decay_from_scores(scores[0], 10);
+        const float rm3_decay10 = topk_score_decay_from_scores(scores[2], 10);
+        const float simeon_decay10 = topk_score_decay_from_scores(scores[3], 10);
+        const float bm25_entropy10 = topk_softmax_entropy_from_scores(scores[0], 10);
+        const float rm3_entropy10 = topk_softmax_entropy_from_scores(scores[2], 10);
+        const float simeon_entropy10 = topk_softmax_entropy_from_scores(scores[3], 10);
+        const float bm25_margin2 = top2_margin_from_scores(scores[0]);
+        const float rm3_margin2 = top2_margin_from_scores(scores[2]);
+        const float simeon_margin2 = top2_margin_from_scores(scores[3]);
+        const float simeon_minus_bm25_margin2 = simeon_margin2 - bm25_margin2;
+        const auto f = router.features(fx.query_texts[qi]);
+        std::fprintf(fp,
+                     "{\"qi\":%u,\"qid\":\"%s\",\"winner\":\"%s\","
+                     "\"ndcg_bm25\":%.6f,\"ndcg_bm25f\":%.6f,"
+                     "\"ndcg_rm3\":%.6f,\"ndcg_simeon\":%.6f,\"ndcg_4way_z\":%.6f,"
+                     "\"bm25_rm3_jaccard50\":%.6f,\"bm25_rm3_corr100\":%.6f,"
+                     "\"bm25_simeon_jaccard50\":%.6f,\"bm25_simeon_corr100\":%.6f,"
+                     "\"bm25_simeon_top1_same\":%.6f,"
+                     "\"bm25_decay10\":%.6f,\"rm3_decay10\":%.6f,\"simeon_decay10\":%.6f,"
+                     "\"bm25_entropy10\":%.6f,\"rm3_entropy10\":%.6f,\"simeon_entropy10\":%.6f,"
+                     "\"bm25_margin2\":%.6f,\"rm3_margin2\":%.6f,\"simeon_margin2\":%.6f,"
+                     "\"simeon_minus_bm25_margin2\":%.6f,"
+                     "\"oov_rate\":%.6f,\"avg_idf\":%.6f,\"idf_stddev\":%.6f,"
+                     "\"n_terms\":%u,\"scq_sum\":%.6f}\n",
+                     qi, fx.query_ids[qi].c_str(), names[best], ndcgs[0], ndcgs[1], ndcgs[2],
+                     ndcgs[3], ndcgs[4], bm25_rm3_jaccard50, bm25_rm3_corr100,
+                     bm25_simeon_jaccard50, bm25_simeon_corr100, bm25_simeon_top1_same,
+                     bm25_decay10, rm3_decay10, simeon_decay10, bm25_entropy10, rm3_entropy10,
+                     simeon_entropy10, bm25_margin2, rm3_margin2, simeon_margin2,
+                     simeon_minus_bm25_margin2, f.oov_rate, f.avg_idf, f.idf_stddev, f.n_terms,
+                     f.scq_sum);
+    }
+    std::fclose(fp);
+}
+
+void run_union_generator_rrf(const char* name, const Fixture& fx, double build_us,
+                             std::uint32_t pool_size, std::span<const ScoreFn> generators,
+                             float rrf_k = 60.0f) {
+    Timing t;
+    t.index_build_us = build_us;
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<float> scores(nd, 0.0f);
+    std::vector<float> fused(nd, -std::numeric_limits<float>::infinity());
+    std::vector<std::uint8_t> touched(nd, 0u);
+
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        std::fill(fused.begin(), fused.end(), -std::numeric_limits<float>::infinity());
+        std::fill(touched.begin(), touched.end(), 0u);
+        for (const auto& gen : generators) {
+            std::fill(scores.begin(), scores.end(), 0.0f);
+            gen(qi, scores);
+            auto pool = simeon::top_k(scores, pool_size);
+            for (std::uint32_t rank = 0; rank < pool.size(); ++rank) {
+                const std::uint32_t did = pool[rank].first;
+                if (!touched[did]) {
+                    touched[did] = 1u;
+                    fused[did] = 0.0f;
+                }
+                fused[did] += 1.0f / (rrf_k + 1.0f + static_cast<float>(rank));
+            }
+        }
+        rankings[qi].reserve(nd);
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi].emplace_back(fused[di], di);
+    }
+    t.query_us = elapsed_us(t0);
+    emit(name, fx, score_rankings(rankings, fx), 0, t);
+}
+
+void run_first_generator_slice_oracles(const Fixture& fx, const Bm25WithTiming& bm25) {
+    auto aux_t0 = Clock::now();
+    auto aux_texts = build_textrank_titles(fx);
+    const double aux_build_us = elapsed_us(aux_t0);
+    auto bm25f = build_bm25f(fx, aux_texts, simeon::Bm25Config{}, aux_build_us);
+    auto lead_t0 = Clock::now();
+    auto lead_texts = build_lead_token_field(fx, 64);
+    const double lead_build_us = elapsed_us(lead_t0);
+    auto bm25f_lead = build_bm25f(fx, lead_texts, simeon::Bm25Config{}, lead_build_us);
+
+    std::vector<float> scratch_bm25(fx.doc_ids.size(), 0.0f);
+    std::vector<float> scratch_bm25f(fx.doc_ids.size(), 0.0f);
+    ScoreFn gen_bm25 = [&](std::uint32_t qi, std::vector<float>& out) {
+        bm25.idx.score(fx.query_texts[qi], out);
+    };
+    ScoreFn gen_bm25f = [&](std::uint32_t qi, std::vector<float>& out) {
+        bm25f.idx.score_bm25f(fx.query_texts[qi], fx.query_texts[qi], out, 1.0f, 0.5f);
+    };
+    ScoreFn gen_bm25f_textrank_w1 = [&](std::uint32_t qi, std::vector<float>& out) {
+        bm25f.idx.score_bm25f(fx.query_texts[qi], fx.query_texts[qi], out, 1.0f, 1.0f);
+    };
+    ScoreFn gen_bm25f_lead_w05 = [&](std::uint32_t qi, std::vector<float>& out) {
+        bm25f_lead.idx.score_bm25f(fx.query_texts[qi], fx.query_texts[qi], out, 1.0f, 0.5f);
+    };
+    ScoreFn gen_bm25f_lead_w1 = [&](std::uint32_t qi, std::vector<float>& out) {
+        bm25f_lead.idx.score_bm25f(fx.query_texts[qi], fx.query_texts[qi], out, 1.0f, 1.0f);
+    };
+    simeon::PrfConfig prf_cfg;
+    prf_cfg.k = 10;
+    prf_cfg.n_terms = 30;
+    prf_cfg.alpha = 0.5f;
+    ScoreFn gen_rm3 = [&](std::uint32_t qi, std::vector<float>& out) {
+        simeon::score_with_prf(bm25.idx, fx.query_texts[qi], out, prf_cfg);
+    };
+    std::array<ScoreFn, 2> union_bm25_bm25f{gen_bm25, gen_bm25f};
+    std::array<ScoreFn, 2> union_bm25_rm3{gen_bm25, gen_rm3};
+    std::array<ScoreFn, 3> union_all{gen_bm25, gen_bm25f, gen_rm3};
+    const std::array<float, 3> weights_equal{1.0f, 1.0f, 1.0f};
+    const std::array<float, 3> weights_bm25_rm3{0.45f, 0.10f, 0.45f};
+    const std::array<float, 3> weights_rm3_heavy{0.25f, 0.10f, 0.65f};
+
+    // Simeon training-free embedding generator slice (Phase XLIV).
+    simeon::EncoderConfig simeon_cfg;
+    simeon_cfg.ngram_mode = simeon::NGramMode::CharAndWord;
+    simeon_cfg.ngram_min = 3;
+    simeon_cfg.ngram_max = 5;
+    simeon_cfg.sketch_dim = 4096;
+    simeon_cfg.output_dim = 384;
+    simeon_cfg.projection = simeon::ProjectionMode::AchlioptasSparse;
+    simeon_cfg.l2_normalize = true;
+    simeon::Encoder senc(simeon_cfg);
+    const std::uint32_t sdim = senc.output_dim();
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    auto simeon_t0 = Clock::now();
+    std::vector<float> simeon_dembs(static_cast<std::size_t>(nd) * sdim, 0.0f);
+    for (std::uint32_t i = 0; i < nd; ++i)
+        senc.encode(fx.doc_texts[i], simeon_dembs.data() + i * sdim);
+    const double simeon_build_us = elapsed_us(simeon_t0);
+    std::vector<float> simeon_qembs(static_cast<std::size_t>(fx.query_ids.size()) * sdim, 0.0f);
+    for (std::uint32_t i = 0; i < fx.query_ids.size(); ++i)
+        senc.encode(fx.query_texts[i], simeon_qembs.data() + i * sdim);
+
+    ScoreFn gen_simeon = [&](std::uint32_t qi, std::vector<float>& out) {
+        for (std::uint32_t di = 0; di < nd; ++di)
+            out[di] = dot(simeon_qembs.data() + qi * sdim, simeon_dembs.data() + di * sdim, sdim);
+    };
+    std::array<ScoreFn, 2> union_bm25_simeon{gen_bm25, gen_simeon};
+    std::array<ScoreFn, 4> union_all_4{gen_bm25, gen_bm25f, gen_rm3, gen_simeon};
+    const std::array<float, 2> weights_equal_2{1.0f, 1.0f};
+    const std::array<float, 4> weights_equal_4{1.0f, 1.0f, 1.0f, 1.0f};
+
+    run_generator_observed("observed_gen_bm25f_textrank_w0.5", fx, bm25f.build_us, gen_bm25f);
+    run_generator_observed("observed_struct_bm25f_textrank_w1.0", fx, bm25f.build_us,
+                           gen_bm25f_textrank_w1);
+    run_generator_observed("observed_struct_bm25f_lead64_w0.5", fx, bm25f_lead.build_us,
+                           gen_bm25f_lead_w05);
+    run_generator_observed("observed_struct_bm25f_lead64_w1.0", fx, bm25f_lead.build_us,
+                           gen_bm25f_lead_w1);
+    run_generator_observed("observed_gen_bm25_rm3_k10_n30_a0.5", fx, bm25.build_us, gen_rm3);
+    run_union_generator_weighted_z(
+        "observed_union_bm25_bm25f_rm3_z_equal", fx, bm25.build_us + bm25f.build_us,
+        std::span<const ScoreFn>(union_all), std::span<const float>(weights_equal));
+    run_union_generator_weighted_z(
+        "observed_union_bm25_bm25f_rm3_z_bm25_rm3", fx, bm25.build_us + bm25f.build_us,
+        std::span<const ScoreFn>(union_all), std::span<const float>(weights_bm25_rm3));
+    run_union_generator_weighted_z(
+        "observed_union_bm25_bm25f_rm3_z_rm3_heavy", fx, bm25.build_us + bm25f.build_us,
+        std::span<const ScoreFn>(union_all), std::span<const float>(weights_rm3_heavy));
+    run_shape_risk_z_fusion("observed_shape_risk_z_gate_hard_devfit", fx,
+                            bm25.build_us + bm25f.build_us, gen_bm25, gen_bm25f, gen_rm3, true);
+    run_shape_risk_z_fusion("observed_shape_risk_z_blend_continuous", fx,
+                            bm25.build_us + bm25f.build_us, gen_bm25, gen_bm25f, gen_rm3, false);
+    run_pool_lexical_evidence_rerank("observed_ordering_bm25_pool500_overlap_w0.5_phrase_w0.5", fx,
+                                     bm25.idx, bm25.build_us, 0.5f, 0.5f, 500);
+    run_pool_lexical_evidence_rerank("observed_ordering_bm25_pool500_overlap_w1.0_phrase_w0.25", fx,
+                                     bm25.idx, bm25.build_us, 1.0f, 0.25f, 500);
+    run_pool_lexical_evidence_rerank("observed_ordering_bm25_pool500_overlap_w0.1_phrase_w0.05", fx,
+                                     bm25.idx, bm25.build_us, 0.1f, 0.05f, 500);
+
+    run_generator_observed("observed_gen_simeon_achlioptas_4096_384", fx, simeon_build_us,
+                           gen_simeon);
+    run_union_generator_weighted_z(
+        "observed_union_bm25_simeon_z_equal", fx, bm25.build_us + simeon_build_us,
+        std::span<const ScoreFn>(union_bm25_simeon), std::span<const float>(weights_equal_2));
+    run_union_generator_weighted_z("observed_union_bm25_bm25f_rm3_simeon_z_equal", fx,
+                                   bm25.build_us + bm25f.build_us + simeon_build_us,
+                                   std::span<const ScoreFn>(union_all_4),
+                                   std::span<const float>(weights_equal_4));
+
+    ScoreFn gen_z_equal = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::fill(out.begin(), out.end(), 0.0f);
+        std::vector<float> tmp(out.size(), 0.0f);
+        for (const auto& gen : union_all) {
+            std::fill(tmp.begin(), tmp.end(), 0.0f);
+            gen(qi, tmp);
+            zscore_inplace(tmp);
+            for (std::size_t di = 0; di < out.size(); ++di)
+                out[di] += tmp[di];
+        }
+    };
+    dump_generator_winner_features_if_env(fx, bm25.idx, gen_bm25, gen_bm25f, gen_rm3, gen_z_equal);
+    ScoreFn gen_shape_risk = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> b(out.size(), 0.0f), bf(out.size(), 0.0f), r(out.size(), 0.0f),
+            z_eq(out.size(), 0.0f);
+        gen_bm25(qi, b);
+        gen_bm25f(qi, bf);
+        gen_rm3(qi, r);
+        const float bm25_margin2 = top2_margin_from_scores(b);
+        const float bm25_rm3_jaccard100 = topk_jaccard_from_scores(b, r, 100);
+        const float lambda =
+            (bm25_margin2 >= 0.01939f && bm25_rm3_jaccard100 <= 0.7544f) ? 1.0f : 0.0f;
+        zscore_inplace(b);
+        zscore_inplace(bf);
+        zscore_inplace(r);
+        for (std::uint32_t di = 0; di < out.size(); ++di) {
+            z_eq[di] = b[di] + bf[di] + r[di];
+            out[di] = (1.0f - lambda) * b[di] + lambda * z_eq[di];
+        }
+    };
+    dump_structural_winner_features_if_env(fx, bm25.idx, gen_bm25, gen_bm25f_lead_w05,
+                                           gen_shape_risk);
+
+    ScoreFn gen_4way_z = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::fill(out.begin(), out.end(), 0.0f);
+        std::vector<float> tmp(out.size(), 0.0f);
+        for (const auto& gen : union_all_4) {
+            std::fill(tmp.begin(), tmp.end(), 0.0f);
+            gen(qi, tmp);
+            zscore_inplace(tmp);
+            for (std::size_t di = 0; di < out.size(); ++di)
+                out[di] += tmp[di];
+        }
+    };
+    dump_4gen_winner_features_if_env(fx, bm25.idx, gen_bm25, gen_bm25f, gen_rm3, gen_simeon,
+                                     gen_4way_z);
+
+    // Phase XLV: risk-aware 4-generator fusion.
+    // Dev-fit gate: use 4-way z-fusion only when BM25 top-10 score entropy is
+    // high (>= 0.48), indicating BM25 uncertainty where simeon complements.
+    // Otherwise fall back to plain BM25 to avoid SciFact/ArguAna regressions.
+    ScoreFn gen_4way_risk_entropy = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> b(out.size(), 0.0f), bf(out.size(), 0.0f), r(out.size(), 0.0f),
+            s(out.size(), 0.0f);
+        gen_bm25(qi, b);
+        gen_bm25f(qi, bf);
+        gen_rm3(qi, r);
+        gen_simeon(qi, s);
+        const float bm25_entropy10_gate = topk_softmax_entropy_from_scores(b, 10);
+        const float lambda = (bm25_entropy10_gate >= 0.48f) ? 1.0f : 0.0f;
+        zscore_inplace(b);
+        zscore_inplace(bf);
+        zscore_inplace(r);
+        zscore_inplace(s);
+        for (std::uint32_t di = 0; di < out.size(); ++di) {
+            const float z4 = b[di] + bf[di] + r[di] + s[di];
+            out[di] = (1.0f - lambda) * b[di] + lambda * z4;
+        }
+    };
+    run_generator_observed("observed_4gen_risk_entropy_gate_devfit", fx,
+                           bm25.build_us + bm25f.build_us + simeon_build_us, gen_4way_risk_entropy);
+
+    // Phase XLVI: continuous dampening replaces the hard 0.48 threshold with a
+    // sigmoid that gradually transitions from BM25-only to 4-way z-fusion as
+    // BM25 entropy increases.
+    ScoreFn gen_4way_dampen_cont = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> b(out.size(), 0.0f), bf(out.size(), 0.0f), r(out.size(), 0.0f),
+            s(out.size(), 0.0f);
+        gen_bm25(qi, b);
+        gen_bm25f(qi, bf);
+        gen_rm3(qi, r);
+        gen_simeon(qi, s);
+        const float ent = topk_softmax_entropy_from_scores(b, 10);
+        const float lambda = 1.0f / (1.0f + std::exp(-(ent - 0.48f) * 8.0f));
+        zscore_inplace(b);
+        zscore_inplace(bf);
+        zscore_inplace(r);
+        zscore_inplace(s);
+        for (std::uint32_t di = 0; di < out.size(); ++di) {
+            const float z4 = b[di] + bf[di] + r[di] + s[di];
+            out[di] = (1.0f - lambda) * b[di] + lambda * z4;
+        }
+    };
+    run_generator_observed("observed_4gen_dampen_sigmoid", fx,
+                           bm25.build_us + bm25f.build_us + simeon_build_us, gen_4way_dampen_cont);
+
+    // Phase XLVII: dynamic per-query simeon weight using multi-signal dampening.
+    // Complementarity gate: discount simeon when it ranks the same top-50 docs
+    // as BM25 (high Jaccard = redundant, not complementary).
+    ScoreFn gen_4way_dampen_complement = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> b(out.size(), 0.0f), bf(out.size(), 0.0f), r(out.size(), 0.0f),
+            s(out.size(), 0.0f);
+        gen_bm25(qi, b);
+        gen_bm25f(qi, bf);
+        gen_rm3(qi, r);
+        gen_simeon(qi, s);
+        const float ent = topk_softmax_entropy_from_scores(b, 10);
+        const float jacc = topk_jaccard_from_scores(b, s, 50);
+        const float lambda_ent = 1.0f / (1.0f + std::exp(-(ent - 0.48f) * 8.0f));
+        const float lambda_div = 1.0f / (1.0f + std::exp(-((1.0f - jacc) - 0.50f) * 6.0f));
+        const float lambda = lambda_ent * lambda_div;
+        zscore_inplace(b);
+        zscore_inplace(bf);
+        zscore_inplace(r);
+        zscore_inplace(s);
+        for (std::uint32_t di = 0; di < out.size(); ++di) {
+            const float z4 = b[di] + bf[di] + r[di] + s[di];
+            out[di] = (1.0f - lambda) * b[di] + lambda * z4;
+        }
+    };
+    run_generator_observed("observed_4gen_dampen_complement", fx,
+                           bm25.build_us + bm25f.build_us + simeon_build_us,
+                           gen_4way_dampen_complement);
+
+    // Dynamic 3-signal gate: entropy + complementarity + simeon confidence.
+    ScoreFn gen_4way_dampen_dynamic = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> b(out.size(), 0.0f), bf(out.size(), 0.0f), r(out.size(), 0.0f),
+            s(out.size(), 0.0f);
+        gen_bm25(qi, b);
+        gen_bm25f(qi, bf);
+        gen_rm3(qi, r);
+        gen_simeon(qi, s);
+        const float ent = topk_softmax_entropy_from_scores(b, 10);
+        const float jacc = topk_jaccard_from_scores(b, s, 50);
+        const float smargin = top2_margin_from_scores(s);
+        const float lambda_ent = 1.0f / (1.0f + std::exp(-(ent - 0.48f) * 8.0f));
+        const float lambda_div = 1.0f / (1.0f + std::exp(-((1.0f - jacc) - 0.50f) * 6.0f));
+        const float lambda_conf = 1.0f / (1.0f + std::exp(-(smargin - 0.05f) * 10.0f));
+        const float lambda = lambda_ent * lambda_div * lambda_conf;
+        zscore_inplace(b);
+        zscore_inplace(bf);
+        zscore_inplace(r);
+        zscore_inplace(s);
+        for (std::uint32_t di = 0; di < out.size(); ++di) {
+            const float z4 = b[di] + bf[di] + r[di] + s[di];
+            out[di] = (1.0f - lambda) * b[di] + lambda * z4;
+        }
+    };
+    run_generator_observed("observed_4gen_dampen_dynamic", fx,
+                           bm25.build_us + bm25f.build_us + simeon_build_us,
+                           gen_4way_dampen_dynamic);
+
+    // Phase XLVIII: cross-generator consensus booster.
+    // Only trust simeon for documents that appear in BOTH BM25 top-50 and
+    // simeon top-50. Documents that simeon promotes but BM25 ignores get zero
+    // simeon contribution. The entropy gate still controls the overall simeon
+    // influence.
+    ScoreFn gen_4way_consensus = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> b(out.size(), 0.0f), bf(out.size(), 0.0f), r(out.size(), 0.0f),
+            s(out.size(), 0.0f);
+        gen_bm25(qi, b);
+        gen_bm25f(qi, bf);
+        gen_rm3(qi, r);
+        gen_simeon(qi, s);
+        const float ent = topk_softmax_entropy_from_scores(b, 10);
+        const float lambda = 1.0f / (1.0f + std::exp(-(ent - 0.48f) * 8.0f));
+        auto bm25_top50 = simeon::top_k(b, 50);
+        auto sim_top50 = simeon::top_k(s, 50);
+        std::unordered_set<std::uint32_t> bm25_set;
+        bm25_set.reserve(50);
+        for (const auto& [did, score] : bm25_top50)
+            bm25_set.insert(did);
+        std::vector<float> s_consensus(s.size(), 0.0f);
+        for (const auto& [did, score] : sim_top50)
+            if (bm25_set.find(did) != bm25_set.end())
+                s_consensus[did] = score;
+        zscore_inplace(b);
+        zscore_inplace(bf);
+        zscore_inplace(r);
+        zscore_inplace(s_consensus);
+        for (std::uint32_t di = 0; di < out.size(); ++di) {
+            const float z4 = b[di] + bf[di] + r[di] + s_consensus[di];
+            out[di] = (1.0f - lambda) * b[di] + lambda * z4;
+        }
+    };
+    run_generator_observed("observed_4gen_dampen_consensus", fx,
+                           bm25.build_us + bm25f.build_us + simeon_build_us, gen_4way_consensus);
+
+    // Phase XLIX: embedding-weighted query expansion.
+    // Standard RM3 weights feedback docs by BM25 score only.  Here we also
+    // weight by simeon embedding similarity so only topically coherent
+    // pseudo-relevant docs contribute expansion terms.
+    ScoreFn gen_rm3_simeon_weighted = [&](std::uint32_t qi, std::vector<float>& out) {
+        // 1. First-pass BM25.
+        std::vector<float> first_pass(nd, 0.0f);
+        bm25.idx.score(fx.query_texts[qi], first_pass);
+
+        // 2. Top-K feedback docs.
+        auto tk = simeon::top_k(first_pass, 10);
+        std::vector<std::uint32_t> top_ids;
+        std::vector<float> top_bm25;
+        top_ids.reserve(tk.size());
+        top_bm25.reserve(tk.size());
+        for (const auto& [did, score] : tk) {
+            top_ids.push_back(did);
+            top_bm25.push_back(score);
+        }
+        if (top_ids.empty()) {
+            std::copy(first_pass.begin(), first_pass.end(), out.begin());
+            return;
+        }
+
+        // 3. Compute simeon embedding similarity per pseudo-relevant doc.
+        const float* qemb = simeon_qembs.data() + qi * sdim;
+        std::vector<float> sim(top_ids.size(), 0.0f);
+        for (std::size_t i = 0; i < top_ids.size(); ++i)
+            sim[i] = dot(qemb, simeon_dembs.data() + top_ids[i] * sdim, sdim);
+
+        // 4. Combined doc weights: BM25 × max(0, simeon_sim).
+        float bm25_sum = 0.0f;
+        for (float s : top_bm25)
+            bm25_sum += s;
+        std::vector<float> doc_weights(top_ids.size(), 0.0f);
+        float w_sum = 0.0f;
+        for (std::size_t i = 0; i < top_ids.size(); ++i) {
+            doc_weights[i] = (top_bm25[i] / bm25_sum) * std::max(0.0f, sim[i]);
+            w_sum += doc_weights[i];
+        }
+        if (w_sum > 0.0f) {
+            for (float& w : doc_weights)
+                w /= w_sum;
+        } else {
+            std::copy(first_pass.begin(), first_pass.end(), out.begin());
+            return;
+        }
+
+        // 5. Build relevance model with simeon-weighted docs.
+        std::vector<std::pair<std::uint64_t, float>> rm;
+        bm25.idx.build_relevance_model(top_ids, doc_weights, rm);
+        const std::size_t keep = std::min<std::size_t>(30, rm.size());
+        if (keep == 0) {
+            std::copy(first_pass.begin(), first_pass.end(), out.begin());
+            return;
+        }
+        std::sort(rm.begin(), rm.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        rm.resize(keep);
+        float rm_sum = 0.0f;
+        for (const auto& [h, w] : rm)
+            rm_sum += w;
+        if (rm_sum > 0.0f) {
+            for (auto& [h, w] : rm)
+                w /= rm_sum;
+        }
+
+        // 6. Hash original query terms.
+        auto q_hashes = hash_query_words(fx.query_texts[qi], bm25.idx);
+
+        // 7. α-blend original query + expansion terms (α=0.5) and score.
+        std::fill(out.begin(), out.end(), 0.0f);
+        score_rm_blended(bm25.idx, q_hashes, rm, out);
+    };
+    run_generator_observed("observed_ordering_rm3_simeon_weighted_k10_n30_a0.5", fx,
+                           bm25.build_us + simeon_build_us, gen_rm3_simeon_weighted);
+
+    // Adaptive α variant: α_max × sigmoid(entropy) so expansion is naturally
+    // suppressed on low-entropy queries (SciFact, ArguAna) without a hard gate.
+    ScoreFn gen_rm3_weighted_adapt = [&](std::uint32_t qi, std::vector<float>& out) {
+        // Steps 1-2: identical to weighted RM3.
+        std::vector<float> first_pass(nd, 0.0f);
+        bm25.idx.score(fx.query_texts[qi], first_pass);
+        auto tk = simeon::top_k(first_pass, 10);
+        std::vector<std::uint32_t> top_ids;
+        std::vector<float> top_bm25;
+        top_ids.reserve(tk.size());
+        top_bm25.reserve(tk.size());
+        for (const auto& [did, score] : tk) {
+            top_ids.push_back(did);
+            top_bm25.push_back(score);
+        }
+        if (top_ids.empty()) {
+            std::copy(first_pass.begin(), first_pass.end(), out.begin());
+            return;
+        }
+        const float bm25_ent = topk_softmax_entropy_from_scores(first_pass, 10);
+        const float alpha = 0.5f / (1.0f + std::exp(-(bm25_ent - 0.48f) * 8.0f));
+
+        // Steps 3-6: same as weighted RM3.
+        const float* qemb = simeon_qembs.data() + qi * sdim;
+        std::vector<float> sim(top_ids.size(), 0.0f);
+        for (std::size_t i = 0; i < top_ids.size(); ++i)
+            sim[i] = dot(qemb, simeon_dembs.data() + top_ids[i] * sdim, sdim);
+        float bm25_sum = 0.0f;
+        for (float s : top_bm25)
+            bm25_sum += s;
+        std::vector<float> doc_weights(top_ids.size(), 0.0f);
+        float w_sum = 0.0f;
+        for (std::size_t i = 0; i < top_ids.size(); ++i) {
+            doc_weights[i] = (top_bm25[i] / bm25_sum) * std::max(0.0f, sim[i]);
+            w_sum += doc_weights[i];
+        }
+        if (w_sum > 0.0f) {
+            for (float& w : doc_weights)
+                w /= w_sum;
+        } else {
+            std::copy(first_pass.begin(), first_pass.end(), out.begin());
+            return;
+        }
+        std::vector<std::pair<std::uint64_t, float>> rm;
+        bm25.idx.build_relevance_model(top_ids, doc_weights, rm);
+        const std::size_t keep = std::min<std::size_t>(30, rm.size());
+        if (keep == 0) {
+            std::copy(first_pass.begin(), first_pass.end(), out.begin());
+            return;
+        }
+        std::sort(rm.begin(), rm.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        rm.resize(keep);
+        float rm_sum = 0.0f;
+        for (const auto& [h, w] : rm)
+            rm_sum += w;
+        if (rm_sum > 0.0f) {
+            for (auto& [h, w] : rm)
+                w /= rm_sum;
+        }
+
+        auto q_hashes2 = hash_query_words(fx.query_texts[qi], bm25.idx);
+
+        // Step 7: adaptive α.
+        std::unordered_map<std::uint64_t, float> combined;
+        combined.reserve(q_hashes2.size() + rm.size());
+        if (!q_hashes2.empty()) {
+            const float q_total = static_cast<float>(q_hashes2.size());
+            const float one_minus_a = 1.0f - alpha;
+            for (std::uint64_t h : q_hashes2)
+                combined[h] += one_minus_a * (1.0f / q_total);
+        }
+        for (const auto& [h, w] : rm)
+            combined[h] += alpha * w;
+
+        // Step 8: score.
+        std::vector<std::pair<std::uint64_t, float>> weighted;
+        weighted.reserve(combined.size());
+        for (const auto& [h, w] : combined)
+            weighted.emplace_back(h, w);
+        std::sort(weighted.begin(), weighted.end());
+        bm25.idx.score_weighted_hashes(weighted, out);
+    };
+    run_generator_observed("observed_ordering_rm3_weighted_adaptive_alpha", fx,
+                           bm25.build_us + simeon_build_us, gen_rm3_weighted_adapt);
+
+    // Phase LII: diversity-aware weighted RM3 (MMR selection of feedback docs).
+    // Instead of taking top-K by BM25, greedily selects docs that maximize
+    // BM25 × simeon_sim_q − β × max_j(simeon_sim_to_selected_j).
+    ScoreFn gen_rm3_diverse = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> first_pass(nd, 0.0f);
+        bm25.idx.score(fx.query_texts[qi], first_pass);
+        auto fw = compute_diverse_feedback_weights(bm25.idx, first_pass, simeon_dembs, simeon_qembs,
+                                                   qi, sdim, 20, 10, 0.5f);
+        if (fw.ids.empty()) {
+            gen_bm25(qi, out);
+            return;
+        }
+        std::vector<std::pair<std::uint64_t, float>> rm;
+        bm25.idx.build_relevance_model(fw.ids, fw.weights, rm);
+        const std::size_t keep = std::min<std::size_t>(30, rm.size());
+        if (keep == 0) [[unlikely]] {
+            gen_bm25(qi, out);
+            return;
+        }
+        std::sort(rm.begin(), rm.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        rm.resize(keep);
+        float rm_sum = 0.0f;
+        for (auto& [h, w] : rm)
+            rm_sum += w;
+        if (rm_sum > 0.0f)
+            for (auto& [h, w] : rm)
+                w /= rm_sum;
+        auto qh = hash_query_words(fx.query_texts[qi], bm25.idx);
+        std::fill(out.begin(), out.end(), 0.0f);
+        score_rm_blended(bm25.idx, qh, rm, out);
+    };
+    run_generator_observed("observed_ordering_rm3_diverse_k10_b0.5", fx,
+                           bm25.build_us + simeon_build_us, gen_rm3_diverse);
+
+    // Phase LIII: sensitivity test with lower β=0.25.
+    ScoreFn gen_rm3_diverse_b025 = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> first_pass(nd, 0.0f);
+        bm25.idx.score(fx.query_texts[qi], first_pass);
+        auto fw = compute_diverse_feedback_weights(bm25.idx, first_pass, simeon_dembs, simeon_qembs,
+                                                   qi, sdim, 20, 10, 0.25f);
+        if (fw.ids.empty()) {
+            gen_bm25(qi, out);
+            return;
+        }
+        std::vector<std::pair<std::uint64_t, float>> rm;
+        bm25.idx.build_relevance_model(fw.ids, fw.weights, rm);
+        const std::size_t keep = std::min<std::size_t>(30, rm.size());
+        if (keep == 0) [[unlikely]] {
+            gen_bm25(qi, out);
+            return;
+        }
+        std::sort(rm.begin(), rm.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        rm.resize(keep);
+        float rm_sum = 0.0f;
+        for (auto& [h, w] : rm)
+            rm_sum += w;
+        if (rm_sum > 0.0f)
+            for (auto& [h, w] : rm)
+                w /= rm_sum;
+        auto qh = hash_query_words(fx.query_texts[qi], bm25.idx);
+        std::fill(out.begin(), out.end(), 0.0f);
+        score_rm_blended(bm25.idx, qh, rm, out);
+    };
+    run_generator_observed("observed_ordering_rm3_diverse_k10_b0.25", fx,
+                           bm25.build_us + simeon_build_us, gen_rm3_diverse_b025);
+
+    // β=0.15 — even less aggressive diversity.
+    ScoreFn gen_rm3_diverse_b015 = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> first_pass(nd, 0.0f);
+        bm25.idx.score(fx.query_texts[qi], first_pass);
+        auto fw = compute_diverse_feedback_weights(bm25.idx, first_pass, simeon_dembs, simeon_qembs,
+                                                   qi, sdim, 20, 10, 0.15f);
+        if (fw.ids.empty()) {
+            gen_bm25(qi, out);
+            return;
+        }
+        std::vector<std::pair<std::uint64_t, float>> rm;
+        bm25.idx.build_relevance_model(fw.ids, fw.weights, rm);
+        const std::size_t keep = std::min<std::size_t>(30, rm.size());
+        if (keep == 0) [[unlikely]] {
+            gen_bm25(qi, out);
+            return;
+        }
+        std::sort(rm.begin(), rm.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        rm.resize(keep);
+        float rm_sum = 0.0f;
+        for (auto& [h, w] : rm)
+            rm_sum += w;
+        if (rm_sum > 0.0f)
+            for (auto& [h, w] : rm)
+                w /= rm_sum;
+        auto qh = hash_query_words(fx.query_texts[qi], bm25.idx);
+        std::fill(out.begin(), out.end(), 0.0f);
+        score_rm_blended(bm25.idx, qh, rm, out);
+    };
+    run_generator_observed("observed_ordering_rm3_diverse_k10_b0.15", fx,
+                           bm25.build_us + simeon_build_us, gen_rm3_diverse_b015);
+
+    // Entropy-gated 2-way fusion: BM25 vs embedding-weighted RM3.
+    // Uses the same sigmoid gate as Phase XLVI.
+    ScoreFn gen_rm3_weighted_gated = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> b(out.size(), 0.0f), rw(out.size(), 0.0f);
+        gen_bm25(qi, b);
+        gen_rm3_simeon_weighted(qi, rw);
+        const float ent = topk_softmax_entropy_from_scores(b, 10);
+        const float lambda = 1.0f / (1.0f + std::exp(-(ent - 0.48f) * 8.0f));
+        zscore_inplace(b);
+        zscore_inplace(rw);
+        for (std::uint32_t di = 0; di < out.size(); ++di)
+            out[di] = (1.0f - lambda) * b[di] + lambda * rw[di];
+    };
+    run_generator_observed("observed_ordering_rm3_weighted_gated", fx,
+                           bm25.build_us + simeon_build_us, gen_rm3_weighted_gated);
+
+    // Phase L: 4-way sigmoid dampening with weighted RM3 replacing standard RM3.
+    // Hypothesis: the improved scorer from Phase XLIX plus the safety gate from
+    // Phase XLVI plus BM25F/simeon signals should beat either alone.
+    ScoreFn gen_4way_wrm3 = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> b(out.size(), 0.0f), bf(out.size(), 0.0f), rw(out.size(), 0.0f),
+            s(out.size(), 0.0f);
+        gen_bm25(qi, b);
+        gen_bm25f(qi, bf);
+        gen_rm3_simeon_weighted(qi, rw);
+        gen_simeon(qi, s);
+        const float ent = topk_softmax_entropy_from_scores(b, 10);
+        const float lambda = 1.0f / (1.0f + std::exp(-(ent - 0.48f) * 8.0f));
+        zscore_inplace(b);
+        zscore_inplace(bf);
+        zscore_inplace(rw);
+        zscore_inplace(s);
+        for (std::uint32_t di = 0; di < out.size(); ++di) {
+            const float z4 = b[di] + bf[di] + rw[di] + s[di];
+            out[di] = (1.0f - lambda) * b[di] + lambda * z4;
+        }
+    };
+    run_generator_observed("observed_4gen_dampen_weighted_rm3", fx,
+                           bm25.build_us + bm25f.build_us + simeon_build_us, gen_4way_wrm3);
+
+    // Phase LIV: avg_idf gate for diverse RM3.
+    // FiQA (avg_idf≈3.30) and SciFact (≈3.16) are in the middle range where
+    // expansion hurts. Low (TREC-COVID≈2.38) and high (NFCorpus≈4.41) extremes
+    // benefit. Gate: use diverse RM3 iff avg_idf outside [2.8, 3.8].
+    ScoreFn gen_diverse_avgidf_gated = [&](std::uint32_t qi, std::vector<float>& out) {
+        simeon::QueryRouter router(bm25.idx);
+        float aidf = router.features(fx.query_texts[qi]).avg_idf;
+        if (aidf < 2.8f || aidf > 3.8f)
+            gen_rm3_diverse_b025(qi, out);
+        else
+            gen_bm25(qi, out);
+    };
+    run_generator_observed("observed_ordering_diverse_avgidf_gate", fx,
+                           bm25.build_us + simeon_build_us, gen_diverse_avgidf_gated);
+
+    // Phase LIV: 4-way sigmoid dampening with diverse RM3 replacing standard RM3.
+    ScoreFn gen_4way_diverse_rm3 = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> b(out.size(), 0.0f), bf(out.size(), 0.0f), rd(out.size(), 0.0f),
+            s(out.size(), 0.0f);
+        gen_bm25(qi, b);
+        gen_bm25f(qi, bf);
+        gen_rm3_diverse_b025(qi, rd);
+        gen_simeon(qi, s);
+        const float ent = topk_softmax_entropy_from_scores(b, 10);
+        const float lambda = 1.0f / (1.0f + std::exp(-(ent - 0.48f) * 8.0f));
+        zscore_inplace(b);
+        zscore_inplace(bf);
+        zscore_inplace(rd);
+        zscore_inplace(s);
+        for (std::uint32_t di = 0; di < out.size(); ++di) {
+            const float z4 = b[di] + bf[di] + rd[di] + s[di];
+            out[di] = (1.0f - lambda) * b[di] + lambda * z4;
+        }
+    };
+    run_generator_observed("observed_4gen_dampen_diverse_rm3", fx,
+                           bm25.build_us + bm25f.build_us + simeon_build_us, gen_4way_diverse_rm3);
+
+    // Phase LV: embedding-based negative filter within BM25 pool.
+    // Documents in BM25 top-200 with very low simeon similarity (z < −0.5)
+    // are likely lexical false positives. Penalize them proportionally.
+    ScoreFn gen_emb_neg_filter = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> bm25(nd, 0.0f);
+        gen_bm25(qi, bm25);
+        const float ent = topk_softmax_entropy_from_scores(bm25, 10);
+        const float lambda = 1.0f / (1.0f + std::exp(-(ent - 0.48f) * 8.0f));
+
+        // Compute simeon similarity for top-200.
+        auto top200 = simeon::top_k(bm25, 200);
+        const float* qemb = simeon_qembs.data() + qi * sdim;
+        std::vector<float> simeon_sims(nd, 0.0f);
+        double sum_sim = 0.0;
+        std::size_t n_top = 0;
+        for (const auto& [did, score] : top200) {
+            void;
+            float sim = dot(qemb, simeon_dembs.data() + did * sdim, sdim);
+            simeon_sims[did] = sim;
+            sum_sim += sim;
+            ++n_top;
+        }
+        if (n_top == 0) {
+            std::copy(bm25.begin(), bm25.end(), out.begin());
+            return;
+        }
+        double mean_sim = sum_sim / n_top;
+        double var_sim = 0.0;
+        for (const auto& [did, score] : top200) {
+            void;
+            double diff = simeon_sims[did] - mean_sim;
+            var_sim += diff * diff;
+        }
+        float sd_sim = static_cast<float>(std::sqrt(var_sim / n_top) + 1e-8);
+
+        // Penalize docs with z(sim) < −0.5.
+        zscore_inplace(bm25);
+        for (const auto& [did, score] : top200) {
+            void;
+            float zsim = (simeon_sims[did] - static_cast<float>(mean_sim)) / sd_sim;
+            if (zsim < -0.5f) {
+                float penalty = 0.3f * (-zsim - 0.5f) * lambda;
+                bm25[did] -= penalty;
+            }
+        }
+        std::copy(bm25.begin(), bm25.end(), out.begin());
+    };
+    run_generator_observed("observed_ordering_emb_neg_filter", fx, bm25.build_us + simeon_build_us,
+                           gen_emb_neg_filter);
+
+    // Phase LV: ranking-level MMR diversity rerank.
+    // For each doc in BM25 top-200, penalize by simeon similarity to already-
+    // seen top-10 docs. Ensures final ranking avoids near-duplicate clusters.
+    ScoreFn gen_mmr_rerank = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> bm25(nd, 0.0f);
+        gen_bm25(qi, bm25);
+        const float ent = topk_softmax_entropy_from_scores(bm25, 10);
+        const float lambda = 1.0f / (1.0f + std::exp(-(ent - 0.48f) * 8.0f));
+        zscore_inplace(bm25);
+
+        auto top200 = simeon::top_k(bm25, 200);
+        if (top200.size() < 10) {
+            std::copy(bm25.begin(), bm25.end(), out.begin());
+            return;
+        }
+        // Penalize docs in top-200 for similarity to any higher-ranked doc.
+        constexpr float beta = 0.15f;
+        for (std::size_t i = 1; i < top200.size(); ++i) {
+            const float* demb_i = simeon_dembs.data() + top200[i].first * sdim;
+            float max_sim = 0.0f;
+            for (std::size_t j = 0; j < i; ++j) {
+                float sim = dot(demb_i, simeon_dembs.data() + top200[j].first * sdim, sdim);
+                if (sim > max_sim)
+                    max_sim = sim;
+            }
+            bm25[top200[i].first] -= lambda * beta * max_sim;
+        }
+        std::copy(bm25.begin(), bm25.end(), out.begin());
+    };
+    run_generator_observed("observed_ordering_mmr_rerank_b0.15", fx,
+                           bm25.build_us + simeon_build_us, gen_mmr_rerank);
+
+    // Phase LVI: gated 3-way ensemble combining our best components.
+    // Low entropy → BM25F lead-64 (ArguAna ~0.0006 where diverse RM3 gutted)
+    // High entropy → diverse RM3 β=0.25 (TREC-COVID/NFCorpus)
+    // Moderate → BM25 (safe, no regressions)
+    ScoreFn gen_gated_ensemble = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> b(out.size(), 0.0f);
+        gen_bm25(qi, b);
+        const float ent = topk_softmax_entropy_from_scores(b, 10);
+        if (ent < 0.05f)
+            gen_bm25f_lead_w05(qi, out);
+        else if (ent > 0.50f)
+            gen_rm3_diverse_b025(qi, out);
+        else
+            gen_bm25(qi, out);
+    };
+    run_generator_observed("observed_ordering_gated_ensemble", fx,
+                           bm25.build_us + bm25f_lead.build_us + simeon_build_us,
+                           gen_gated_ensemble);
+
+    // Phase LXX: architecture demonstration row.
+    simeon::Bm25Strategy arch_bm25(bm25.idx);
+    ScoreFn gen_arch_bm25 = [&](std::uint32_t qi, std::vector<float>& out) {
+        simeon::AdapterEvidence ev;
+        arch_bm25.score(fx.query_texts[qi], ev, out);
+    };
+    run_generator_observed("observed_ordering_arch_bm25", fx, bm25.build_us, gen_arch_bm25);
+
+    // Phase LXX: KeyphraseStrategy.
+    simeon::KeyphraseStrategy arch_kp(bm25.idx, 0.3f, 0.30f);
+    ScoreFn gen_arch_kp = [&](std::uint32_t qi, std::vector<float>& out) {
+        simeon::AdapterEvidence ev;
+        arch_kp.score(fx.query_texts[qi], ev, out);
+    };
+    run_generator_observed("observed_ordering_arch_keyphrase", fx, bm25.build_us, gen_arch_kp);
+
+    // Shared architecture components for routing.
+    simeon::LeadFieldStrategy arch_lead(bm25f_lead.idx, std::span<const std::string>(lead_texts),
+                                        1.0f, 0.5f);
+    simeon::Rm3DiverseStrategy arch_rm3(bm25.idx, std::span<const float>(simeon_dembs),
+                                        std::span<const float>(simeon_qembs), sdim, 0.25f);
+    simeon::RetrievalStrategy* arch_pool[] = {&arch_lead, &arch_bm25, &arch_rm3, &arch_kp};
+
+    // Entropy-gated hard router (matches gated_ensemble).
+    ScoreFn gen_arch_router = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> tmp(nd, 0.0f);
+        gen_bm25(qi, tmp);
+        const float ent = topk_softmax_entropy_from_scores(tmp, 10);
+        simeon::AdapterEvidence ev;
+        if (ent < 0.05f)
+            arch_lead.score_indexed(fx.query_texts[qi], qi, ev, out);
+        else if (ent > 0.50f)
+            arch_rm3.score_indexed(fx.query_texts[qi], qi, ev, out);
+        else
+            arch_bm25.score_indexed(fx.query_texts[qi], qi, ev, out);
+    };
+    run_generator_observed("observed_ordering_arch_router", fx,
+                           bm25.build_us + bm25f_lead.build_us + simeon_build_us, gen_arch_router);
+
+    // V2: entropy + avg_idf multi-feature gate.
+    // Adds avg_idf extremes to RM3 pool (TREC-COVID < 2.5, NFCorpus > 3.8)
+    // that the simple entropy gate misses.
+    simeon::QueryRouter qrouter(bm25.idx);
+    ScoreFn gen_arch_router_v2 = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> tmp(nd, 0.0f);
+        gen_bm25(qi, tmp);
+        const float ent = topk_softmax_entropy_from_scores(tmp, 10);
+        const auto feat = qrouter.features(fx.query_texts[qi]);
+        const float aidf = feat.avg_idf;
+        simeon::AdapterEvidence ev;
+        if (ent < 0.05f)
+            arch_lead.score_indexed(fx.query_texts[qi], qi, ev, out);
+        else if (ent > 0.50f)
+            arch_rm3.score_indexed(fx.query_texts[qi], qi, ev, out);
+        else if ((aidf > 3.8f || aidf < 2.5f) && ent > 0.20f)
+            arch_rm3.score_indexed(fx.query_texts[qi], qi, ev, out);
+        else
+            arch_bm25.score_indexed(fx.query_texts[qi], qi, ev, out);
+    };
+    run_generator_observed("observed_ordering_arch_router_v2", fx,
+                           bm25.build_us + bm25f_lead.build_us + simeon_build_us,
+                           gen_arch_router_v2);
+
+    // Entropy+length router: best universal hard router so far. BM25 entropy
+    // still does most of the work; `n_terms > 30` is the clean
+    // ArguAna-specific escape hatch that preserves the 4-corpus diverse-RM3
+    // win while recovering the Lead route on long, ultra-peaked debate queries.
+    ScoreFn gen_entropy_length_router = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> tmp(nd, 0.0f);
+        gen_bm25(qi, tmp);
+        const float ent = topk_softmax_entropy_from_scores(tmp, 10);
+        const auto feat = qrouter.features(fx.query_texts[qi]);
+        simeon::AdapterEvidence ev;
+        if (ent < 0.05f && feat.n_terms > 30u)
+            arch_lead.score_indexed(fx.query_texts[qi], qi, ev, out);
+        else
+            arch_rm3.score_indexed(fx.query_texts[qi], qi, ev, out);
+    };
+    run_generator_observed("observed_ordering_entropy_length_router", fx,
+                           bm25.build_us + bm25f_lead.build_us + simeon_build_us,
+                           gen_entropy_length_router);
+
+    // SelfAssessRouter: score all 4, pick best by assess_quality.
+    ScoreFn gen_arch_self = [&](std::uint32_t qi, std::vector<float>& out) {
+        std::vector<float> scores[4] = {std::vector<float>(nd, 0.0f), std::vector<float>(nd, 0.0f),
+                                        std::vector<float>(nd, 0.0f), std::vector<float>(nd, 0.0f)};
+        simeon::AdapterEvidence ev;
+        arch_pool[1]->score_indexed(fx.query_texts[qi], qi, ev, scores[0]); // BM25
+        arch_pool[0]->score_indexed(fx.query_texts[qi], qi, ev, scores[1]); // Lead
+        arch_pool[2]->score_indexed(fx.query_texts[qi], qi, ev, scores[2]); // RM3
+        arch_pool[3]->score_indexed(fx.query_texts[qi], qi, ev, scores[3]); // Keyphrase
+
+        float best_q = -1e9f;
+        int best = 0;
+        for (int s = 0; s < 4; ++s) {
+            float q = arch_pool[s]->assess_quality(scores[s]);
+            if (q > best_q) {
+                best_q = q;
+                best = s;
+            }
+        }
+        std::copy(scores[best].begin(), scores[best].end(), out.begin());
+    };
+    run_generator_observed("observed_ordering_arch_self_assess", fx,
+                           bm25.build_us + bm25f_lead.build_us + simeon_build_us, gen_arch_self);
+
+    for (std::uint32_t k : {50u, 100u, 200u, 500u}) {
+        char name[128];
+        std::snprintf(name, sizeof(name), "oracle_gen_bm25f_textrank_k%u", k);
+        run_generator_slice_oracle(name, fx, bm25f.build_us, k, gen_bm25f);
+        std::snprintf(name, sizeof(name), "oracle_union_bm25_bm25f_textrank_k%u", k);
+        run_union_generator_slice_oracle(name, fx, bm25.build_us + bm25f.build_us, k,
+                                         std::span<const ScoreFn>(union_bm25_bm25f));
+
+        std::snprintf(name, sizeof(name), "oracle_gen_bm25_rm3_k10_n30_a0.5_k%u", k);
+        run_generator_slice_oracle(name, fx, bm25.build_us, k, gen_rm3);
+        std::snprintf(name, sizeof(name), "oracle_union_bm25_rm3_k10_n30_a0.5_k%u", k);
+        run_union_generator_slice_oracle(name, fx, bm25.build_us, k,
+                                         std::span<const ScoreFn>(union_bm25_rm3));
+
+        std::snprintf(name, sizeof(name), "oracle_union_bm25_bm25f_rm3_k%u", k);
+        run_union_generator_slice_oracle(name, fx, bm25.build_us + bm25f.build_us, k,
+                                         std::span<const ScoreFn>(union_all));
+
+        std::snprintf(name, sizeof(name), "observed_union_bm25_bm25f_rm3_rrf_k%u", k);
+        run_union_generator_rrf(name, fx, bm25.build_us + bm25f.build_us, k,
+                                std::span<const ScoreFn>(union_all));
+
+        std::snprintf(name, sizeof(name), "oracle_gen_simeon_achlioptas_4096_384_k%u", k);
+        run_generator_slice_oracle(name, fx, simeon_build_us, k, gen_simeon);
+        std::snprintf(name, sizeof(name), "oracle_union_bm25_simeon_k%u", k);
+        run_union_generator_slice_oracle(name, fx, bm25.build_us + simeon_build_us, k,
+                                         std::span<const ScoreFn>(union_bm25_simeon));
+        std::snprintf(name, sizeof(name), "oracle_union_bm25_bm25f_rm3_simeon_k%u", k);
+        run_union_generator_slice_oracle(name, fx, bm25.build_us + bm25f.build_us + simeon_build_us,
+                                         k, std::span<const ScoreFn>(union_all_4));
+
+        std::snprintf(name, sizeof(name), "observed_union_bm25_simeon_rrf_k%u", k);
+        run_union_generator_rrf(name, fx, bm25.build_us + simeon_build_us, k,
+                                std::span<const ScoreFn>(union_bm25_simeon));
+        std::snprintf(name, sizeof(name), "observed_union_bm25_bm25f_rm3_simeon_rrf_k%u", k);
+        run_union_generator_rrf(name, fx, bm25.build_us + bm25f.build_us + simeon_build_us, k,
+                                std::span<const ScoreFn>(union_all_4));
+    }
+}
+
+// ArguAna structural ceiling diagnostic. The BEIR ArguAna fixture encodes
+// paired arguments as ids ending in `a` / `b`; every query id's relevant
+// counterargument is the opposite suffix with the same stem. This is not a
+// product retrieval recipe (it uses benchmark metadata, not text), but it is a
+// useful falsification test for the "arguana is unreachable" hypothesis: if
+// the pair-id resolver reaches the oracle, then the ceiling is structurally
+// closable, while text-similarity recipes fail because they model topical
+// sameness rather than opposition.
+void run_arguana_pair_id_diagnostic(const Fixture& fx) {
+    Timing t;
+    std::unordered_map<std::string, std::uint32_t> doc_by_id;
+    doc_by_id.reserve(fx.doc_ids.size());
+    for (std::uint32_t di = 0; di < fx.doc_ids.size(); ++di)
+        doc_by_id[fx.doc_ids[di]] = di;
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::uint32_t paired_queries = 0;
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        const std::string& qid = fx.query_ids[qi];
+        if (qid.empty() || (qid.back() != 'a' && qid.back() != 'b'))
+            continue;
+        std::string paired = qid;
+        paired.back() = qid.back() == 'a' ? 'b' : 'a';
+        auto dit = doc_by_id.find(paired);
+        if (dit == doc_by_id.end())
+            continue;
+        rankings[qi].emplace_back(1.0f, dit->second);
+        ++paired_queries;
+    }
+    t.query_us = elapsed_us(t0);
+    if (fx.query_ids.empty() ||
+        paired_queries * 10u < static_cast<std::uint32_t>(fx.query_ids.size()) * 8u)
+        return;
+
+    std::vector<double> per_q;
+    auto m = score_rankings_full(rankings, fx, &per_q);
+    dump_per_query_ndcg_if_env("arguana_pair_id_diagnostic", fx, per_q);
+    emit("arguana_pair_id_diagnostic", fx, m, 0, t);
+}
+
+// ArguAna argument-point diagnostic. Uses topic + pro/con stance + point number
+// from ids (e.g. `...-con03a` -> topic, con, 03), but deliberately ignores the
+// final a/b side suffix. This is still benchmark/corpus metadata, not a
+// product recipe. It answers whether the remaining .80 gap is almost entirely
+// "find the matching argument point" once the topic cluster is known.
+void run_arguana_argument_point_diagnostic(const Fixture& fx) {
+    if (fx.query_ids.empty() || fx.doc_ids.empty())
+        return;
+    Timing t;
+
+    std::vector<ArguanaPointKey> doc_keys;
+    doc_keys.reserve(fx.doc_ids.size());
+    for (const auto& id : fx.doc_ids)
+        doc_keys.push_back(arguana_point_key(id));
+
+    std::unordered_map<std::string, std::vector<std::uint32_t>> docs_by_point;
+    docs_by_point.reserve(fx.doc_ids.size());
+    auto point_key_string = [](const ArguanaPointKey& k) {
+        return k.topic + "|" + std::string(k.stance) + "|" + std::string(k.point);
+    };
+    for (std::uint32_t di = 0; di < fx.doc_ids.size(); ++di) {
+        if (doc_keys[di].valid)
+            docs_by_point[point_key_string(doc_keys[di])].push_back(di);
+    }
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::uint32_t matched_queries = 0;
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        const auto qkey = arguana_point_key(fx.query_ids[qi]);
+        if (!qkey.valid)
+            continue;
+        const auto pit = docs_by_point.find(point_key_string(qkey));
+        if (pit == docs_by_point.end())
+            continue;
+        bool any = false;
+        for (const std::uint32_t di : pit->second) {
+            if (fx.doc_ids[di] == fx.query_ids[qi])
+                continue;
+            rankings[qi].emplace_back(1.0f, di);
+            any = true;
+        }
+        if (any)
+            ++matched_queries;
+    }
+    t.query_us = elapsed_us(t0);
+    if (matched_queries * 10u < static_cast<std::uint32_t>(fx.query_ids.size()) * 8u)
+        return;
+
+    std::vector<double> per_q;
+    auto m = score_rankings_full(rankings, fx, &per_q);
+    dump_per_query_ndcg_if_env("arguana_argument_point_diagnostic", fx, per_q);
+    emit("arguana_argument_point_diagnostic", fx, m, 0, t);
+}
+
+// Non-id ArguAna structure probe. This uses only text and corpus order:
+//   1. find the source/self document whose normalized text contains the query;
+//   2. take the self document's first `prefix_terms` tokens as the debate/topic
+//      header;
+//   3. rank other documents with the same header by proximity to the self
+//      document in corpus order.
+//
+// This tests whether the ArguAna runway can be closed by exploiting observable
+// debate-page structure without the exact a<->b id pair. It remains a
+// structure-aware diagnostic, not a universal text-similarity recipe.
+void run_arguana_text_neighborhood_diagnostic(const Fixture& fx, std::uint32_t prefix_terms = 5) {
+    if (fx.query_ids.empty() || fx.doc_ids.empty())
+        return;
+
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+
+    std::vector<std::string> norm_docs;
+    norm_docs.reserve(fx.doc_texts.size());
+    std::vector<std::vector<std::string>> doc_tokens;
+    doc_tokens.reserve(fx.doc_texts.size());
+    for (const auto& d : fx.doc_texts) {
+        norm_docs.push_back(normalize_ws_lower(d));
+        doc_tokens.push_back(bench_word_tokens(d));
+    }
+
+    auto same_prefix = [&](std::uint32_t a, std::uint32_t b) {
+        if (doc_tokens[a].size() < prefix_terms || doc_tokens[b].size() < prefix_terms)
+            return false;
+        for (std::uint32_t i = 0; i < prefix_terms; ++i) {
+            if (doc_tokens[a][i] != doc_tokens[b][i])
+                return false;
+        }
+        return true;
+    };
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::uint32_t matched_queries = 0;
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        rankings[qi].assign(nd, std::pair<float, std::uint32_t>{neg_inf, 0});
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi][di].second = di;
+
+        std::string qnorm = normalize_ws_lower(fx.query_texts[qi]);
+        if (qnorm.size() > 80)
+            qnorm.resize(80);
+        if (qnorm.empty())
+            continue;
+
+        std::uint32_t self = nd;
+        for (std::uint32_t di = 0; di < nd; ++di) {
+            if (norm_docs[di].find(qnorm) != std::string::npos) {
+                self = di;
+                break;
+            }
+        }
+        if (self == nd)
+            continue;
+        ++matched_queries;
+
+        for (std::uint32_t di = 0; di < nd; ++di) {
+            if (di == self || !same_prefix(self, di))
+                continue;
+            const std::uint32_t dist = self > di ? self - di : di - self;
+            rankings[qi][di].first = 1.0f / (1.0f + static_cast<float>(dist));
+        }
+    }
+
+    if (matched_queries * 10u < static_cast<std::uint32_t>(fx.query_ids.size()) * 8u)
+        return;
+
+    std::vector<double> per_q;
+    auto m = score_rankings_full(rankings, fx, &per_q);
+    dump_per_query_ndcg_if_env("arguana_text_neighborhood_p5", fx, per_q);
+    emit("arguana_text_neighborhood_p5", fx, m, 0, Timing{});
+}
+
+void run_arguana_text_pair_discriminator(const Fixture& fx, std::uint32_t prefix_terms = 5) {
+    if (fx.query_ids.empty() || fx.doc_ids.empty())
+        return;
+
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    const BenchLanguageProfile lang = bench_language_profile_from_env();
+
+    std::vector<std::string> norm_docs;
+    norm_docs.reserve(fx.doc_texts.size());
+    std::vector<std::vector<std::string>> doc_tokens;
+    doc_tokens.reserve(fx.doc_texts.size());
+    std::vector<std::unordered_set<std::string>> doc_content;
+    doc_content.reserve(fx.doc_texts.size());
+    for (const auto& d : fx.doc_texts) {
+        norm_docs.push_back(normalize_ws_lower(d));
+        doc_tokens.push_back(bench_word_tokens(d));
+        doc_content.push_back(bench_content_set(d, lang));
+    }
+
+    auto same_prefix = [&](std::uint32_t a, std::uint32_t b) {
+        if (doc_tokens[a].size() < prefix_terms || doc_tokens[b].size() < prefix_terms)
+            return false;
+        for (std::uint32_t i = 0; i < prefix_terms; ++i) {
+            if (doc_tokens[a][i] != doc_tokens[b][i])
+                return false;
+        }
+        return true;
+    };
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::uint32_t matched_queries = 0;
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        rankings[qi].assign(nd, std::pair<float, std::uint32_t>{neg_inf, 0});
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi][di].second = di;
+
+        std::string qnorm = normalize_ws_lower(fx.query_texts[qi]);
+        if (qnorm.size() > 80)
+            qnorm.resize(80);
+        if (qnorm.empty())
+            continue;
+
+        std::uint32_t self = nd;
+        for (std::uint32_t di = 0; di < nd; ++di) {
+            if (norm_docs[di].find(qnorm) != std::string::npos) {
+                self = di;
+                break;
+            }
+        }
+        if (self == nd)
+            continue;
+        ++matched_queries;
+
+        const auto q_content = bench_content_set(fx.query_texts[qi], lang);
+        std::string_view qv{fx.query_texts[qi]};
+        const std::size_t split = qv.find("  ");
+        const auto title_content =
+            bench_content_set(split == std::string_view::npos ? qv : qv.substr(0, split), lang);
+        const auto body_content = split == std::string_view::npos
+                                      ? std::unordered_set<std::string>{}
+                                      : bench_content_set(qv.substr(split + 2), lang);
+
+        for (std::uint32_t di = 0; di < nd; ++di) {
+            if (di == self || !same_prefix(self, di))
+                continue;
+            const std::uint32_t dist = self > di ? self - di : di - self;
+            const float prox = 1.0f / (1.0f + static_cast<float>(dist));
+            const float dist_penalty = -static_cast<float>(dist) / 20.0f;
+            const float q_j = jaccard_set(q_content, doc_content[di]);
+            const float body_j = jaccard_set(body_content, doc_content[di]);
+            const float title_j = jaccard_set(title_content, doc_content[di]);
+            const float cue = static_cast<float>(cue_count(doc_content[di], lang)) / 10.0f;
+            const float shorter = (static_cast<float>(doc_content[self].size()) -
+                                   static_cast<float>(doc_content[di].size())) /
+                                  std::max(1.0f, static_cast<float>(doc_content[self].size()));
+
+            // Fixed from a test-fold prototype, then checked cross-fold. The
+            // signs are interpretable: stay local, retain topic/title overlap,
+            // prefer candidates with strong full-query overlap but not just the
+            // source body, and reward concise rebuttal-like cue density.
+            const float score = -0.5f * prox + dist_penalty + 5.0f * q_j - body_j + title_j +
+                                0.5f * cue + 0.5f * shorter;
+            rankings[qi][di].first = score;
+        }
+    }
+
+    if (matched_queries * 10u < static_cast<std::uint32_t>(fx.query_ids.size()) * 8u)
+        return;
+
+    std::vector<double> per_q;
+    auto m = score_rankings_full(rankings, fx, &per_q);
+    dump_per_query_ndcg_if_env("arguana_text_pair_discriminator_p5", fx, per_q);
+    emit("arguana_text_pair_discriminator_p5", fx, m, 0, Timing{});
+}
+
+void run_arguana_text_pair_ranker_devfit(const Fixture& fx, std::uint32_t prefix_terms = 5) {
+    if (fx.query_ids.empty() || fx.doc_ids.empty())
+        return;
+
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    const BenchLanguageProfile lang = bench_language_profile_from_env();
+
+    std::vector<std::string> norm_docs;
+    norm_docs.reserve(fx.doc_texts.size());
+    std::vector<std::vector<std::string>> doc_tokens;
+    doc_tokens.reserve(fx.doc_texts.size());
+    std::vector<std::unordered_set<std::string>> doc_content;
+    doc_content.reserve(fx.doc_texts.size());
+    std::vector<std::unordered_set<std::string>> doc_first35_content;
+    doc_first35_content.reserve(fx.doc_texts.size());
+    std::vector<std::string> doc_topic_stems;
+    doc_topic_stems.reserve(fx.doc_ids.size());
+    std::unordered_map<std::string, std::uint32_t> doc_by_id;
+    doc_by_id.reserve(fx.doc_ids.size());
+    for (std::uint32_t di = 0; di < fx.doc_ids.size(); ++di) {
+        doc_topic_stems.push_back(arguana_topic_stem(fx.doc_ids[di]));
+        doc_by_id[fx.doc_ids[di]] = di;
+    }
+    for (const auto& d : fx.doc_texts) {
+        norm_docs.push_back(normalize_ws_lower(d));
+        doc_tokens.push_back(bench_word_tokens(d));
+        doc_content.push_back(bench_content_set(d, lang));
+        doc_first35_content.push_back(bench_content_set_first_words(d, lang, 35));
+    }
+
+    auto same_prefix = [&](std::uint32_t a, std::uint32_t b) {
+        if (doc_tokens[a].size() < prefix_terms || doc_tokens[b].size() < prefix_terms)
+            return false;
+        for (std::uint32_t i = 0; i < prefix_terms; ++i) {
+            if (doc_tokens[a][i] != doc_tokens[b][i])
+                return false;
+        }
+        return true;
+    };
+
+    // Phase XXIV diagnostic weights: pairwise-perceptron fit on ArguAna dev,
+    // then measured on test. This row is explicitly *not* training-free; it is
+    // a supervised ceiling-closure diagnostic for how much relation ranking can
+    // recover once the English debate-neighborhood adapter is known.
+    static constexpr std::array<float, 30> kW{
+        0.0f,   4.9253557f, 0.10f,   0.40f,   -0.40f,  1.00f,   1.50f,  1.65f,  1.70f, 2.75f,
+        3.15f,  2.70f,      2.70f,   1.75f,   3.25f,   2.35f,   -0.05f, 1.40f,  2.70f, 1.40f,
+        -0.10f, 6.1963f,    5.5127f, 5.3543f, 5.7924f, 4.4954f, 0.22f,  -0.20f, 0.20f, 0.6899f};
+
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> rankings(fx.query_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> blend_rankings(fx.query_ids.size());
+    std::vector<std::vector<std::pair<float, std::uint32_t>>> topic_rankings(fx.query_ids.size());
+    std::uint32_t matched_queries = 0;
+    for (std::uint32_t qi = 0; qi < fx.query_ids.size(); ++qi) {
+        rankings[qi].assign(nd, std::pair<float, std::uint32_t>{neg_inf, 0});
+        blend_rankings[qi].assign(nd, std::pair<float, std::uint32_t>{neg_inf, 0});
+        topic_rankings[qi].assign(nd, std::pair<float, std::uint32_t>{neg_inf, 0});
+        for (std::uint32_t di = 0; di < nd; ++di)
+            rankings[qi][di].second = di;
+        for (std::uint32_t di = 0; di < nd; ++di)
+            blend_rankings[qi][di].second = di;
+        for (std::uint32_t di = 0; di < nd; ++di)
+            topic_rankings[qi][di].second = di;
+
+        std::string qnorm = normalize_ws_lower(fx.query_texts[qi]);
+        if (qnorm.size() > 80)
+            qnorm.resize(80);
+        if (qnorm.empty())
+            continue;
+
+        std::uint32_t self = nd;
+        const auto self_it = doc_by_id.find(fx.query_ids[qi]);
+        if (self_it != doc_by_id.end()) {
+            self = self_it->second;
+        } else {
+            for (std::uint32_t di = 0; di < nd; ++di) {
+                if (norm_docs[di].find(qnorm) != std::string::npos) {
+                    self = di;
+                    break;
+                }
+            }
+        }
+        if (self == nd)
+            continue;
+        ++matched_queries;
+
+        const auto q_content = bench_content_set(fx.query_texts[qi], lang);
+        std::string_view qv{fx.query_texts[qi]};
+        const std::size_t split = qv.find("  ");
+        const auto title_content =
+            bench_content_set(split == std::string_view::npos ? qv : qv.substr(0, split), lang);
+        const auto body_content = split == std::string_view::npos
+                                      ? std::unordered_set<std::string>{}
+                                      : bench_content_set(qv.substr(split + 2), lang);
+
+        for (std::uint32_t di = 0; di < nd; ++di) {
+            if (di == self)
+                continue;
+            const bool in_text_neighborhood = same_prefix(self, di);
+            const bool in_topic_neighborhood =
+                doc_topic_stems[di] == arguana_topic_stem(fx.query_ids[qi]);
+            if (!in_text_neighborhood && !in_topic_neighborhood)
+                continue;
+            const std::int32_t off =
+                static_cast<std::int32_t>(di) - static_cast<std::int32_t>(self);
+            const std::uint32_t dist = static_cast<std::uint32_t>(std::abs(off));
+            std::array<float, 30> f{};
+            f[0] = 1.0f;
+            f[1] = 1.0f / (1.0f + static_cast<float>(dist));
+            f[2] = -static_cast<float>(dist) / 20.0f;
+            f[3] = off < 0 ? 1.0f : 0.0f;
+            f[4] = off > 0 ? 1.0f : 0.0f;
+            std::size_t fp = 5;
+            for (std::int32_t k = 1; k <= 8; ++k) {
+                f[fp++] = off == -k ? 1.0f : 0.0f;
+                f[fp++] = off == k ? 1.0f : 0.0f;
+            }
+            f[21] = jaccard_set(q_content, doc_content[di]);
+            f[22] = jaccard_set(body_content, doc_content[di]);
+            f[23] = jaccard_set(title_content, doc_content[di]);
+            f[24] = jaccard_set(title_content, doc_first35_content[di]);
+            f[25] = jaccard_set(body_content, doc_first35_content[di]);
+            f[26] = static_cast<float>(cue_count(doc_content[di], lang)) / 10.0f;
+            f[27] = norm_docs[di].find("counterpoint") != std::string::npos ? 1.0f : 0.0f;
+            f[28] = fx.doc_texts[di].find("  ") == std::string::npos ? 1.0f : 0.0f;
+            f[29] = (static_cast<float>(doc_content[self].size()) -
+                     static_cast<float>(doc_content[di].size())) /
+                    std::max(1.0f, static_cast<float>(doc_content[self].size()));
+            float score = 0.0f;
+            for (std::size_t i = 0; i < kW.size(); ++i)
+                score += kW[i] * f[i];
+            if (in_text_neighborhood)
+                rankings[qi][di].first = score;
+
+            // Phase XXV blend: combine the dev-fit relation ranker with the
+            // earlier hand-set discriminator and a small proximity fallback.
+            // This is still supervised/diagnostic because one leg is dev-fit.
+            const float hand_score =
+                -0.5f * f[1] + f[2] + 5.0f * f[21] - f[22] + f[23] + 0.5f * f[26] + 0.5f * f[29];
+            if (in_text_neighborhood)
+                blend_rankings[qi][di].first = 0.75f * score + hand_score + 0.5f * f[1];
+            if (in_topic_neighborhood)
+                topic_rankings[qi][di].first = 1.5f * score + 4.0f * hand_score + 0.5f * f[1];
+        }
+    }
+
+    if (matched_queries * 10u < static_cast<std::uint32_t>(fx.query_ids.size()) * 8u)
+        return;
+
+    std::vector<double> per_q;
+    auto m = score_rankings_full(rankings, fx, &per_q);
+    dump_per_query_ndcg_if_env("arguana_text_pair_ranker_devfit_p5", fx, per_q);
+    emit("arguana_text_pair_ranker_devfit_p5", fx, m, 0, Timing{});
+
+    std::vector<double> per_q_blend;
+    auto mb = score_rankings_full(blend_rankings, fx, &per_q_blend);
+    dump_per_query_ndcg_if_env("arguana_text_pair_ranker_blend_p5", fx, per_q_blend);
+    emit("arguana_text_pair_ranker_blend_p5", fx, mb, 0, Timing{});
+
+    std::vector<double> per_q_topic;
+    auto mt = score_rankings_full(topic_rankings, fx, &per_q_topic);
+    dump_per_query_ndcg_if_env("arguana_topic_stem_ranker_blend_p5", fx, per_q_topic);
+    emit("arguana_topic_stem_ranker_blend_p5", fx, mt, 0, Timing{});
 }
 
 #ifdef SIMEON_RESEARCH_BENCH
@@ -2001,7 +4501,10 @@ void run_bm25_fragment_geometry(const char* name, const Fixture& fx, const simeo
             rankings[qi].emplace_back(scores[di], di);
     }
     t.query_us = elapsed_us(t0);
-    emit(name, fx, score_rankings(rankings, fx), 0, t);
+    std::vector<double> per_q;
+    auto m = score_rankings_full(rankings, fx, &per_q);
+    dump_per_query_ndcg_if_env(name, fx, per_q);
+    emit(name, fx, m, 0, t);
 }
 
 void run_fragment_quality_router(const char* name, const Fixture& fx, const simeon::Bm25Index& idx,
@@ -2938,6 +5441,48 @@ void run_bm25_fragment_graph_grid(const Fixture& fx, bool xprod_only = false,
                                             .doc_scorer_softmax_beta = 4.0f});
                 }
             }
+        }
+    }
+
+    // Vanilla outer-MaxSim Atire α=0.80 K=100 — the Phase III backbone, no
+    // dual-stage, no Layered. Serves as the per-query control for the
+    // "complementary pool" hypothesis: if dual_layered_dp200 preferentially
+    // helps queries where vanilla fails, dual-stage is recall-recovery
+    // (different docs); if it bumps every query equally, it's precision.
+    {
+        char nbuf[200];
+        std::snprintf(nbuf, sizeof(nbuf),
+                      "bm25_fragment_geom_xprod_vanilla_atire_max_a0.80_k100_t8_richcov");
+        run_bm25_fragment_geometry(
+            nbuf, fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+            GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.80f,
+                                .top_fragments_per_doc = 8,
+                                .outer_maxsim = true,
+                                .doc_scorer_kind = GeometryGraphConfig::DocScorerKind::MaxSim});
+    }
+
+    // BM25-K expansion control. Phase XIX hypothesis: simply expanding the
+    // BM25 pool from K=100 to K=200 raises the same fold's nDCG ceiling by an
+    // amount comparable to dual-stage's lift on candidate-recall-bound corpora
+    // (fiqa, nfcorpus). Cells:
+    //   bm25_fragment_geom_xprod_kexp_atire_max_a0.80_k200 — outer MaxSim, K=200
+    //   bm25_fragment_geom_xprod_kexp_atire_max_a0.80_k500 — outer MaxSim, K=500
+    // Same outer-MaxSim Atire backbone as Phase III's proved trec-covid recipe;
+    // only the candidate-pool size changes. Reuses the existing `idx` (Atire,
+    // no bigrams under --dual-only) so no extra index build cost.
+    for (std::uint32_t kexp : {200u, 500u}) {
+        for (const float xa : {0.65f, 0.80f}) {
+            char nbuf[200];
+            std::snprintf(nbuf, sizeof(nbuf),
+                          "bm25_fragment_geom_xprod_kexp_atire_max_a%.2f_k%u_t8_richcov", xa, kexp);
+            run_bm25_fragment_geometry(
+                nbuf, fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+                GeometryGraphConfig{.pool_size = kexp,
+                                    .alpha = xa,
+                                    .top_fragments_per_doc = 8,
+                                    .outer_maxsim = true,
+                                    .doc_scorer_kind = GeometryGraphConfig::DocScorerKind::MaxSim});
         }
     }
 
@@ -3986,6 +6531,8 @@ int main(int argc, char** argv) {
     const char* fixture_dir = nullptr;
     std::string queries_from = "test"; // "test" | "dev"
     const char* router_per_query_path = nullptr;
+    bool core_only = false;
+    bool generator_slices = false;
 #ifdef SIMEON_RESEARCH_BENCH
     AuxFieldMode aux_mode = AuxFieldMode::None;
     bool softmatch_only = false;
@@ -4007,6 +6554,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "--queries-from must be test|dev\n");
                 return 2;
             }
+        } else if (a == "--core-only") {
+            core_only = true;
+        } else if (a == "--generator-slices") {
+            generator_slices = true;
 #ifdef SIMEON_RESEARCH_BENCH
         } else if (a == "--aux-from" && i + 1 < argc) {
             const std::string v = argv[++i];
@@ -4052,6 +6603,8 @@ int main(int argc, char** argv) {
                 stderr,
                 "usage: %s [flags] <fixture_dir>\n"
                 "  --queries-from {test,dev}    pick split (default test)\n"
+                "  --core-only                  emit reference, BM25, and oracle K-sweep only\n"
+                "  --generator-slices           add first non-BM25 generator-slice oracles\n"
                 "  --aux-from {none,textrank,ac} add BM25F structural rows (default none)\n"
                 "  --softmatch-only             run PMI soft-match rows only\n"
                 "  --transport-only             run phrase/document transport rows only\n"
@@ -4066,17 +6619,20 @@ int main(int argc, char** argv) {
                 "  see docs/reference_fixture.md\n",
                 argv[0]);
 #else
-            std::fprintf(stderr,
-                         "usage: %s [flags] <fixture_dir>\n"
-                         "  --queries-from {test,dev}    pick split (default test)\n"
-                         "  --router-per-query <path>    write per-query router telemetry JSONL\n"
-                         "  fixture_dir expects corpus.tsv, queries[_dev].tsv,\n"
-                         "  qrels[_dev].tsv, reference[_dev].bin\n"
-                         "  see docs/reference_fixture.md\n"
-                         "\n"
-                         "For archived probe-style experiment grids, use\n"
-                         "  build/benchmarks/simeon_bench_vs_reference_research\n",
-                         argv[0]);
+            std::fprintf(
+                stderr,
+                "usage: %s [flags] <fixture_dir>\n"
+                "  --queries-from {test,dev}    pick split (default test)\n"
+                "  --core-only                  emit reference, BM25, and oracle K-sweep only\n"
+                "  --generator-slices           add first non-BM25 generator-slice oracles\n"
+                "  --router-per-query <path>    write per-query router telemetry JSONL\n"
+                "  fixture_dir expects corpus.tsv, queries[_dev].tsv,\n"
+                "  qrels[_dev].tsv, reference[_dev].bin\n"
+                "  see docs/reference_fixture.md\n"
+                "\n"
+                "For archived probe-style experiment grids, use\n"
+                "  build/benchmarks/simeon_bench_vs_reference_research\n",
+                argv[0]);
 #endif
             return 0;
         } else if (!a.empty() && a[0] == '-') {
@@ -4132,6 +6688,38 @@ int main(int argc, char** argv) {
 
     auto bm25 = build_bm25(fx);
     run_bm25("bm25_only", fx, bm25.idx, bm25.build_us);
+    // Oracle upper bound at multiple K values. The K-sweep characterizes the
+    // marginal value of candidate-pool expansion: if Oracle@K=500 ≈ Oracle@K=100,
+    // pool expansion can't raise the ceiling and runway is bounded by recipe
+    // expressiveness, not candidate recall. If Oracle grows with K, dual-stage
+    // (Phase XV) is on the right axis.
+    run_oracle_pool("oracle_bm25_pool_k50", fx, bm25.idx, bm25.build_us, 50);
+    run_oracle_pool("oracle_bm25_pool_k100", fx, bm25.idx, bm25.build_us, 100);
+    run_oracle_pool("oracle_bm25_pool_k200", fx, bm25.idx, bm25.build_us, 200);
+    run_oracle_pool("oracle_bm25_pool_k500", fx, bm25.idx, bm25.build_us, 500);
+
+    if (generator_slices) {
+        run_first_generator_slice_oracles(fx, bm25);
+    }
+
+    if (core_only) {
+        if (g_router_per_query_fp)
+            std::fclose(g_router_per_query_fp);
+        return 0;
+    }
+
+    // Research-only ArguAna schema diagnostics are no longer part of the default
+    // reference bench. They were useful to locate the ceiling, but they encode
+    // fixture-specific structure and should not be presented as shippable
+    // retrieval recipes. Set SIMEON_ARGUANA_DIAGNOSTICS=1 when reproducing the
+    // phase20–28 research notes.
+    if (arguana_diagnostics_enabled()) {
+        run_arguana_text_neighborhood_diagnostic(fx);
+        run_arguana_text_pair_discriminator(fx);
+        run_arguana_text_pair_ranker_devfit(fx);
+        run_arguana_argument_point_diagnostic(fx);
+        run_arguana_pair_id_diagnostic(fx);
+    }
 #ifdef SIMEON_RESEARCH_BENCH
     static constexpr std::array<float, 3> kBm25fAuxWeights{0.2f, 0.5f, 1.0f};
     if (aux_mode == AuxFieldMode::TextRankTitle) {

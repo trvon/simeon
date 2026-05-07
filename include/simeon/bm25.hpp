@@ -262,6 +262,18 @@ public:
     void score_weighted_hashes(std::span<const std::pair<std::uint64_t, float>> weighted_terms,
                                std::span<float> out_scores) const;
 
+    // LM-style score interpolation: score each doc as
+    //   Σ_t body_w(t) * body_contrib(t,d) + aux_w(t) * aux_contrib(t,d)
+    // using separate body and aux postings.  `body_weighted_terms` are scored
+    // against postings_ (body) and `aux_weighted_terms` against aux_postings_.
+    // Both spans use the same (term_hash, per-term-weight) format as
+    // score_weighted_hashes.  out_scores must be pre-zeroed and sized to
+    // doc_count().  Does not invoke SAB n-gram fallback (no term strings).
+    void
+    score_lm_interpolation(std::span<const std::pair<std::uint64_t, float>> body_weighted_terms,
+                           std::span<const std::pair<std::uint64_t, float>> aux_weighted_terms,
+                           std::span<float> out_scores) const;
+
     // SDM (Metzler & Croft 2005): three-leg blend of unigram BM25 (via the
     // configured Bm25Variant), ordered-bigram BM25, and windowed-unordered-
     // bigram BM25. Requires cfg_.build_word_bigrams == true at construction;

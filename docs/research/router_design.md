@@ -1,5 +1,16 @@
 # Query router design
 
+## Status
+
+This note documents the **early BM25-family recipe router** that selects among
+`Bm25Atire`, `Bm25SabSmooth`, and `CascadeLinearAlpha`. It remains useful as the
+design note for `QueryRouter` and its feature inventory, but it is **not** the
+current best universal benchmark router.
+
+The current best universal hard router is the entropy+length 2-way selector over
+`LeadFieldStrategy` vs `Rm3DiverseStrategy`; see
+[phase71_entropy_length_router.md](phase71_entropy_length_router.md).
+
 Per-query selection between simeon's BM25 variants and cascade configurations,
 using cheap corpus-statistic predictors and static thresholds chosen from the
 scifact ablation in `docs/benchmarks.md`.

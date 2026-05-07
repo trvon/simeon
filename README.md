@@ -58,6 +58,81 @@ In YAMS, simeon is used as the default retrieval embedding backend and lexical c
 
 simeon is best read as an engineering and evaluation layer over several lines of prior work: NUMEN-style training-free retrieval, ColBERT-era late-interaction framing, sparse random projection, matryoshka-style nested representations, Product Quantization, and classical query-difficulty routing. It is not a new retrieval algorithm. The shipped benchmark and router notes include negative findings, so this repository should not be read as blanket validation of any single upstream paper's headline claims.
 
+## Corpus adapters and ceiling research
+
+Recent ArguAna experiments in `docs/research/` show that the gap between a
+training-free recipe and the BM25 candidate-pool oracle is often **structure
+recognition**, not more vector similarity. On the full English ArguAna fixture,
+BM25 reaches ~0.32 nDCG@10 while the BM25-top-100 oracle is ~0.92. Adding
+corpus-specific structure progressively closes the gap:
+
+| Stage | nDCG@10 | Scope |
+|---|---:|---|
+| BM25 baseline | ~0.32 | general lexical retrieval |
+| text-neighborhood structure | ~0.44 | text-derived debate cluster |
+| English pair discriminator | ~0.63 | English relation cues |
+| topic-stem blended ranker | ~0.76 | ArguAna topic adapter |
+| argument-point diagnostic | 1.00 | ArguAna schema diagnostic, not a product recipe |
+
+The product lesson is: expose **corpus adapters** when structure exists — paths,
+titles, sections, headings, issue IDs, citations, debate points — and keep them
+separate from universal embedding claims. YAMS now has a first-class
+`CorpusAdapter` component; its built-in native adapter performs English-first
+query seeding for path/content fragments plus structured metadata filters, then
+fuses the result as `corpus_adapter` evidence.
+
+The ArguAna diagnostic rows are not shippable general retrieval algorithms;
+they are evidence that structured adapters can unlock headroom already present
+in the candidate set. They are no longer emitted by default from the reference
+bench; set `SIMEON_ARGUANA_DIAGNOSTICS=1` only when reproducing the phase20–28
+research notes.
+
+PRs are welcome for additional English corpora, corpus adapters, language
+profiles, and qrel-backed fixtures that let these findings transfer beyond
+ArguAna.
+
+The current theorem work now treats BM25 as one generator variable inside
+`T=(G,A,S,F,B)`, not as the ceiling. BM25F and RM3 generator slices raise the
+measured union oracle across the English fixtures, while Phase XXXVI shows that
+qrel-free post-retrieval gate features recover part of the BM25/RM3 per-query
+oracle on NFCorpus and TREC-COVID. Phase XXXVII adds the stricter constraint that
+router rules must be corpus-agnostic: a shippable router may inspect query and
+rank-neighborhood features, but not corpus IDs. Phase XXXVIII clarifies that
+oracle rows are answer-key diagnostics, not callable system components. Phase
+XXXIX adds rank-shape risk features; pooled robust gates reduce regressions, but
+LOCO transfer remains weak. Phase XL turns those diagnostics into observed
+score-level rows: shape-risk fusion improves macro nDCG@10 over BM25/static
+z-fusion while avoiding the large SciFact regression. Phase XLI shows that simple
+lexical-overlap reranking does not reduce the remaining ordering gap. Phase XLII
+shows static central/lead fields are also not a general fix. Phase XLIII shows
+structural features are currently better as risk sensors for shape-risk fusion
+than as directly promoted fields. Phase XLIV adds simeon's own training-free
+embedding as a generator slice. Standalone simeon is weak (0.2123 macro), but the
+4-way union oracle (BM25 + BM25F + RM3 + simeon) rises to 0.8089 from 0.7848,
+proving the embedding exposes different relevant documents. The observed 4-way
+z-equal fusion reaches 0.4045 macro nDCG@10, a new best observed row, with the
+largest gains on TREC-COVID (+0.0479) and NFCorpus (+0.0102). Phase XLV adds a
+corpus-agnostic safety gate for the 4-way fusion: `bm25_entropy10 >= 0.48`
+decides when BM25 is uncertain enough for the simeon leg to help safely. The
+resulting `observed_4gen_risk_entropy_gate_devfit` reaches 0.4014 macro nDCG@10
+with **non-negative deltas on every corpus** (worst −0.0007 on FiQA), making it
+a safer shippable candidate than raw 4-way z-equal. Phase XLVI replaces the hard
+gate with a continuous sigmoid dampening that transitions gradually as BM25
+uncertainty rises, reaching 0.4041 macro (+0.0101 over BM25) with **positive
+deltas on every corpus** (worst +0.0004 on ArguAna). The dampened row nearly
+matches raw 4-way z-equal while eliminating its regressions entirely. Phase XLVII
+finds that adding complementarity and simeon-confidence gates makes things worse:
+simple entropy dampening is Pareto-optimal. Phase XLVIII shows consensus filtering
+also fails. Phase XLIX makes the first successful scorer-level improvement:
+embedding-weighted RM3 filters pseudo-relevance docs by simeon similarity,
+achieving 0.4046 macro (+0.0106 over BM25) as a single generator — matching the
+4-way dampening and fixing RM3's ArguAna regression (+0.0080 Δ vs standard RM3).
+The remaining proof obligation is rich within-pool ordering and a safety gate
+for the SciFact regression (−0.0154). Phase L swaps weighted RM3 into the 4-way
+sigmoid dampening; the result is tied at 0.4041 macro — the improved scorer helps
+NFCorpus but the additional generator signals dilute the gain elsewhere. The
+clean conclusion: a single better scorer beats a fusion of weaker ones.
+
 ## Documentation
 
 | Topic              | File                                                  |
@@ -66,6 +141,37 @@ simeon is best read as an engineering and evaluation layer over several lines of
 | Benchmarks         | [docs/research/benchmarks.md](docs/research/benchmarks.md)              |
 | Research notes     | [docs/research/index.md](docs/research/index.md)                  |
 | Research saturation | [docs/research/training_free_saturation.md](docs/research/training_free_saturation.md) |
+| Training-free ceiling | [docs/research/training_free_optimum.md](docs/research/training_free_optimum.md) |
+| Training-free space | [docs/research/training_free_space_redefinition.md](docs/research/training_free_space_redefinition.md) |
+| Generator-slice oracle | [docs/research/phase31_theorem_redefinition_plan.md](docs/research/phase31_theorem_redefinition_plan.md) |
+| RM3 generator slice | [docs/research/phase32_rm3_generator_slice.md](docs/research/phase32_rm3_generator_slice.md) |
+| Constructive union ranker | [docs/research/phase33_constructive_union_ranker.md](docs/research/phase33_constructive_union_ranker.md) |
+| Weighted fusion rows | [docs/research/phase34_weighted_fusion_rows.md](docs/research/phase34_weighted_fusion_rows.md) |
+| Query-adaptive diagnostic | [docs/research/phase35_query_adaptive_winner_diagnostic.md](docs/research/phase35_query_adaptive_winner_diagnostic.md) |
+| Post-retrieval gate features | [docs/research/phase36_post_retrieval_gate_features.md](docs/research/phase36_post_retrieval_gate_features.md) |
+| General router invariance | [docs/research/phase37_general_router_invariance.md](docs/research/phase37_general_router_invariance.md) |
+| Oracle-external theorem | [docs/research/phase38_oracle_external_theorem.md](docs/research/phase38_oracle_external_theorem.md) |
+| Rank-shape risk features | [docs/research/phase39_rank_shape_risk_features.md](docs/research/phase39_rank_shape_risk_features.md) |
+| Observed shape-risk fusion | [docs/research/phase40_observed_shape_risk_fusion.md](docs/research/phase40_observed_shape_risk_fusion.md) |
+| Ordering-gap lexical negative | [docs/research/phase41_ordering_gap_negative_lexical_evidence.md](docs/research/phase41_ordering_gap_negative_lexical_evidence.md) |
+| Structural centrality rows | [docs/research/phase42_structural_centrality_negative.md](docs/research/phase42_structural_centrality_negative.md) |
+| Structural-risk diagnostic | [docs/research/phase43_structural_risk_diagnostic.md](docs/research/phase43_structural_risk_diagnostic.md) |
+| Simeon embedding generator slice | [docs/research/phase44_simeon_embedding_generator_slice.md](docs/research/phase44_simeon_embedding_generator_slice.md) |
+| Risk-aware 4-generator fusion | [docs/research/phase45_risk_aware_4gen_fusion.md](docs/research/phase45_risk_aware_4gen_fusion.md) |
+| Continuous 4-generator dampening | [docs/research/phase46_continuous_dampening.md](docs/research/phase46_continuous_dampening.md) |
+| Dynamic multi-signal dampening (negative) | [docs/research/phase47_dynamic_dampening_negative.md](docs/research/phase47_dynamic_dampening_negative.md) |
+| Cross-generator consensus booster (negative) | [docs/research/phase48_consensus_booster_negative.md](docs/research/phase48_consensus_booster_negative.md) |
+| Embedding-weighted RM3 query expansion | [docs/research/phase49_embedding_weighted_rm3.md](docs/research/phase49_embedding_weighted_rm3.md) |
+| Weighted RM3 in 4-way fusion | [docs/research/phase50_weighted_rm3_4way_fusion.md](docs/research/phase50_weighted_rm3_4way_fusion.md) |
+| Adaptive α weighted RM3 | [docs/research/phase51_adaptive_alpha_rm3.md](docs/research/phase51_adaptive_alpha_rm3.md) |
+| Diversity-aware MMR RM3 | [docs/research/phase52_diversity_aware_rm3.md](docs/research/phase52_diversity_aware_rm3.md) |
+| MMR β sensitivity sweep | [docs/research/phase53_beta_sensitivity_sweep.md](docs/research/phase53_beta_sensitivity_sweep.md) |
+| Query-type gate + diverse RM3 fusion | [docs/research/phase54_query_type_gate.md](docs/research/phase54_query_type_gate.md) |
+| Embedding-based scoring (negative) | [docs/research/phase55_embedding_scoring_negative.md](docs/research/phase55_embedding_scoring_negative.md) |
+| Gated 3-way ensemble | [docs/research/phase56_gated_ensemble.md](docs/research/phase56_gated_ensemble.md) |
+| PPR graph re-ranking | [docs/research/phase57_ppr_graph_rerank.md](docs/research/phase57_ppr_graph_rerank.md) |
+| Theorem correction (LM framework) | [docs/research/theorem_correction_lm_framework.md](docs/research/theorem_correction_lm_framework.md) |
+| Corpus/language adapters | [docs/research/language_corpus_support.md](docs/research/language_corpus_support.md) |
 | Works cited        | [docs/works_cited.md](docs/works_cited.md)            |
 | Reference fixture  | [docs/reference_fixture.md](docs/reference_fixture.md)|
 | Headers            | [include/simeon/](include/simeon/)                    |

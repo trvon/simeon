@@ -430,6 +430,53 @@ void Bm25Index::score_weighted_hashes(
     }
 }
 
+void Bm25Index::score_lm_interpolation(
+    std::span<const std::pair<std::uint64_t, float>> body_weighted_terms,
+    std::span<const std::pair<std::uint64_t, float>> aux_weighted_terms,
+    std::span<float> out_scores) const {
+    if (!finalized_)
+        throw std::runtime_error("Bm25Index::score_lm_interpolation before finalize()");
+    if (out_scores.size() != doc_lengths_.size())
+        throw std::runtime_error("Bm25Index::score_lm_interpolation out_scores size mismatch");
+
+    const float k1 = cfg_.k1;
+    const float b = cfg_.b;
+    const float avg = avg_dl_ > 0.0f ? avg_dl_ : 1.0f;
+    const float aux_avg = aux_avg_dl_ > 0.0f ? aux_avg_dl_ : 1.0f;
+
+    // Body pass — same as score_weighted_hashes but without zeroing out_scores.
+    for (const auto& [h, w] : body_weighted_terms) {
+        if (w <= 0.0f)
+            continue;
+        const auto pit = postings_.find(h);
+        if (pit == postings_.end())
+            continue;
+        const float idf = pit->second.idf;
+        for (const auto& [did, tf] : pit->second.docs) {
+            const float tff = static_cast<float>(tf);
+            const float dl = static_cast<float>(doc_lengths_[did]);
+            out_scores[did] += w * score_atire(tff, dl, idf, k1, b, avg);
+        }
+    }
+
+    // Aux pass — iterate aux_postings_ separately.
+    if (!aux_weighted_terms.empty() && !aux_postings_.empty()) {
+        for (const auto& [h, w] : aux_weighted_terms) {
+            if (w <= 0.0f)
+                continue;
+            const auto pit = aux_postings_.find(h);
+            if (pit == aux_postings_.end())
+                continue;
+            const float idf = pit->second.idf;
+            for (const auto& [did, tf] : pit->second.docs) {
+                const float tff = static_cast<float>(tf);
+                const float dl = static_cast<float>(aux_doc_lengths_[did]);
+                out_scores[did] += w * score_atire(tff, dl, idf, k1, b, aux_avg);
+            }
+        }
+    }
+}
+
 void Bm25Index::reserve_docs(std::size_t expected_docs) {
     if (finalized_ || expected_docs == 0)
         return;
