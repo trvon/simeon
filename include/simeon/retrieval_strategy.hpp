@@ -85,12 +85,14 @@ public:
 // ---------------------------------------------------------------------------
 class Bm25Strategy final : public RetrievalStrategy {
 public:
-    explicit Bm25Strategy(const Bm25Index& idx) : idx_(&idx) {}
+    explicit Bm25Strategy(const Bm25Index& idx, float relation_boost = 0.0f)
+        : idx_(&idx), relation_boost_(relation_boost) {}
     void score(std::string_view query, const AdapterEvidence& evidence,
                std::span<float> out_scores) const override;
 
 private:
     const Bm25Index* idx_;
+    float relation_boost_ = 0.0f;
 };
 
 // ---------------------------------------------------------------------------

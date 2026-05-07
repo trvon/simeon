@@ -53,5 +53,6 @@ Even a good quality estimate is diluted by nonzero weight on suboptimal runs.
 - Phase LXIX tests that directly and still fails when the signal is taken from
   per-strategy output shape rather than query-level difficulty.
 
-See [Phase LXIX](phase69_hard_select_router.md) and
-[Phase LXXI](phase71_entropy_length_router.md).
+See [Phase LXIX](phase69_hard_select_router.md),
+[Phase LXXI](phase71_entropy_length_router.md), and
+[Phase LXXII](phase72_qpp_hard_router.md).

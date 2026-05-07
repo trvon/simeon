@@ -115,6 +115,12 @@ void Bm25Strategy::score(std::string_view query, const AdapterEvidence& evidence
     } else {
         idx_->score_bm25f(query, evidence.aux_field, out_scores, 0.85f, 0.15f);
     }
+    if (relation_boost_ > 0.0f && !evidence.relations.empty()) {
+        for (const auto& rel : evidence.relations) {
+            if (rel.target_doc < out_scores.size())
+                out_scores[rel.target_doc] += relation_boost_ * rel.weight;
+        }
+    }
 }
 
 // =========================================================================

@@ -121,9 +121,10 @@ The remaining gap: 4-way oracle@100 (0.8089) − ensemble (0.4086) = **0.4003**.
 ## Later result
 
 This gate was later superseded as the best universal router by the
-entropy+length 2-way selector in [Phase LXXI](phase71_entropy_length_router.md):
+QPP-refined entropy+length selector in
+[Phase LXXII](phase72_qpp_hard_router.md):
 
-- `observed_ordering_entropy_length_router`: **0.4141** macro
+- `observed_ordering_entropy_length_qpp_router`: **0.4169** macro
 - `observed_ordering_gated_ensemble`: `0.4086` macro
 
 The later rule keeps the ArguAna lead escape hatch, but removes the BM25 middle

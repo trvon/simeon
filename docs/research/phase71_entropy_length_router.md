@@ -2,6 +2,9 @@
 
 ## Setup
 
+Superseded by [Phase LXXII](phase72_qpp_hard_router.md) as the current best
+universal router, but kept here as the first successful hard-routing baseline.
+
 - Candidate strategies: `LeadFieldStrategy`, `Rm3DiverseStrategy`
 - Objective: improve the universal hard router after the Phase LXVIII/LXIX
   self-assessment failures

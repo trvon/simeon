@@ -150,6 +150,7 @@ public:
 
 | Router | How it routes | Phase proven |
 |---|---|---|
+| `EntropyLengthQppRouter` | entropy < 0.05 and n_terms > 30 → Lead; otherwise BM25 rescue from NQC+WIG or diverse RM3 | LXXII (0.4169) |
 | `EntropyLengthRouter` | entropy < 0.05 and n_terms > 30 → Lead, else diverse RM3 | LXXI (0.4141) |
 | `EntropyRouter` | entropy < 0.05 → Lead, > 0.50 → RM3, else BM25 | LVI (0.4086) |
 | `SelfAssessRouter` | score all, pick best by quality metric | LXVIII (negative result; loses to hard routing) |
@@ -161,6 +162,7 @@ public:
 |---|---|---|
 | `TextAdapter` | Lead-64 tokens | Default |
 | `ArguanaAdapter` | Debate pair IDs | LXV (0.4529) |
+| `ArguanaTextPairAdapter` | Debate-neighborhood text relations | LXXIII (0.4745 overall ensemble) |
 | `KeyphraseAdapter` | RAKE-style from query | Proposed |
 
 ## Users extend by

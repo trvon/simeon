@@ -65,7 +65,7 @@ query-dependent family:
        = θ_d^mle + θ_R^diverse    otherwise
 ```
 
-Observed row: `observed_ordering_entropy_length_router = 0.4141`.
+Observed row: `observed_ordering_entropy_length_qpp_router = 0.4169`.
 
 This is better described as **configuration selection over feasible language
 models** than as a fixed mixture.
@@ -96,7 +96,8 @@ but the research goal is to enlarge or choose the best feasible `θ_d(q)`, not t
 |---|---|---:|
 | `bm25_only` | lexical MLE baseline | 0.3941 |
 | `observed_ordering_rm3_diverse_k10_b0.25` | `θ_d^mle + θ_R` | 0.4108 |
-| `observed_ordering_entropy_length_router` | query-dependent select between `θ_d^struct` and `θ_d^mle + θ_R` | **0.4141** |
+| `observed_ordering_entropy_length_router` | query-dependent select between `θ_d^struct` and `θ_d^mle + θ_R` | 0.4141 |
+| `observed_ordering_entropy_length_qpp_router` | previous row + BM25 rescue gate from NQC and WIG | **0.4169** |
 | `observed_ordering_gated_ensemble` | earlier query-dependent selector with BM25 middle branch | 0.4086 |
 
 ## Consequences
@@ -120,7 +121,7 @@ but the research goal is to enlarge or choose the best feasible `θ_d(q)`, not t
 ## Next experiments under this formulation
 
 1. Add QPP-style gates over clarity, SCQ, NQC, WIG, and score variance only if
-   they improve on `observed_ordering_entropy_length_router`.
+   they improve on `observed_ordering_entropy_length_qpp_router`.
 2. Treat verbose-query handling as a separate branch of the model family rather
    than a small threshold perturbation.
 3. Treat argument / stance adapters as representation changes, not as ordinary

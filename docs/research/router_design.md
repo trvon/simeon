@@ -7,9 +7,8 @@ This note documents the **early BM25-family recipe router** that selects among
 design note for `QueryRouter` and its feature inventory, but it is **not** the
 current best universal benchmark router.
 
-The current best universal hard router is the entropy+length 2-way selector over
-`LeadFieldStrategy` vs `Rm3DiverseStrategy`; see
-[phase71_entropy_length_router.md](phase71_entropy_length_router.md).
+The current best universal hard router is the QPP-refined entropy+length
+selector; see [phase72_qpp_hard_router.md](phase72_qpp_hard_router.md).
 
 Per-query selection between simeon's BM25 variants and cascade configurations,
 using cheap corpus-statistic predictors and static thresholds chosen from the

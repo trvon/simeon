@@ -60,7 +60,7 @@ This phase separates two objectives:
 2. **max safety / smoother portfolio behavior** -> dampened fusion
 
 The later router work supersedes both as the best universal compromise:
-`observed_ordering_entropy_length_router = 0.4141`.
+`observed_ordering_entropy_length_qpp_router = 0.4169`.
 
 So the durable lesson from this phase is not the specific avg-IDF band. It is
 that query-type safety mechanisms are useful, but they work best as **hard

@@ -7,9 +7,9 @@ without hard-coding corpus IDs into the retrieval logic.
 
 Current empirical anchors:
 
-- best universal row: `observed_ordering_entropy_length_router = 0.4141`
+- best universal row: `observed_ordering_entropy_length_qpp_router = 0.4169`
 - best adapter-only system: ArguAna pair-ID adapter `= 0.4529`
-- best adapter + routing system: adapter-aware ensemble `= 0.4634`
+- best adapter + routing system: `observed_ordering_arguana_text_pair_adapter_ensemble = 0.4745`
 
 ## Rejected design
 
@@ -42,7 +42,7 @@ In current terms:
 
 1. **Adapter layer** emits observable structural evidence
 2. **Branching policy** prefers explicit adapter relations when available
-3. **Fallback** is `observed_ordering_entropy_length_router`, not
+3. **Fallback** is `observed_ordering_entropy_length_qpp_router`, not
    per-strategy self-assessment
 
 ## Evidence types
@@ -103,8 +103,10 @@ interface and one branching discipline:
 - degrade cleanly when no evidence is available
 - reuse the same universal fallback when the adapter is silent
 
-Under this definition, the ArguAna adapter is already a proof of concept for the
-interface, but not yet for the fully general adapter family.
+Under this definition, the ArguAna pair-ID adapter is the first proof of concept
+for the interface, and the ArguAna text-pair adapter is the first proof that a
+non-id structural branch can still produce a large macro jump. Neither is yet a
+fully general adapter family.
 
 ## Open problem
 

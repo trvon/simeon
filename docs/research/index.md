@@ -45,6 +45,8 @@ the published simeon numbers.
 - **Self-assessed score-list router:** see [phase68_self_assess_router.md](phase68_self_assess_router.md).
 - **Hard-select score-list router (negative):** see [phase69_hard_select_router.md](phase69_hard_select_router.md).
 - **Entropy+length 2-way router:** see [phase71_entropy_length_router.md](phase71_entropy_length_router.md).
+- **QPP hard-router refinement:** see [phase72_qpp_hard_router.md](phase72_qpp_hard_router.md).
+- **ArguAna text-pair adapter ensemble:** see [phase73_arguana_text_pair_adapter_ensemble.md](phase73_arguana_text_pair_adapter_ensemble.md).
 - **Research dashboard (all numbers):** see [research_dashboard.md](research_dashboard.md).
 - **Paperbridge synthesis + next directions:** see [paperbridge_synthesis_next.md](paperbridge_synthesis_next.md).
 - **Corpus adapter library design:** see [corpus_adapter_design.md](corpus_adapter_design.md).

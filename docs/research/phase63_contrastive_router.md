@@ -54,8 +54,8 @@ What survives is the routing insight:
 ## Status relative to later work
 
 - Phase LXV provides the correct ArguAna signal: pair-ID structure
-- Phase LXXI provides the later best universal router: entropy+length hard
-  selection
+- Phase LXXII provides the later best universal router: entropy+length hard
+  selection plus QPP rescue gating
 
 So this phase is best read as a partial success in **query regime detection** and
 a failure of the proposed debate scorer.

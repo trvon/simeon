@@ -52,5 +52,7 @@ output entropy does not have that semantics.
 - The next successful step is to return to **query-level routing** and use a
   verbose-query regime split.
 
-That follow-up becomes the entropy+length 2-way router at `0.4141` macro; see
-[Phase LXXI](phase71_entropy_length_router.md).
+That follow-up becomes the entropy+length 2-way router at `0.4141` macro and is
+then refined to `0.4169` by a QPP rescue gate; see
+[Phase LXXI](phase71_entropy_length_router.md) and
+[Phase LXXII](phase72_qpp_hard_router.md).

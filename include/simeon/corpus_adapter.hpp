@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace simeon {
@@ -111,6 +112,51 @@ private:
         bool valid = false;
     };
     static Id parse(std::string_view id);
+};
+
+// ---------------------------------------------------------------------------
+// ArguanaTextPairAdapter — non-id text-only ArguAna relation adapter.
+//
+// Seeds on document text, then at query time:
+//   1. locates the self/source document by normalized query containment;
+//   2. clusters candidates by a shared first-N-token header;
+//   3. emits weighted DocRelation scores for the cluster using overlap,
+//      rebuttal-cue, and locality features.
+//
+// Unlike ArguanaAdapter, this does not use the exact a↔b id pair. It is still
+// corpus-structured, but the signal comes from observable text only.
+// ---------------------------------------------------------------------------
+class ArguanaTextPairAdapter final : public CorpusAdapter {
+public:
+    explicit ArguanaTextPairAdapter(std::uint32_t prefix_terms = 5) noexcept
+        : prefix_terms_(prefix_terms) {}
+
+    void seed_doc(std::string_view doc_id, std::string_view doc_text, std::uint32_t doc_index);
+
+    std::size_t seeded_docs() const noexcept { return docs_.size(); }
+
+    AdapterEvidence process_doc(std::string_view doc_id, std::string_view doc_text) override;
+
+    AdapterEvidence process_query(std::string_view query_id, std::string_view query_text) override;
+
+private:
+    struct SeededDoc {
+        std::uint32_t index = 0;
+        std::string normalized;
+        std::vector<std::string> tokens;
+        std::unordered_set<std::string> content;
+    };
+
+    std::uint32_t prefix_terms_ = 5;
+    std::vector<SeededDoc> docs_;
+
+    static std::string normalize_ws_lower(std::string_view text);
+    static std::vector<std::string> word_tokens(std::string_view text);
+    static std::unordered_set<std::string> content_set(std::string_view text);
+    static float jaccard_set(const std::unordered_set<std::string>& a,
+                             const std::unordered_set<std::string>& b);
+    static std::uint32_t cue_count(const std::unordered_set<std::string>& toks);
+    bool same_prefix(const SeededDoc& a, const SeededDoc& b) const noexcept;
 };
 
 } // namespace simeon

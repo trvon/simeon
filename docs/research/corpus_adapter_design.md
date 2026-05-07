@@ -71,6 +71,22 @@ This is the adapter form of the lead-text bias already used in BM25F rows.
 This is a training-free structural adapter because it uses observable ID format,
 not relevance labels.
 
+### `ArguanaTextPairAdapter`
+
+- non-id structural adapter for ArguAna-style debate pages
+- seeded with `(doc_id, doc_text, doc_index)` so query-time matching can search
+  over normalized document text and local header clusters
+- finds the source/self document by query-text containment
+- restricts candidates to documents sharing the first-`N` token header
+- emits weighted `relations` from query to candidate docs using:
+  - local order proximity
+  - query/title/body overlap
+  - rebuttal cue density
+  - relative concision
+
+This is still corpus-structured, but it no longer depends on the exact `a ↔ b`
+ID pair.
+
 ## Invariants
 
 1. **No qrels at inference**

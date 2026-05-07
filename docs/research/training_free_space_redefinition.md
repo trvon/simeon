@@ -73,7 +73,8 @@ Definitions:
 ```text
 bm25_only                                0.3941
 observed_ordering_entropy_length_router  0.4141
-adapter-aware ensemble                   0.4634
+observed_ordering_entropy_length_qpp_router 0.4169
+observed_ordering_arguana_text_pair_adapter_ensemble 0.4745
 oracle_bm25_pool_k100                    0.7423
 oracle_union_4way_k100                   0.8089
 ```
@@ -99,7 +100,7 @@ so ranking quality remains unresolved even when relevant documents are exposed.
 ### Routing approximation gap
 
 The best current constructive reduction is
-`observed_ordering_entropy_length_router`.
+`observed_ordering_entropy_length_qpp_router`.
 
 Its rule is:
 
@@ -112,7 +113,8 @@ else:
 
 This is better modeled as **query-performance prediction** than as generic
 fusion. The relevant literature line is: query difficulty, selective expansion,
-and query-dependent configuration ranking.
+query-dependent configuration ranking, and BM25 rescue from post-retrieval QPP
+signals.
 
 ### Structural gap
 
@@ -121,6 +123,7 @@ ArguAna is the strongest witness. Its residual gap is better described as an
 failure. The best evidence comes from:
 
 - pair-ID adapter gains
+- text-pair adapter ensemble gains
 - argument-retrieval literature
 - stance-aware retrieval literature
 
@@ -137,8 +140,8 @@ training-free change to G, A, S, or F that reduces it under budget B?
 
 ## Current priority order
 
-1. Better QPP-style hard routing over the existing universal strategies
-2. Better argument / stance adapters for structural corpora
+1. Better argument / stance adapters for structural corpora
+2. Better query shaping for verbose / discourse-heavy queries
 3. Better generators where exposure is still the dominant limiter
 
 Detailed empirical history remains in the phase notes; this file is the compact

@@ -17,7 +17,9 @@ else:
 ```
 
 This phase predates the later universal winner
-`observed_ordering_entropy_length_router`; the fallback here is historical.
+`observed_ordering_entropy_length_qpp_router` and the later stronger structural
+row `observed_ordering_arguana_text_pair_adapter_ensemble`; the fallback here is
+historical.
 
 ## Results
 
@@ -61,7 +63,7 @@ Macro effect:
 
 This note is historically correct but not the final composition point. The
 fallback universal router was later improved from `observed_ordering_gated_ensemble`
-to `observed_ordering_entropy_length_router`.
+to `observed_ordering_entropy_length_qpp_router`.
 
 The design lesson remains valid:
 
