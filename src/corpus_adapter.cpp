@@ -354,4 +354,165 @@ AdapterEvidence ArguanaTextPairAdapter::process_query(std::string_view /*query_i
     return ev;
 }
 
+// ---------------------------------------------------------------------------
+// ScientificAdapter
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const std::unordered_set<std::string_view>& biomedical_suffixes() {
+    static const std::unordered_set<std::string_view> kSuffixes = {
+        "ase",    "itis",   "osis",  "emia",    "oma",      "pathy",    "penia",  "uria",   "phage",
+        "plasty", "ectomy", "otomy", "scopy",   "gram",     "graphy",   "ology",  "iasis",  "genic",
+        "lysis",  "toxin",  "mycin", "cillin",  "vir",      "pril",     "sartan", "statin", "olol",
+        "pine",   "zole",   "mab",   "cycline", "floxacin", "conazole", "parin",  "tide",   "lide",
+        "sone",   "lone",   "dopa",  "gen",     "cyte",     "blast",    "some",   "mer",    "dase",
+    };
+    return kSuffixes;
+}
+
+bool ends_with_biomedical(std::string_view word) {
+    if (word.size() < 4)
+        return false;
+    for (const auto& suffix : biomedical_suffixes()) {
+        if (word.size() <= suffix.size())
+            continue;
+        if (word.ends_with(suffix)) {
+            const char prev = word[word.size() - suffix.size() - 1];
+            if (std::isalpha(static_cast<unsigned char>(prev)))
+                return true;
+        }
+    }
+    return false;
+}
+
+bool is_all_caps_word(std::string_view word) {
+    if (word.size() < 2)
+        return false;
+    bool has_letter = false;
+    for (char c : word) {
+        if (std::isalpha(static_cast<unsigned char>(c))) {
+            if (!std::isupper(static_cast<unsigned char>(c)))
+                return false;
+            has_letter = true;
+        }
+    }
+    return has_letter;
+}
+
+bool is_measurement(std::string_view text) {
+    if (text.empty() || !std::isdigit(static_cast<unsigned char>(text[0])))
+        return false;
+    for (std::size_t i = 1; i < text.size(); ++i) {
+        char c = text[i];
+        if (std::isdigit(static_cast<unsigned char>(c)) || c == '.' || c == ',')
+            continue;
+        if (std::isalpha(static_cast<unsigned char>(c)) || c == '%' || c == 0xC2)
+            return i >= 1;
+        break;
+    }
+    return false;
+}
+
+std::string normalize_entity(std::string_view raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (char c : raw) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '(' || c == ')')
+            out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    while (!out.empty() && out.back() == '-')
+        out.pop_back();
+    return out;
+}
+
+} // namespace
+
+bool ScientificAdapter::is_biomedical_suffix(std::string_view word) {
+    return ends_with_biomedical(word);
+}
+
+std::vector<std::string> ScientificAdapter::extract_entities(std::string_view text,
+                                                             std::size_t max_entities) {
+    std::vector<std::string> entities;
+    std::unordered_set<std::string> seen;
+    std::string current_word;
+    std::vector<std::string> cap_phrase;
+
+    for (std::size_t i = 0; i <= text.size() && entities.size() < max_entities; ++i) {
+        const char c = i < text.size() ? text[i] : ' ';
+        const bool delim = std::isspace(static_cast<unsigned char>(c)) || c == '.' || c == ',' ||
+                           c == ';' || c == ':' || c == '!' || c == '?' || c == '(' || c == ')' ||
+                           c == '"' || c == '\n' || c == '\t';
+
+        if (!delim) {
+            current_word.push_back(c);
+            continue;
+        }
+        if (current_word.empty()) {
+            cap_phrase.clear();
+            continue;
+        }
+
+        if (ends_with_biomedical(current_word) && current_word.size() >= 5) {
+            auto norm = normalize_entity(current_word);
+            if (seen.insert(norm).second)
+                entities.push_back(current_word);
+        } else if (is_all_caps_word(current_word) && current_word.size() >= 2) {
+            auto norm = normalize_entity(current_word);
+            if (seen.insert(norm).second)
+                entities.push_back(current_word);
+            cap_phrase.push_back(current_word);
+        } else if (std::isupper(static_cast<unsigned char>(current_word[0])) &&
+                   current_word.size() >= 3) {
+            bool all_alpha = true;
+            for (char ch : current_word)
+                if (!std::isalpha(static_cast<unsigned char>(ch))) {
+                    all_alpha = false;
+                    break;
+                }
+            if (all_alpha) {
+                cap_phrase.push_back(current_word);
+                current_word.clear();
+                continue;
+            }
+        } else if (is_measurement(current_word) && current_word.size() >= 2) {
+            auto norm = normalize_entity(current_word);
+            if (seen.insert(norm).second)
+                entities.push_back(current_word);
+        } else {
+            if (cap_phrase.size() >= 2) {
+                std::string joined;
+                for (std::size_t j = 0; j < cap_phrase.size(); ++j) {
+                    if (j > 0)
+                        joined.push_back(' ');
+                    joined += cap_phrase[j];
+                }
+                auto norm = normalize_entity(joined);
+                if (norm.size() >= 8 && seen.insert(norm).second)
+                    entities.push_back(std::move(joined));
+            }
+            cap_phrase.clear();
+        }
+        current_word.clear();
+    }
+    return entities;
+}
+
+AdapterEvidence ScientificAdapter::process_doc(std::string_view /*doc_id*/,
+                                               std::string_view doc_text) {
+    AdapterEvidence ev;
+    ev.aux_field = extract_lead_tokens(doc_text, 64);
+    ev.entities = extract_entities(doc_text);
+    return ev;
+}
+
+AdapterEvidence ScientificAdapter::process_query(std::string_view /*query_id*/,
+                                                 std::string_view query_text) {
+    AdapterEvidence ev;
+    ev.aux_field = extract_lead_tokens(query_text, 64);
+    ev.entities = extract_entities(query_text);
+    return ev;
+}
+
 } // namespace simeon

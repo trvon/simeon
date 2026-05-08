@@ -166,4 +166,32 @@ private:
     bool same_prefix(const SeededDoc& a, const SeededDoc& b) const noexcept;
 };
 
+// ---------------------------------------------------------------------------
+// ScientificAdapter — corpus-agnostic scientific/technical entity extraction.
+//
+// Training-free: uses regex patterns and suffix-matching to identify
+// biomedical and technical entities in prose text. Works on any scientific
+// corpus (SciFact, TREC-COVID, NFCorpus) without per-corpus tuning.
+//
+// Entity types extracted:
+//   - Capitalized multi-word technical terms (genes, processes, methods)
+//   - ALL_CAPS acronyms and gene/protein symbols
+//   - Biomedical-suffix words (-ase, -itis, -oma, -in, -gen, -cyte, etc.)
+//   - Measurement patterns (number + unit)
+//
+// At query time, entities are extracted for use by KeyphraseStrategy
+// and other entity-aware retrieval lanes.  No ML dependencies.
+// ---------------------------------------------------------------------------
+class ScientificAdapter final : public CorpusAdapter {
+public:
+    AdapterEvidence process_doc(std::string_view doc_id, std::string_view doc_text) override;
+
+    AdapterEvidence process_query(std::string_view query_id, std::string_view query_text) override;
+
+private:
+    static bool is_biomedical_suffix(std::string_view word);
+    static std::vector<std::string> extract_entities(std::string_view text,
+                                                     std::size_t max_entities = 32);
+};
+
 } // namespace simeon
