@@ -130,9 +130,10 @@ private:
 // ---------------------------------------------------------------------------
 class ArguanaTextPairAdapter final : public CorpusAdapter {
 public:
-    explicit ArguanaTextPairAdapter(std::uint32_t prefix_terms = 5,
-                                    bool claim_premise_mode = false) noexcept
-        : prefix_terms_(prefix_terms), claim_premise_mode_(claim_premise_mode) {}
+    explicit ArguanaTextPairAdapter(std::uint32_t prefix_terms = 5, bool claim_premise_mode = false,
+                                    float soft_opening_overlap = 0.0f) noexcept
+        : prefix_terms_(prefix_terms), claim_premise_mode_(claim_premise_mode),
+          soft_opening_overlap_(soft_opening_overlap) {}
 
     void seed_doc(std::string_view doc_id, std::string_view doc_text, std::uint32_t doc_index);
 
@@ -153,6 +154,7 @@ private:
 
     std::uint32_t prefix_terms_ = 5;
     bool claim_premise_mode_ = false;
+    float soft_opening_overlap_ = 0.0f;
     std::vector<SeededDoc> docs_;
 
     static std::string normalize_ws_lower(std::string_view text);
@@ -188,7 +190,6 @@ public:
 
     AdapterEvidence process_query(std::string_view query_id, std::string_view query_text) override;
 
-private:
     static bool is_biomedical_suffix(std::string_view word);
     static std::vector<std::string> extract_entities(std::string_view text,
                                                      std::size_t max_entities = 32);
