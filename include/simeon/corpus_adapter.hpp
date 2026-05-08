@@ -130,10 +130,9 @@ private:
 // ---------------------------------------------------------------------------
 class ArguanaTextPairAdapter final : public CorpusAdapter {
 public:
-    explicit ArguanaTextPairAdapter(std::uint32_t prefix_terms = 5, bool claim_premise_mode = false,
-                                    float soft_opening_overlap = 0.0f) noexcept
-        : prefix_terms_(prefix_terms), claim_premise_mode_(claim_premise_mode),
-          soft_opening_overlap_(soft_opening_overlap) {}
+    explicit ArguanaTextPairAdapter(std::uint32_t prefix_terms = 5,
+                                    bool claim_premise_mode = false) noexcept
+        : prefix_terms_(prefix_terms), claim_premise_mode_(claim_premise_mode) {}
 
     void seed_doc(std::string_view doc_id, std::string_view doc_text, std::uint32_t doc_index);
 
@@ -154,7 +153,6 @@ private:
 
     std::uint32_t prefix_terms_ = 5;
     bool claim_premise_mode_ = false;
-    float soft_opening_overlap_ = 0.0f;
     std::vector<SeededDoc> docs_;
 
     static std::string normalize_ws_lower(std::string_view text);
