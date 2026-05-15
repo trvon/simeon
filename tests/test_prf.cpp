@@ -103,8 +103,10 @@ void test_prf_expands_query_with_related_terms() {
     simeon::score_with_prf(idx, "infection", prf, pc);
 
     // Basic sanity: PRF scores are finite.
-    for (auto v : prf)
+    for (auto v : prf) {
         assert(std::isfinite(v));
+        (void)v;
+    }
     // Plain BM25 scores doc 11 at 0 (no "infection" token); PRF should lift
     // it above 0 through expansion terms that overlap ("wound", "bloodstream").
     assert(bm25[11] == 0.0f);
@@ -143,10 +145,12 @@ void test_prf_works_with_sab_variant() {
     pc.k = 5;
     pc.alpha = 0.5f;
     simeon::score_with_prf(sab, "infect", prf, pc); // OOV exact; SAB's n-gram path fires.
-    for (auto v : prf)
+    for (auto v : prf) {
         assert(std::isfinite(v));
+        (void)v;
+    }
     // At least one on-topic doc scores strictly above zero.
-    bool any_lift = false;
+    [[maybe_unused]] bool any_lift = false;
     for (std::size_t i = 0; i < n; ++i)
         if (prf[i] > 0.0f) {
             any_lift = true;

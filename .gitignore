@@ -13,3 +13,6 @@ benchmarks/*.py
 scripts/*.py
 scripts/*.sh
 !scripts/format-code.sh
+
+# Research notes / LLM slop — keep out of the open-source surface.
+docs/research/

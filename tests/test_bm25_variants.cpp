@@ -126,8 +126,10 @@ void test_dlh13_produces_finite_scores_and_ranks_relevant_doc() {
     const std::size_t n = idx.doc_count();
     std::vector<float> s(n, 0.0f);
     idx.score("infection", s);
-    for (auto v : s)
+    for (auto v : s) {
         assert(std::isfinite(v));
+        (void)v;
+    }
 
     // Doc 1 ("infection of the wound...") should outscore unrelated docs
     // 0 ("the quick brown fox") and 4 ("the cat sat on the mat").
@@ -197,8 +199,10 @@ void test_pl2_finite_and_ranks_relevant_doc() {
     const std::size_t n = idx.doc_count();
     std::vector<float> s(n, 0.0f);
     idx.score("infection", s);
-    for (auto v : s)
+    for (auto v : s) {
         assert(std::isfinite(v));
+        (void)v;
+    }
     assert(s[1] > s[0]);
     assert(s[1] > s[4]);
 }
@@ -223,7 +227,7 @@ void test_pl2_c_parameter_changes_score() {
     std::vector<float> sa(n, 0.0f), sb(n, 0.0f);
     a.score("infection", sa);
     b.score("infection", sb);
-    bool differs = false;
+    [[maybe_unused]] bool differs = false;
     for (std::size_t i = 0; i < n; ++i) {
         if (std::fabs(sa[i] - sb[i]) > 1e-5f) {
             differs = true;
@@ -242,8 +246,10 @@ void test_dph_finite_and_ranks_relevant_doc() {
     const std::size_t n = idx.doc_count();
     std::vector<float> s(n, 0.0f);
     idx.score("infection", s);
-    for (auto v : s)
+    for (auto v : s) {
         assert(std::isfinite(v));
+        (void)v;
+    }
     assert(s[1] > s[0]);
     assert(s[1] > s[4]);
 }
@@ -274,8 +280,10 @@ void test_dcm_produces_finite_scores_and_ranks_relevant_doc() {
     const std::size_t n = idx.doc_count();
     std::vector<float> s(n, 0.0f);
     idx.score("infection", s);
-    for (auto v : s)
+    for (auto v : s) {
         assert(std::isfinite(v));
+        (void)v;
+    }
 
     assert(s[1] > s[0]);
     assert(s[1] > s[4]);
@@ -330,7 +338,7 @@ void test_dcm_alpha_sum_override_is_deterministic() {
     c.score("infection", sc);
     assert(sa == sb);
 
-    bool differs = false;
+    [[maybe_unused]] bool differs = false;
     for (std::size_t i = 0; i < n; ++i) {
         if (std::fabs(sa[i] - sc[i]) > 1e-5f) {
             differs = true;
@@ -364,7 +372,7 @@ void test_subword_aware_smooth_blends_exact_and_ngram() {
     std::vector<float> ss(n, 0.0f), st(n, 0.0f);
     smooth.score("dog", ss);
     strict.score("dog", st);
-    bool any_diff = false;
+    [[maybe_unused]] bool any_diff = false;
     for (std::size_t i = 0; i < n; ++i) {
         if (std::fabs(ss[i] - st[i]) > 1e-4f) {
             any_diff = true;
@@ -377,7 +385,7 @@ void test_subword_aware_smooth_blends_exact_and_ngram() {
 // Cross-fold-validated long-doc → AtireLTD α=0.7 recommendation per
 // docs/research/plan1_trec_covid_results.md.
 void test_corpus_class_recommendation_long_doc_picks_ltd() {
-    const auto rec = simeon::recommend_recipe_by_avg_dl(290.0f);
+    [[maybe_unused]] const auto rec = simeon::recommend_recipe_by_avg_dl(290.0f);
     assert(rec.variant == Bm25Variant::AtireLTD);
     assert(std::fabs(rec.ltd_alpha - 0.7f) < 1e-6f);
 }
@@ -386,15 +394,15 @@ void test_corpus_class_recommendation_short_doc_picks_atire() {
     // BEIR-3 fixtures: scifact 215, nfcorpus 234, fiqa 133 — all ≤ default
     // long-doc threshold of 250. Recommendation should be plain Atire.
     for (float avg_dl : {133.0f, 215.0f, 234.0f, 250.0f}) {
-        const auto rec = simeon::recommend_recipe_by_avg_dl(avg_dl);
+        [[maybe_unused]] const auto rec = simeon::recommend_recipe_by_avg_dl(avg_dl);
         assert(rec.variant == Bm25Variant::Atire);
     }
 }
 
 void test_corpus_class_recommendation_threshold_override() {
-    auto rec_high_thresh = simeon::recommend_recipe_by_avg_dl(290.0f, 300.0f);
+    [[maybe_unused]] auto rec_high_thresh = simeon::recommend_recipe_by_avg_dl(290.0f, 300.0f);
     assert(rec_high_thresh.variant == Bm25Variant::Atire); // 290 < 300
-    auto rec_low_thresh = simeon::recommend_recipe_by_avg_dl(200.0f, 150.0f);
+    [[maybe_unused]] auto rec_low_thresh = simeon::recommend_recipe_by_avg_dl(200.0f, 150.0f);
     assert(rec_low_thresh.variant == Bm25Variant::AtireLTD); // 200 > 150
 }
 
