@@ -52,7 +52,7 @@ void test_sparse_jl_distortion_within_eps() {
     std::vector<float> proj_diff(output_dim);
 
     double sum_sq_distortion = 0.0;
-    std::uint32_t in_bound = 0;
+    [[maybe_unused]] std::uint32_t in_bound = 0;
     for (std::uint32_t k = 0; k < pairs; ++k) {
         auto a = random_sketch(sketch_dim, 1234 + k);
         auto b = random_sketch(sketch_dim, 9876 + k);
@@ -76,7 +76,7 @@ void test_sparse_jl_distortion_within_eps() {
     // JL is a probabilistic guarantee — most pairs (≥ 80% with eps=0.10 and
     // s=ceil(0.10 * 1024) = 103 nonzeros per row) should land within bound.
     // RMS distortion should also be O(eps).
-    const double rms = std::sqrt(sum_sq_distortion / pairs);
+    [[maybe_unused]] const double rms = std::sqrt(sum_sq_distortion / pairs);
     assert(rms < 0.20);
     assert(in_bound >= pairs * 7 / 10);
 }
@@ -86,12 +86,12 @@ void test_sparse_jl_column_has_exact_s_nonzeros() {
     constexpr std::uint32_t output_dim = 64;
     constexpr float eps = 0.25f;
     // Kane–Nelson column-sparsity: each input column gets s = ceil(eps*k).
-    constexpr std::uint32_t expected_s = 16; // ceil(0.25 * 64)
+    [[maybe_unused]] constexpr std::uint32_t expected_s = 16; // ceil(0.25 * 64)
 
     Projection p(sketch_dim, output_dim, ProjectionMode::SparseJL, /*seed*/ 7, eps);
 
     for (std::uint32_t col = 0; col < sketch_dim; ++col) {
-        std::uint32_t nonzero = 0;
+        [[maybe_unused]] std::uint32_t nonzero = 0;
         for (std::uint32_t row = 0; row < output_dim; ++row) {
             if (p.entry(row, col) != 0.0f)
                 ++nonzero;
@@ -123,7 +123,7 @@ void test_sparse_jl_seed_changes_output() {
     std::vector<float> o1(output_dim), o2(output_dim);
     p1.apply(a.data(), o1.data());
     p2.apply(a.data(), o2.data());
-    bool any_diff = false;
+    [[maybe_unused]] bool any_diff = false;
     for (std::uint32_t i = 0; i < output_dim; ++i) {
         if (o1[i] != o2[i]) {
             any_diff = true;
@@ -134,7 +134,7 @@ void test_sparse_jl_seed_changes_output() {
 }
 
 void test_sparse_jl_rejects_invalid_eps() {
-    bool threw = false;
+    [[maybe_unused]] bool threw = false;
     try {
         Projection p(64, 16, ProjectionMode::SparseJL, 1, 0.0f);
         (void)p;

@@ -13,7 +13,7 @@ namespace {
 
 void test_empty_index_score_throws() {
     Bm25Index idx;
-    bool threw = false;
+    [[maybe_unused]] bool threw = false;
     try {
         std::vector<float> s;
         idx.score("anything", s);
@@ -55,7 +55,7 @@ void test_idf_rare_beats_common() {
     idx.score("rare", s_rare);
 
     // "rare" hit on doc 1 should outscore any "the" hit.
-    const float max_the = *std::max_element(s_the.begin(), s_the.end());
+    [[maybe_unused]] const float max_the = *std::max_element(s_the.begin(), s_the.end());
     assert(s_rare[1] > max_the);
 }
 
@@ -108,7 +108,7 @@ void test_score_size_mismatch_throws() {
     Bm25Index idx;
     idx.add_doc("alpha");
     idx.finalize();
-    bool threw = false;
+    [[maybe_unused]] bool threw = false;
     try {
         std::vector<float> s(99, 0.0f);
         idx.score("alpha", s);
@@ -122,7 +122,7 @@ void test_add_after_finalize_throws() {
     Bm25Index idx;
     idx.add_doc("alpha");
     idx.finalize();
-    bool threw = false;
+    [[maybe_unused]] bool threw = false;
     try {
         idx.add_doc("beta");
     } catch (const std::runtime_error&) {

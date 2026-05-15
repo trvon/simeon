@@ -102,6 +102,42 @@ understanding the library's design or citing its evaluation context.
 - **Bendersky and Kurland (2008/2010), _Utilizing passage-based language models for document retrieval_.** DOI: [10.1007/s10791-009-9118-8](https://doi.org/10.1007/s10791-009-9118-8)
   Passage-level language model estimation for ad hoc retrieval. Combines
   document-level and passage-level evidence.
+- **Vechtomova (2006), _Noun phrases in interactive query expansion and document ranking_.** DOI: [10.1007/s10791-006-6390-8](https://doi.org/10.1007/s10791-006-6390-8)
+  Query representation matters: noun-phrase structure can outperform plain
+  bag-of-words expansion/ranking on the right query classes.
+- **Efron (2013), _Query representation for cross-temporal information retrieval_.** DOI: [10.1145/2484028.2484054](https://doi.org/10.1145/2484028.2484054)
+  Query representation should vary with the retrieval regime and collection
+  dynamics; one fixed query view is not generally optimal.
+- **Xu and Benaroch (2005), _Information Retrieval with a Hybrid Automatic Query Expansion and Data Fusion Procedure_.** DOI: [10.1023/B:INRT.0000048496.31867.62](https://doi.org/10.1023/B:INRT.0000048496.31867.62)
+  Hybrid procedures that combine expansion and fusion/configuration selection
+  can outperform either family alone.
+- **Kimura and Araki (2006), _Query Expansion for Contextual Question Using Genetic Algorithms_.** DOI: [10.1007/11880592_48](https://doi.org/10.1007/11880592_48)
+  Genetic algorithms are useful as an **offline search procedure** over query
+  expansion choices; they optimize over a retrieval design space rather than
+  becoming part of the deployed retrieval function itself.
+- **Dinçer, Macdonald, and Ounis (2016), _Risk-Sensitive Evaluation and Learning to Rank using Multiple Baselines_.** DOI: [10.1145/2911451.2911511](https://doi.org/10.1145/2911451.2911511)
+  Risk-sensitive IR evaluation: the system ranking depends on which baseline- or
+  risk-aware objective is optimized, not only on average effectiveness.
+- **Cañamares, Castells, and Moffat (2020), _Offline evaluation options for recommender systems_.** DOI: [10.1007/s10791-020-09371-3](https://doi.org/10.1007/s10791-020-09371-3)
+  Offline evaluation objectives encode deployment priorities; changing the
+  objective can change which system is preferred even under the same data.
+- **Armstrong, Moffat, Webber, and Zobel (2009), _Improvements that don't add up_.** DOI: [10.1145/1645953.1646031](https://doi.org/10.1145/1645953.1646031)
+  Retrieval gains are not safely compositional: improvements that look positive
+  in isolation or under one composition can fail to transfer unchanged once the
+  full system is materialized.
+- **Carterette (2007), _Robust test collections for retrieval evaluation_.** DOI: [10.1145/1277741.1277754](https://doi.org/10.1145/1277741.1277754)
+  Robustness is a first-class evaluation concern, not just a secondary summary;
+  different test-collection constructions can legitimately favor different
+  systems.
+- **Scholer, Kelly, and Carterette (2016), _Information retrieval evaluation using test collections_.** DOI: [10.1007/s10791-016-9281-7](https://doi.org/10.1007/s10791-016-9281-7)
+  Test-collection evaluation is the standard validation frame for IR, but its
+  conclusions are conditional on the collection, judgments, and metric.
+- **Sanderson (2010), _Test Collection Based Evaluation of Information Retrieval Systems_.** DOI: [10.1561/1500000009](https://doi.org/10.1561/1500000009)
+  Broad survey of why exact benchmark/test-collection evaluation remains the
+  authoritative way to state retrieval effectiveness claims.
+- **Bellogín, Castells, and Cantador (2017), _Statistical biases in Information Retrieval metrics for recommender systems_.** DOI: [10.1007/s10791-017-9312-z](https://doi.org/10.1007/s10791-017-9312-z)
+  Metric design can bias system comparisons; optimizer scores and deployment
+  validation scores should not be treated as interchangeable without checking.
 
 ## Theorem framework (revised)
 

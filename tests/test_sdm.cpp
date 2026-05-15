@@ -118,7 +118,7 @@ void test_sdm_without_bigrams_degenerates_to_unigram_leg() {
     // Unigram leg scaled by lambda_unigram (0.85); bigram legs contribute 0
     // because the postings tables are empty. So s_sdm ≈ 0.85 * s_plain.
     for (std::size_t i = 0; i < n; ++i) {
-        const float expected = scfg.lambda_unigram * s_plain[i];
+        [[maybe_unused]] const float expected = scfg.lambda_unigram * s_plain[i];
         assert(std::fabs(expected - s_sdm[i]) < 1e-5f);
     }
 }

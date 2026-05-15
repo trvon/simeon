@@ -19,7 +19,7 @@ using simeon::score_bm25_with_concepts;
 
 namespace {
 
-bool approx(float a, float b, float eps = 1e-4f) {
+[[maybe_unused]] bool approx(float a, float b, float eps = 1e-4f) {
     return std::fabs(a - b) <= eps;
 }
 
@@ -63,7 +63,7 @@ void test_pmi_matches_hand_computed_reference() {
     const std::uint64_t h_time = f.idx.hash_term("time");
     const std::uint64_t h_value = f.idx.hash_term("value");
     const std::uint64_t h_bigram = ConceptIndex::hash_bigram(h_time, h_value);
-    const ConceptEntry* e = concepts.find(h_bigram);
+    [[maybe_unused]] const ConceptEntry* e = concepts.find(h_bigram);
     assert(e != nullptr);
     assert(std::isfinite(e->pmi));
     assert(e->pmi > 0.0f);
@@ -107,8 +107,8 @@ void test_concept_mining_is_deterministic() {
     const std::uint64_t h_time = fa.idx.hash_term("time");
     const std::uint64_t h_value = fa.idx.hash_term("value");
     const std::uint64_t h_bg = ConceptIndex::hash_bigram(h_time, h_value);
-    const auto* ea = ca.find(h_bg);
-    const auto* eb = cb.find(h_bg);
+    [[maybe_unused]] const auto* ea = ca.find(h_bg);
+    [[maybe_unused]] const auto* eb = cb.find(h_bg);
     assert(ea != nullptr && eb != nullptr);
     assert(approx(ea->pmi, eb->pmi));
     assert(ea->total_tf == eb->total_tf);

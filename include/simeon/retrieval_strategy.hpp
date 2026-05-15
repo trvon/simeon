@@ -39,7 +39,7 @@ public:
     virtual ~RetrievalStrategy() = default;
     virtual void score(std::string_view query, const AdapterEvidence& evidence,
                        std::span<float> out_scores) const = 0;
-    virtual void score_indexed(std::string_view query, std::uint32_t qi,
+    virtual void score_indexed(std::string_view query, std::uint32_t /*qi*/,
                                const AdapterEvidence& evidence, std::span<float> out_scores) const {
         score(query, evidence, out_scores); // fallback: ignore qi
     }

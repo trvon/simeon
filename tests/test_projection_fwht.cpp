@@ -46,7 +46,7 @@ void test_fwht_distortion_within_bound() {
 
     std::vector<float> proj_diff(output_dim);
     double sum_sq_distortion = 0.0;
-    std::uint32_t in_bound = 0;
+    [[maybe_unused]] std::uint32_t in_bound = 0;
     constexpr float bound = 0.20f;
     for (std::uint32_t k = 0; k < pairs; ++k) {
         auto a = random_sketch(sketch_dim, 1234 + k);
@@ -67,7 +67,7 @@ void test_fwht_distortion_within_bound() {
         if (dist <= static_cast<double>(bound))
             ++in_bound;
     }
-    const double rms = std::sqrt(sum_sq_distortion / pairs);
+    [[maybe_unused]] const double rms = std::sqrt(sum_sq_distortion / pairs);
     // Subsampled-WHT distortion at k=256 over n=1024: textbook bound is
     // O(sqrt(log d / k)). Empirical RMS should land well under 0.20 and
     // most pairs within ±0.20.
@@ -90,7 +90,7 @@ void test_fwht_pads_to_power_of_two() {
     assert(in_norm > 0.0f);
     // Loose sanity bound — exact distortion depends on sample/sign; just
     // assert the output isn't degenerate.
-    const float ratio = out_norm / in_norm;
+    [[maybe_unused]] const float ratio = out_norm / in_norm;
     assert(ratio > 0.5f && ratio < 2.0f);
 }
 
@@ -117,7 +117,7 @@ void test_fwht_seed_changes_output() {
     std::vector<float> o1(output_dim), o2(output_dim);
     p1.apply(a.data(), o1.data());
     p2.apply(a.data(), o2.data());
-    bool any_diff = false;
+    [[maybe_unused]] bool any_diff = false;
     for (std::uint32_t i = 0; i < output_dim; ++i) {
         if (o1[i] != o2[i]) {
             any_diff = true;
@@ -150,17 +150,17 @@ void test_fwht_dense_matrix_matches_apply() {
     }
 
     for (std::uint32_t r = 0; r < output_dim; ++r) {
-        const float diff = std::fabs(via_apply[r] - via_dense[r]);
+        [[maybe_unused]] const float diff = std::fabs(via_apply[r] - via_dense[r]);
         // FP tolerance: FWHT does pad_n_-1 add/subs per output, scalar
         // dense path accumulates in double then casts back. Allow a small
         // absolute diff scaled to magnitude.
-        const float mag = std::fabs(via_dense[r]) + 1e-3f;
+        [[maybe_unused]] const float mag = std::fabs(via_dense[r]) + 1e-3f;
         assert(diff < 1e-3f * mag);
     }
 }
 
 void test_fwht_rejects_oversized_output() {
-    bool threw = false;
+    [[maybe_unused]] bool threw = false;
     try {
         // sketch_dim=8 → pad_n=8; output_dim=16 > 8 → reject.
         Projection p(8, 16, ProjectionMode::Fwht, 1);
