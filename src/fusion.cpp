@@ -46,9 +46,12 @@ void score_bm25_variants_rrf(std::span<const Bm25Index* const> variants, std::st
     for (std::size_t v = 0; v < variants.size(); ++v) {
         std::fill(scratch.begin(), scratch.end(), 0.0f);
         variants[v]->score(query, scratch);
-        per_variant[v].resize(nd);
-        for (std::uint32_t d = 0; d < nd; ++d)
-            per_variant[v][d] = {d, scratch[d]};
+        per_variant[v].reserve(nd);
+        for (std::uint32_t d = 0; d < nd; ++d) {
+            if (std::isfinite(scratch[d]) && scratch[d] > 0.0f) {
+                per_variant[v].push_back({d, scratch[d]});
+            }
+        }
     }
     std::vector<Ranking> ins;
     ins.reserve(variants.size());

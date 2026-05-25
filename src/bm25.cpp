@@ -16,11 +16,35 @@ namespace simeon {
 
 namespace {
 
+bool needs_ascii_fold(std::string_view tok) noexcept {
+    for (unsigned char c : tok) {
+        if (c >= 'A' && c <= 'Z')
+            return true;
+    }
+    return false;
+}
+
+std::string ascii_fold(std::string_view tok) {
+    std::string out;
+    out.reserve(tok.size());
+    for (unsigned char c : tok) {
+        out.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return out;
+}
+
+std::uint64_t hash_folded(std::string_view tok, std::uint64_t seed, HashFamily family) {
+    if (!needs_ascii_fold(tok))
+        return hash64(tok, seed, family);
+    const auto folded = ascii_fold(tok);
+    return hash64(folded, seed, family);
+}
+
 struct TfSink final : NGramEmitter {
     std::unordered_map<std::uint64_t, std::uint32_t>* tf;
     HashFamily family;
     std::uint64_t seed;
-    void on_token(std::string_view tok, float) override { ++(*tf)[hash64(tok, seed, family)]; }
+    void on_token(std::string_view tok, float) override { ++(*tf)[hash_folded(tok, seed, family)]; }
 };
 
 struct TermSink final : NGramEmitter {
@@ -28,7 +52,7 @@ struct TermSink final : NGramEmitter {
     HashFamily family;
     std::uint64_t seed;
     void on_token(std::string_view tok, float) override {
-        terms->push_back(hash64(tok, seed, family));
+        terms->push_back(hash_folded(tok, seed, family));
     }
 };
 
@@ -41,8 +65,8 @@ struct StringTermSink final : NGramEmitter {
     HashFamily family;
     std::uint64_t seed;
     void on_token(std::string_view tok, float) override {
-        strs->emplace_back(tok);
-        hashes->push_back(hash64(tok, seed, family));
+        strs->push_back(ascii_fold(tok));
+        hashes->push_back(hash64(strs->back(), seed, family));
     }
 };
 
@@ -53,7 +77,7 @@ struct StringViewTermSink final : NGramEmitter {
     std::uint64_t seed;
     void on_token(std::string_view tok, float) override {
         strs->push_back(tok);
-        hashes->push_back(hash64(tok, seed, family));
+        hashes->push_back(hash_folded(tok, seed, family));
     }
 };
 
@@ -62,7 +86,7 @@ struct UniqueTermSink final : NGramEmitter {
     HashFamily family;
     std::uint64_t seed;
     void on_token(std::string_view tok, float) override {
-        const std::uint64_t h = hash64(tok, seed, family);
+        const std::uint64_t h = hash_folded(tok, seed, family);
         if (std::find(terms->begin(), terms->end(), h) == terms->end())
             terms->push_back(h);
     }
@@ -100,20 +124,23 @@ void collect_field_term_stats(std::string_view text, HashFamily family, std::uin
             continue;
 
         const std::string_view tok = text.substr(start, i - start);
-        const std::uint64_t wh = hash64(tok, seed, family);
+        const std::string folded = needs_ascii_fold(tok) ? ascii_fold(tok) : std::string{};
+        const std::string_view normalized =
+            folded.empty() ? tok : std::string_view{folded.data(), folded.size()};
+        const std::uint64_t wh = hash64(normalized, seed, family);
         ++word_tf[wh];
         ++word_dl;
         if (ordered_words)
             ordered_words->push_back(wh);
 
         if (ngram_tf && ngram_dl) {
-            const std::size_t tok_n = tok.size();
+            const std::size_t tok_n = normalized.size();
             for (std::uint32_t k = k_min; k <= k_max; ++k) {
                 if (tok_n < k)
                     break;
                 const std::size_t last = tok_n - k;
                 for (std::size_t pos = 0; pos <= last; ++pos) {
-                    ++(*ngram_tf)[hash64(tok.substr(pos, k), seed, family)];
+                    ++(*ngram_tf)[hash64(normalized.substr(pos, k), seed, family)];
                     ++(*ngram_dl);
                 }
             }
@@ -727,11 +754,11 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
         // Need raw query strings for the OOV n-gram fallback; store hashes
         // alongside so we still get a fast postings_ lookup for the exact
         // path. score() is const but the scratch is thread_local.
-        static thread_local std::vector<std::string_view> q_strs;
+        static thread_local std::vector<std::string> q_strs;
         static thread_local std::vector<std::uint64_t> q_hashes;
         q_strs.clear();
         q_hashes.clear();
-        StringViewTermSink ssink{};
+        StringTermSink ssink{};
         ssink.strs = &q_strs;
         ssink.hashes = &q_hashes;
         ssink.family = cfg_.hash;
@@ -954,11 +981,11 @@ void Bm25Index::score_bm25f(std::string_view body_query, std::string_view aux_qu
     const float n_docs = static_cast<float>(aux_doc_lengths_.size());
 
     if (cfg_.variant == Bm25Variant::SubwordAwareBackoff) {
-        static thread_local std::vector<std::string_view> q_strs;
+        static thread_local std::vector<std::string> q_strs;
         static thread_local std::vector<std::uint64_t> q_hashes;
         q_strs.clear();
         q_hashes.clear();
-        StringViewTermSink ssink{};
+        StringTermSink ssink{};
         ssink.strs = &q_strs;
         ssink.hashes = &q_hashes;
         ssink.family = cfg_.hash;
@@ -1103,11 +1130,11 @@ void Bm25Index::score_sdm(std::string_view query, std::span<float> out_scores,
 
     // Ordered query tokenization (same path as score()). Keep the strings too
     // so the SAB unigram leg can do its OOV n-gram fallback per term.
-    static thread_local std::vector<std::string_view> q_strs;
+    static thread_local std::vector<std::string> q_strs;
     static thread_local std::vector<std::uint64_t> q_hashes;
     q_strs.clear();
     q_hashes.clear();
-    StringViewTermSink ssink{};
+    StringTermSink ssink{};
     ssink.strs = &q_strs;
     ssink.hashes = &q_hashes;
     ssink.family = cfg_.hash;
@@ -1293,11 +1320,11 @@ void Bm25Index::score_wsdm(std::string_view query, std::span<float> out_scores,
     const float delta = cfg_.delta;
     const float n_docs = static_cast<float>(doc_lengths_.size());
 
-    static thread_local std::vector<std::string_view> q_strs;
+    static thread_local std::vector<std::string> q_strs;
     static thread_local std::vector<std::uint64_t> q_hashes;
     q_strs.clear();
     q_hashes.clear();
-    StringViewTermSink ssink{};
+    StringTermSink ssink{};
     ssink.strs = &q_strs;
     ssink.hashes = &q_hashes;
     ssink.family = cfg_.hash;
