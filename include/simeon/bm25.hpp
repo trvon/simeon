@@ -354,7 +354,7 @@ private:
 // ---------------------------------------------------------------------------
 // Corpus-class recipe routing.
 //
-// Per `docs/research/plan1_trec_covid_results.md`, cross-fold validated
+// Per corpus-class recipe routing (see docs/research.md), cross-fold validated
 // findings cluster by corpus length:
 // - avg_dl > 250 (true long-doc, e.g., trec-covid 290): AtireLTD α=0.7 lifts
 //   nDCG cross-fold (+0.0057 dev / +0.0082 test) and R@100 (+0.0239 / +0.0066).

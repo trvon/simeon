@@ -87,19 +87,27 @@ common_srcs = [
   'src/tokenizer_bpe.cpp',
   'src/matryoshka.cpp',
   'src/pmi.cpp',
-  'src/glove_embeddings.cpp',
   'src/query_router.cpp',
   'src/prf.cpp',
   'src/concept_mining.cpp',
   'src/corpus_adapter.cpp',
   'src/retrieval_strategy.cpp',
   'src/aho_corasick.cpp',
-  'src/aho_corasick_da.cpp',
   'src/text_rank.cpp',
   'src/fragment_geometry.cpp',
   'src/arch/scalar.cpp',
   'src/persistent_homology.cpp',
 ]
+
+research_srcs = [
+  'src/glove_embeddings.cpp',
+]
+
+if get_option('enable_research')
+  simd_defines += '-DSIMEON_ENABLE_RESEARCH=1'
+  common_srcs += research_srcs
+  message('simeon: research components enabled')
+endif
 
 arch_srcs = []
 if has_neon
@@ -176,7 +184,7 @@ if get_option('enable_tests')
   subdir('tests')
 endif
 
-if get_option('enable_benchmarks')
+if get_option('enable_benchmarks') or get_option('enable_research')
   subdir('benchmarks')
 endif
 
@@ -191,6 +199,7 @@ summary({
   'AVX2+FMA': has_avx2,
   'Tests': get_option('enable_tests'),
   'Benchmarks': get_option('enable_benchmarks'),
+  'Research': get_option('enable_research'),
   'Fuzz harnesses': get_option('enable_fuzz'),
   'Coverage': get_option('enable_coverage'),
 }, section: 'simeon configuration')

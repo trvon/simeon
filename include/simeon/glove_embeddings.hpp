@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef SIMEON_ENABLE_RESEARCH
+
 #include <cstdint>
 #include <string>
 
@@ -19,6 +21,10 @@ namespace simeon {
 // content-word head that simeon's PMI tokenizer sees.
 //
 // All rows are L2-normalized on load — matching PmiEmbeddings::learn() output.
+//
+// Research-only: gated behind SIMEON_ENABLE_RESEARCH.
 PmiEmbeddings load_glove(const std::string& path, std::uint32_t max_vocab = 0);
 
 } // namespace simeon
+
+#endif // SIMEON_ENABLE_RESEARCH

@@ -139,22 +139,9 @@ understanding the library's design or citing its evaluation context.
   Metric design can bias system comparisons; optimizer scores and deployment
   validation scores should not be treated as interchangeable without checking.
 
-## Theorem framework (revised)
-
-- Cite the **language modeling framework** with the papers above, especially
-  Ponte & Croft 1998 and Zhai & Lafferty 2004.
-- Cite the **corrected theorem** framing with
-  [docs/research/theorem_correction_lm_framework.md](research/theorem_correction_lm_framework.md).
-- Cite the **graph-based re-ranking experiments** with
-  [docs/research/phase57_ppr_graph_rerank.md](research/phase57_ppr_graph_rerank.md).
-
 ## How to cite this repo responsibly
 
 - Cite **the software** with [`CITATION.cff`](../CITATION.cff).
 - Cite **the benchmark tables and negative findings** with
-  [docs/research/benchmarks.md](research/benchmarks.md), [docs/research/router_design.md](research/router_design.md), and
-  [docs/research/pmi_projection.md](research/pmi_projection.md).
-- Cite **the oracle-external theorem framing** with
-  [docs/research/phase38_oracle_external_theorem.md](research/phase38_oracle_external_theorem.md) and
-  [docs/research/training_free_space_redefinition.md](research/training_free_space_redefinition.md).
+  [research.md](research.md) and [benchmarks.md](benchmarks.md).
 - Cite the **upstream papers above** when discussing the underlying prior work.

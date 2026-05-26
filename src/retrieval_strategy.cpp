@@ -77,8 +77,9 @@ void EntropyRouter::route(std::string_view query, const QueryProfile& profile,
 }
 
 // =========================================================================
-// SelfAssessRouter
+// SelfAssessRouter (research-only: gated behind SIMEON_ENABLE_RESEARCH)
 // =========================================================================
+#ifdef SIMEON_ENABLE_RESEARCH
 void SelfAssessRouter::route(std::string_view query, const QueryProfile& /*profile*/,
                              const AdapterEvidence& evidence,
                              std::span<RetrievalStrategy* const> pool,
@@ -104,6 +105,7 @@ void SelfAssessRouter::route(std::string_view query, const QueryProfile& /*profi
     }
     pool[best]->score(query, evidence, out_scores); // re-score (cache in future)
 }
+#endif // SIMEON_ENABLE_RESEARCH
 
 // =========================================================================
 // Bm25Strategy
@@ -147,8 +149,11 @@ void LeadFieldStrategy::score(std::string_view query, const AdapterEvidence& /*e
 }
 
 // =========================================================================
-// Rm3DiverseStrategy — MMR-diverse PRF
+// Rm3DiverseStrategy — MMR-diverse PRF (research-only: gated behind
+// SIMEON_ENABLE_RESEARCH)
 // =========================================================================
+
+#ifdef SIMEON_ENABLE_RESEARCH
 
 namespace {
 
@@ -308,6 +313,8 @@ void Rm3DiverseStrategy::score_indexed(std::string_view query, std::uint32_t qi,
     std::fill(out_scores.begin(), out_scores.end(), 0.0f);
     score_rm_blend(*idx_, qh, rm, out_scores);
 }
+
+#endif // SIMEON_ENABLE_RESEARCH
 
 // =========================================================================
 // Keyphrase extraction — RAKE-style

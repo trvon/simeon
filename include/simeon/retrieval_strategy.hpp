@@ -71,14 +71,17 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// SelfAssessRouter — score all strategies, pick best by assess_quality
+// SelfAssessRouter — score all strategies, pick best by assess_quality.
+// Research-only: gated behind SIMEON_ENABLE_RESEARCH.
 // ---------------------------------------------------------------------------
+#ifdef SIMEON_ENABLE_RESEARCH
 class SelfAssessRouter final : public StrategyRouter {
 public:
     void route(std::string_view query, const QueryProfile& profile, const AdapterEvidence& evidence,
                std::span<RetrievalStrategy* const> pool,
                std::span<float> out_scores) const override;
 };
+#endif // SIMEON_ENABLE_RESEARCH
 
 // ---------------------------------------------------------------------------
 // Bm25Strategy — wraps a Bm25Index
@@ -116,7 +119,9 @@ private:
 // Rm3DiverseStrategy — MMR-diverse PRF via simeon embeddings (β=0.25).
 // query_embs is row-major: query_embs[qi * sdim + d].
 // Use score_query() with a query INDEX, not score() with query text.
+// Research-only: gated behind SIMEON_ENABLE_RESEARCH.
 // ---------------------------------------------------------------------------
+#ifdef SIMEON_ENABLE_RESEARCH
 class Rm3DiverseStrategy final : public RetrievalStrategy {
 public:
     Rm3DiverseStrategy(const Bm25Index& idx, std::span<const float> doc_embs,
@@ -136,6 +141,7 @@ private:
     float mmr_beta_;
     std::uint32_t cand_k_, sel_k_, n_terms_;
 };
+#endif // SIMEON_ENABLE_RESEARCH
 
 // Utility: vector dot product
 inline float emb_dot(const float* a, const float* b, std::size_t n) {

@@ -35,7 +35,7 @@ Same input + same config + same seed = same bytes across supported architectures
 
 - Good fit: first-stage recall, lexical+dense fusion, model-free or on-device retrieval.
 - Not good fit: paraphrase or semantic equivalence. Not drop-in replacement for MiniLM-class bi-encoder.
-- Benchmarks, router notes, ablations, and negative results live in [docs/research/index.md](docs/research/index.md).
+- Benchmarks, router notes, ablations, and negative results live in [docs/research.md](docs/research.md).
 
 ## Build
 
@@ -72,18 +72,18 @@ Public headers:
 ## Docs
 
 - Build: [docs/build.md](docs/build.md)
-- Research index: [docs/research/index.md](docs/research/index.md)
+- Research notes: [docs/research.md](docs/research.md)
 - Works cited: [docs/works_cited.md](docs/works_cited.md)
 - Reference fixture: [docs/reference_fixture.md](docs/reference_fixture.md)
 
 ## Status
 
 - Stable surface: tokenizer, hashing, projection heads, normalization, SIMD dispatch, matryoshka, PQ, retrieval core.
-- Research or opt-in surface: BM25F, SDM/WSDM, RM3, concept mining, corpus-specific adapters.
+- Research or opt-in surface: BM25F, SDM/WSDM, RM3, concept mining, GloVe loader, ArguAna adapters (gated behind `enable_research` build flag).
 
 ## Citation
 
-Cite software via [CITATION.cff](CITATION.cff). Use [docs/research/index.md](docs/research/index.md) for claim-to-document mapping.
+Cite software via [CITATION.cff](CITATION.cff). Use [docs/research.md](docs/research.md) for claim-to-document mapping.
 
 ## License
 

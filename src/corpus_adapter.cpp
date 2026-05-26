@@ -9,6 +9,12 @@ namespace simeon {
 
 namespace {
 
+} // namespace
+
+// Research-only ArguAna helpers (gated behind SIMEON_ENABLE_RESEARCH).
+#ifdef SIMEON_ENABLE_RESEARCH
+namespace {
+
 struct WordTokenSink final : NGramEmitter {
     std::vector<std::string>* out = nullptr;
     void on_token(std::string_view tok, float) override {
@@ -43,6 +49,7 @@ bool stopword(std::string_view token) {
 }
 
 } // namespace
+#endif // SIMEON_ENABLE_RESEARCH
 
 // ---------------------------------------------------------------------------
 // TextAdapter
@@ -87,8 +94,10 @@ AdapterEvidence TextAdapter::process_query(std::string_view /*query_id*/,
 }
 
 // ---------------------------------------------------------------------------
-// ArguanaAdapter
+// ArguanaAdapter (research-only: gated behind SIMEON_ENABLE_RESEARCH)
 // ---------------------------------------------------------------------------
+
+#ifdef SIMEON_ENABLE_RESEARCH
 
 ArguanaAdapter::Id ArguanaAdapter::parse(std::string_view id) {
     Id out;
@@ -353,6 +362,8 @@ AdapterEvidence ArguanaTextPairAdapter::process_query(std::string_view /*query_i
     }
     return ev;
 }
+
+#endif // SIMEON_ENABLE_RESEARCH
 
 // ---------------------------------------------------------------------------
 // ScientificAdapter (v3 — robust, IMRAD-aware)

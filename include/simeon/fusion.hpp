@@ -39,7 +39,7 @@ std::vector<std::pair<std::uint32_t, float>> top_k(std::span<const float> scores
 // (phssapprox_k100_t8_richcov_gap): +0.0089/+0.0045 dev/test nDCG@10,
 // +0.0109/+0.0013 R@100. Mixed cross-fold on scifact and fiqa —
 // corpus-specific lever, not a universal default. See
-// docs/research/rrf_variants_results.md.
+// docs/research.md.
 void score_bm25_variants_rrf(std::span<const Bm25Index* const> variants, std::string_view query,
                              std::span<float> out_scores, float k_rrf = 60.0f);
 

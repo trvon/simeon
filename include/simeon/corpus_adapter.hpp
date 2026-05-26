@@ -70,19 +70,9 @@ std::string extract_lead_tokens(std::string_view text, std::uint32_t max_tokens)
 
 // ---------------------------------------------------------------------------
 // ArguAnaAdapter — debate pair-ID parser.
-//
-// Parses BEIR ArguAna document/query IDs of the form:
-//     <topic>-<stance><point><side>
-//   e.g.  "guncontrol-pro03a" → topic=guncontrol  stance=pro  point=03  side=a
-//
-// For each query, adds a DocRelation pointing to the document with the
-// same topic/stance/point but opposite side (a↔b).  Documents that are
-// not in the expected format produce empty evidence.
-//
-// This adapter must be pre-seeded with all document IDs before any query
-// processing (via seed_doc).  It is only useful for the ArguAna corpus;
-// on other corpora all IDs fail parsing and the adapter degrades to no-op.
+// Research-only: gated behind SIMEON_ENABLE_RESEARCH.
 // ---------------------------------------------------------------------------
+#ifdef SIMEON_ENABLE_RESEARCH
 class ArguanaAdapter final : public CorpusAdapter {
 public:
     // Register a document that will later be matched by queries.
@@ -113,21 +103,13 @@ private:
     };
     static Id parse(std::string_view id);
 };
+#endif // SIMEON_ENABLE_RESEARCH
 
 // ---------------------------------------------------------------------------
 // ArguanaTextPairAdapter — non-id text-only ArguAna relation adapter.
-//
-// Seeds on document text, then at query time:
-//   1. locates the self/source document by normalized query containment;
-//   2. clusters candidates by a shared first-N-token header;
-//   3. emits weighted DocRelation scores for the cluster using overlap,
-//      rebuttal-cue, and locality features.
-// Optional claim/premise mode adds opening-window alignment between the query's
-// title/body split and the candidate's first 35 content words.
-//
-// Unlike ArguanaAdapter, this does not use the exact a↔b id pair. It is still
-// corpus-structured, but the signal comes from observable text only.
+// Research-only: gated behind SIMEON_ENABLE_RESEARCH.
 // ---------------------------------------------------------------------------
+#ifdef SIMEON_ENABLE_RESEARCH
 class ArguanaTextPairAdapter final : public CorpusAdapter {
 public:
     explicit ArguanaTextPairAdapter(std::uint32_t prefix_terms = 5,
@@ -165,6 +147,7 @@ private:
     static std::uint32_t cue_count(const std::unordered_set<std::string>& toks);
     bool same_prefix(const SeededDoc& a, const SeededDoc& b) const noexcept;
 };
+#endif // SIMEON_ENABLE_RESEARCH
 
 // ---------------------------------------------------------------------------
 // ScientificAdapter — corpus-agnostic scientific/technical entity extraction.

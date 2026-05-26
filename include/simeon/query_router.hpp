@@ -10,7 +10,7 @@
 namespace simeon {
 
 // Router config. Defaults are scifact-tuned; override per corpus by sweeping
-// on a held-out fold (see docs/research/router_design.md).
+// on a held-out fold (see docs/research.md).
 struct RouterConfig {
     // (>) → Bm25SabSmooth. Even one OOV term in the query justifies the
     // SAB n-gram backoff path.

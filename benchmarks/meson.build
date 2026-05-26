@@ -12,7 +12,9 @@ accuracy_exe = executable('simeon_accuracy_bench',
 
 # Comparison vs a learned reference embedding model. Requires an external
 # fixture (corpus.tsv, queries.tsv, qrels.tsv, reference.bin); not run as a
-# meson test because the fixture is not committed. See docs/reference_fixture.md.
+# meson test because the fixture is not committed. Gated behind enable_research
+# because it depends on research-only components (GloVe, SelfAssessRouter, etc.).
+if get_option('enable_research')
 vs_reference_exe = executable('simeon_bench_vs_reference',
   'bench_vs_reference.cpp',
   dependencies: simeon_dep,
@@ -24,6 +26,7 @@ vs_reference_research_exe = executable('simeon_bench_vs_reference_research',
   dependencies: simeon_dep,
   install: false,
 )
+endif
 
 # Isolated SAB-smooth profile harness. Builds one Bm25Index with
 # SubwordAwareBackoff/γ=5 and runs N repeats of the query loop, so
@@ -43,13 +46,6 @@ profile_fragment_geometry_exe = executable('simeon_profile_fragment_geometry',
 
 aho_corasick_exe = executable('simeon_aho_corasick_bench',
   'aho_corasick_bench.cpp',
-  dependencies: simeon_dep,
-  install: false,
-)
-
-# Prototype double-array trie AC. Branch-only; not a meson test target.
-aho_corasick_da_exe = executable('simeon_aho_corasick_da_bench',
-  'aho_corasick_da_bench.cpp',
   dependencies: simeon_dep,
   install: false,
 )

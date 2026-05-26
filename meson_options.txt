@@ -10,3 +10,5 @@ option('enable_fuzz', type: 'boolean', value: false,
   description: 'Build libFuzzer harnesses (clang only). Pair with -Db_sanitize=address.')
 option('enable_coverage', type: 'boolean', value: false,
   description: 'Inject source-based coverage instrumentation (clang) or gcov (gcc).')
+option('enable_research', type: 'boolean', value: false,
+  description: 'Build research-only components (GloVe loader, ArguAna adapters, SelfAssessRouter, Rm3Diverse, bench_vs_reference). Off by default for production builds.')

@@ -1,5 +1,7 @@
 #include "simeon/glove_embeddings.hpp"
 
+#ifdef SIMEON_ENABLE_RESEARCH
+
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -88,3 +90,5 @@ PmiEmbeddings load_glove(const std::string& path, std::uint32_t max_vocab) {
 }
 
 } // namespace simeon
+
+#endif // SIMEON_ENABLE_RESEARCH

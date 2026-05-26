@@ -99,7 +99,7 @@ If your build system isn't Meson, copy `include/simeon/` and `src/` into your tr
 ./build/benchmarks/simeon_accuracy_bench 50 60 0.05 > accuracy.jsonl
 ```
 
-The accuracy bench takes `(docs_per_cluster, words_per_doc, leakage)` as positional args. See [research/benchmarks.md](research/benchmarks.md) for interpretation and published summary tables.
+The accuracy bench takes `(docs_per_cluster, words_per_doc, leakage)` as positional args. See [benchmarks.md](benchmarks.md) for interpretation and published summary tables.
 
 ## Reference embedding comparison
 
@@ -137,7 +137,7 @@ Archived probe-style ablations now live in a separate research binary:
 ./build/benchmarks/simeon_bench_vs_reference_research fixtures/scifact-minilm > research.jsonl
 ```
 
-Use this binary when reproducing the experimental grids documented under [research/](research/).
+Use this binary when reproducing the experimental grids documented under [research.md](research.md).
 
 ### Structural BM25F sweeps
 
