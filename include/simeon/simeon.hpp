@@ -134,6 +134,8 @@ public:
     Encoder& operator=(Encoder&&) noexcept;
 
     std::uint32_t output_dim() const noexcept;
+    // Returns the effective encoder configuration after constructor validation
+    // and PMI/output-dimension normalization.
     const EncoderConfig& config() const noexcept;
 
     // Encode one document into `out[0..output_dim())`.

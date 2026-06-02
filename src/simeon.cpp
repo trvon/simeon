@@ -71,6 +71,8 @@ public:
             }
         }
 
+        cfg_.output_dim = output_dim_;
+
         if (cfg_.matryoshka) {
             matryoshka_weights_.resize(output_dim_);
             if (!cfg_.matryoshka_weights.empty()) {
