@@ -15,6 +15,8 @@ public:
 
     Projection(const Projection&) = delete;
     Projection& operator=(const Projection&) = delete;
+    Projection(Projection&&) noexcept = default;
+    Projection& operator=(Projection&&) noexcept = default;
 
     std::uint32_t sketch_dim() const noexcept { return sketch_dim_; }
     std::uint32_t output_dim() const noexcept { return output_dim_; }
@@ -49,10 +51,10 @@ private:
     ProjectionMode mode_;
     std::uint64_t seed_;
     float inv_scale_ = 1.0f;
-    float achlioptas_scale_ = 1.0f;          // cached sqrt(3) * inv_scale for Achlioptas
-    std::vector<float> dense_;               // output_dim_ * sketch_dim_ (Gaussian path)
-    std::vector<AchlioptasRow> achlioptas_;  // per-row pos/neg col lists (Achlioptas)
-    std::vector<WeightedSparseRow> sparse_;  // per-row nonzeros (VerySparse)
+    float achlioptas_scale_ = 1.0f;         // cached sqrt(3) * inv_scale for Achlioptas
+    std::vector<float> dense_;              // output_dim_ * sketch_dim_ (Gaussian path)
+    std::vector<AchlioptasRow> achlioptas_; // per-row pos/neg col lists (Achlioptas)
+    std::vector<WeightedSparseRow> sparse_; // per-row nonzeros (VerySparse)
 
     // Fwht-only state. pad_n_ is the next power of 2 ≥ sketch_dim_; signs_
     // holds the random ±1 diagonal D over the padded space; sample_ holds
@@ -63,7 +65,7 @@ private:
     std::uint32_t pad_n_ = 0;
     std::vector<float> signs_;
     std::vector<std::uint32_t> sample_;
-    float fwht_scale_ = 1.0f;  // 1/sqrt(output_dim_)
+    float fwht_scale_ = 1.0f; // 1/sqrt(output_dim_)
 };
 
-}  // namespace simeon
+} // namespace simeon

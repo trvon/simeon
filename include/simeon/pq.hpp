@@ -52,13 +52,15 @@ public:
     // times. `n_iters` is an upper bound; converges sooner in practice.
     void train(const float* training, std::uint32_t n_train, std::uint32_t n_iters = 25);
 
-    // Encode a single vector → `m` bytes written to `code`.
+    // Encode a single vector from `vec[0..dim())` into `code[0..m())`.
     void encode(const float* vec, std::uint8_t* code) const noexcept;
 
-    // Encode `n` vectors (row-major) → `n * m` bytes written to `codes`.
+    // Encode `n` row-major vectors from `vecs[0..n*dim())` into
+    // `codes[0..n*m())`.
     void encode_batch(const float* vecs, std::uint32_t n, std::uint8_t* codes) const noexcept;
 
-    // Reconstruct an approximation to the original vector from its code.
+    // Reconstruct an approximation to the original vector from `code[0..m())`
+    // into `vec[0..dim())`.
     void decode(const std::uint8_t* code, float* vec) const noexcept;
 
     // Raw centroid read-only accessor: returns pointer to `dsub` floats

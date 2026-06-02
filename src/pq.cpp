@@ -360,8 +360,12 @@ private:
     std::vector<float> lut_ip_; // m * k, inner product from query subspace to each centroid
 };
 
-PQQuery::PQQuery(const ProductQuantizer& pq, const float* query)
-    : impl_(std::make_unique<Impl>(pq, query)) {}
+PQQuery::PQQuery(const ProductQuantizer& pq, const float* query) {
+    if (query == nullptr) {
+        throw std::invalid_argument("simeon::PQQuery: query must not be null");
+    }
+    impl_ = std::make_unique<Impl>(pq, query);
+}
 PQQuery::~PQQuery() = default;
 PQQuery::PQQuery(PQQuery&&) noexcept = default;
 PQQuery& PQQuery::operator=(PQQuery&&) noexcept = default;

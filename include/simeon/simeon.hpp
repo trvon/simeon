@@ -22,8 +22,8 @@ enum class NGramMode : std::uint8_t {
     CharSubword,
 };
 
-class BpeMerges;      // simeon/tokenizer_bpe.hpp
-class PmiEmbeddings;  // simeon/pmi.hpp
+class BpeMerges;     // simeon/tokenizer_bpe.hpp
+class PmiEmbeddings; // simeon/pmi.hpp
 
 enum class HashFamily : std::uint8_t {
     SplitMix64,
@@ -102,9 +102,10 @@ struct EncoderConfig {
     // non-null the encoder bypasses the sketch + projection pipeline
     // entirely: it tokenizes words, sums PmiEmbeddings::row(tok) for
     // in-vocab tokens, applies matryoshka weights if set, and L2-
-    // normalizes. Constraints: `projection` must be None and `output_dim`
-    // must equal `pmi_rows->dim()`. OOV tokens are skipped (no Achlioptas
-    // fallback). See simeon/pmi.hpp for the learner.
+    // normalizes. Constraints: `projection` must be None. If `output_dim`
+    // is non-zero it must equal `pmi_rows->dim()`; otherwise the encoder
+    // adopts `pmi_rows->dim()` automatically. OOV tokens are skipped (no
+    // Achlioptas fallback). See simeon/pmi.hpp for the learner.
     const PmiEmbeddings* pmi_rows = nullptr;
 };
 
@@ -135,7 +136,11 @@ public:
     std::uint32_t output_dim() const noexcept;
     const EncoderConfig& config() const noexcept;
 
+    // Encode one document into `out[0..output_dim())`.
     void encode(std::string_view text, float* out) const;
+
+    // Encode `texts.size()` documents into the row-major output buffer
+    // `out[0..texts.size() * output_dim())`.
     void encode_batch(std::span<const std::string_view> texts, float* out) const;
 
 private:
@@ -143,4 +148,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace simeon
+} // namespace simeon

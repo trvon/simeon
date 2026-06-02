@@ -196,6 +196,10 @@ private:
             if (cfg_.pmi_rows->dim() == 0) {
                 throw std::invalid_argument("simeon::Encoder: pmi_rows->dim() must be > 0");
             }
+            if (cfg_.output_dim != 0 && cfg_.output_dim != cfg_.pmi_rows->dim()) {
+                throw std::invalid_argument(
+                    "simeon::Encoder: output_dim must match pmi_rows->dim() when PMI is enabled");
+            }
             if (cfg_.ngram_min == 0 || cfg_.ngram_max < cfg_.ngram_min) {
                 throw std::invalid_argument("simeon::Encoder: ngram range invalid");
             }
