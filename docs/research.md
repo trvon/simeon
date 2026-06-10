@@ -222,6 +222,34 @@ Findings (MiniLM fixtures, dev→test workflow):
   WSDM-pair plateau shape. Final tally: promoted on SciFact + FiQA, neutral on
   NFCorpus, regression on none. FiQA's 6-leg union-pool oracle is 0.6073.
 
+### Fused-feedback RM3 (`prf_fused`): promoted as a blend leg
+
+The rerank workbench's gap decomposition showed only +0.03–0.05 of the
+union-pool-oracle gap is recoverable by combining the six existing legs; the
+rest needs new document-level evidence. First candidate family tested via
+workbench feature legs:
+
+- **Fused-feedback RM3 beats classic RM3 as a standalone leg on every
+  corpus** (dev single-leg: 0.6648 vs 0.5747 SciFact, 0.2884 vs 0.2633
+  NFCorpus). Mechanism: RM3's known weak point is feedback quality; anchoring
+  the relevance model on the *promoted fusion's* top-10 (softmax(z) doc
+  weights) instead of the BM25 first pass gives a cleaner pseudo-relevant
+  set. Library support: the `score_with_prf` overload taking an explicit
+  feedback set (prf.hpp).
+- **Blend promoted**: `0.3·z(prf_fused) + 0.7·(0.6·z(wsdm_sab)+0.4·z(wsdm_at))`
+  — test nDCG@10 0.6990 SciFact (+0.0105 over the WSDM fusion) and 0.3261
+  NFCorpus (+0.0042); the whole pf-weight plateau (0.1–0.5) sits above the
+  baseline on both test folds. Cross-fold note: SciFact's train-proxy dev fold
+  had the sign *flipped* (−0.002) — the ±0.005 fold-disagreement rule in
+  action; promotion rests on the frozen test reads and the cross-corpus
+  plateau.
+- **MaxSim-family doc scorers are flat as features** (MaxSim / TopKMean /
+  SoftMaxSum / GeoMean over fragment qsims: ≤ +0.0015 in any blend) — the
+  fragment signal's aggregation is not the bottleneck on these corpora.
+- The best-leg-or-feat oracle (0.7678 vs 0.7382 legs-only, SciFact dev) shows
+  features add per-query headroom that fixed blends barely capture — the
+  routing-paradox pattern recurs at the feature level.
+
 ## Components gated behind `enable_research`
 
 When `-Denable_research=false` (production default), the following are excluded:

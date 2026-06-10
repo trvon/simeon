@@ -5918,7 +5918,7 @@ void run_bm25_fusion_grid(const Fixture& fx) {
     struct Row {
         std::string name;
         std::array<float, N_LEGS> w{}; // convex weights for Cc; participation mask otherwise
-        enum Kind : std::uint8_t { Cc, Rrf, CombSum, CombMnz, Oracle, SigAlpha } kind = Cc;
+        enum Kind : std::uint8_t { Cc, Rrf, CombSum, CombMnz, Oracle, SigAlpha, CcPrf } kind = Cc;
         // SigAlpha: blend legs a/b with alpha(q) interpolated on signal s.
         std::uint8_t leg_a = 0, leg_b = 0;
         bool use_nqc = false; // false = simplified_clarity
@@ -6012,6 +6012,18 @@ void run_bm25_fusion_grid(const Fixture& fx) {
             }
         }
     }
+    // Promoted fusion ⊕ z(prf_fused) blend rows (RM3 anchored on the promoted
+    // fusion's top-10; the feature itself is computed in the query loop).
+    for (float w : {0.1f, 0.2f, 0.3f, 0.4f, 0.5f}) {
+        Row r;
+        r.kind = Row::CcPrf;
+        r.alpha_lo = w; // reused as the prf_fused weight
+        char buf[80];
+        std::snprintf(buf, sizeof(buf), "fusion_ccprf_wsdmsab0.60_wsdmat0.40_pf%.2f",
+                      static_cast<double>(w));
+        r.name = buf;
+        rows.push_back(std::move(r));
+    }
     std::fprintf(stderr, "[fusion] rows=%zu queries=%u docs=%u\n", rows.size(), nq, nd);
 
     // ---- Signal anchors: SIMEON_FUSION_ANCHORS="clar_lo,clar_hi,nqc_lo,nqc_hi"
@@ -6061,6 +6073,40 @@ void run_bm25_fusion_grid(const Fixture& fx) {
         if (wb_fp == nullptr)
             std::fprintf(stderr, "[fusion] cannot open workbench path %s\n", wb_path);
     }
+
+    // Feature legs (workbench-only; scored over the fixed 6-leg pool, never
+    // pool contributors): RM3 over the Atire first pass, RM3 anchored on the
+    // promoted fusion's top-10 (stronger pseudo-relevant set), and the four
+    // fragment-aggregation doc scorers (SPLATE-style outer MaxSim family).
+    enum Feat : std::uint8_t {
+        F_PRF_AT = 0,
+        F_PRF_FUSED,
+        F_MAXSIM,
+        F_TKM3,
+        F_SMS,
+        F_GMEAN,
+        N_FEATS
+    };
+    static constexpr const char* kFeatName[N_FEATS] = {"prf_at", "prf_fused", "maxsim",
+                                                       "tkm3",   "sms",       "gmean"};
+    std::array<GeometryGraphConfig, 4> ms_cfgs;
+    for (auto& c : ms_cfgs) {
+        c = GeometryGraphConfig{.pool_size = 100,
+                                .alpha = 0.0f,
+                                .top_fragments_per_doc = 8,
+                                .attention_scale = 8.0f,
+                                .knn = 8,
+                                .steps = 2,
+                                .use_phss = false,
+                                .outer_maxsim = true};
+    }
+    using DK = simeon::FragmentGeometryConfig::DocScorerKind;
+    ms_cfgs[0].doc_scorer_kind = DK::MaxSim;
+    ms_cfgs[1].doc_scorer_kind = DK::TopKMean;
+    ms_cfgs[1].doc_scorer_top_k = 3;
+    ms_cfgs[2].doc_scorer_kind = DK::SoftMaxSum;
+    ms_cfgs[2].doc_scorer_softmax_beta = 4.0f;
+    ms_cfgs[3].doc_scorer_kind = DK::GeoMean;
 
     std::vector<std::vector<std::vector<std::pair<float, std::uint32_t>>>> row_rankings(
         rows.size(), std::vector<std::vector<std::pair<float, std::uint32_t>>>(nq));
@@ -6118,6 +6164,39 @@ void run_bm25_fusion_grid(const Fixture& fx) {
             zscore_inplace(zl);
         }
 
+        // prf_fused: RM3 anchored on the promoted fusion's top-10 over the
+        // pool, with softmax(z) feedback weights. Feeds the CcPrf rows and the
+        // workbench dump.
+        std::vector<float> prf_fused_raw(np, 0.0f);
+        std::vector<float> z_prf_fused;
+        {
+            std::vector<float> fused(np);
+            for (std::size_t p = 0; p < np; ++p)
+                fused[p] = 0.6f * z[L_WSDM_SAB][p] + 0.4f * z[L_WSDM_AT][p];
+            std::vector<std::size_t> ord(np);
+            std::iota(ord.begin(), ord.end(), std::size_t{0});
+            const std::size_t kfb = std::min<std::size_t>(10, np);
+            std::partial_sort(ord.begin(), ord.begin() + kfb, ord.end(),
+                              [&](std::size_t a, std::size_t b) {
+                                  if (fused[a] != fused[b])
+                                      return fused[a] > fused[b];
+                                  return pool[a] < pool[b];
+                              });
+            std::vector<std::uint32_t> fb_ids(kfb);
+            std::vector<float> fb_w(kfb);
+            const float fmax = kfb > 0 ? fused[ord[0]] : 0.0f;
+            for (std::size_t i = 0; i < kfb; ++i) {
+                fb_ids[i] = pool[ord[i]];
+                fb_w[i] = std::exp(fused[ord[i]] - fmax);
+            }
+            std::vector<float> full(nd, 0.0f);
+            simeon::score_with_prf(atire.idx, query, fb_ids, fb_w, full, simeon::PrfConfig{});
+            for (std::size_t p = 0; p < np; ++p)
+                prf_fused_raw[p] = full[pool[p]];
+            z_prf_fused = prf_fused_raw;
+            zscore_inplace(z_prf_fused);
+        }
+
         if (wb_fp != nullptr) {
             const auto rit = rel.find(qi);
             std::fprintf(wb_fp, "{\"qid\":\"%s\",\"clarity\":%.6f,\"nqc\":%.6f,\"pool\":[",
@@ -6153,6 +6232,33 @@ void run_bm25_fusion_grid(const Fixture& fx) {
                 }
                 std::fprintf(wb_fp, "]");
             }
+
+            // Feature legs over the fixed pool (full-corpus scorers restricted
+            // to the pool; -inf sentinel handling identical to the leg dump).
+            std::array<std::vector<float>, N_FEATS> feat;
+            std::vector<float> full(nd, 0.0f);
+            simeon::score_with_prf(atire.idx, query, full, simeon::PrfConfig{});
+            feat[F_PRF_AT].assign(np, 0.0f);
+            for (std::size_t p = 0; p < np; ++p)
+                feat[F_PRF_AT][p] = full[pool[p]];
+            feat[F_PRF_FUSED] = prf_fused_raw;
+            for (int m = 0; m < 4; ++m) {
+                auto ms = simeon::score_fragment_geometry(query, atire.idx, enc, frags, ms_cfgs[m]);
+                auto& f = feat[F_MAXSIM + m];
+                f.assign(np, 0.0f);
+                for (std::size_t p = 0; p < np; ++p)
+                    f[p] = ms[pool[p]];
+            }
+            std::fprintf(wb_fp, "},\"feats\":{");
+            for (int fi = 0; fi < N_FEATS; ++fi) {
+                std::fprintf(wb_fp, "%s\"%s\":[", fi ? "," : "", kFeatName[fi]);
+                for (std::size_t p = 0; p < np; ++p) {
+                    const float v = feat[fi][p];
+                    std::fprintf(wb_fp, "%s%.6g", p ? "," : "",
+                                 std::isfinite(v) ? static_cast<double>(v) : -1e30);
+                }
+                std::fprintf(wb_fp, "]");
+            }
             std::fprintf(wb_fp, "}}\n");
         }
 
@@ -6168,6 +6274,14 @@ void run_bm25_fusion_grid(const Fixture& fx) {
                             if (r.w[leg] != 0.0f)
                                 s += r.w[leg] * z[leg][p];
                         out.emplace_back(s, pool[p]);
+                    }
+                    break;
+                }
+                case Row::CcPrf: {
+                    const float w = r.alpha_lo; // prf_fused weight
+                    for (std::size_t p = 0; p < np; ++p) {
+                        const float base = 0.6f * z[L_WSDM_SAB][p] + 0.4f * z[L_WSDM_AT][p];
+                        out.emplace_back(w * z_prf_fused[p] + (1.0f - w) * base, pool[p]);
                     }
                     break;
                 }

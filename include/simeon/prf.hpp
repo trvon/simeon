@@ -46,6 +46,17 @@ struct PrfConfig {
 void score_with_prf(const Bm25Index& idx, std::string_view query, std::span<float> out_scores,
                     const PrfConfig& cfg = {});
 
+// As above, but with an explicit pseudo-relevant feedback set instead of the
+// internal first-pass BM25 top-K: callers supply doc ids and positive weights
+// (normalized internally to p(d|Q)); cfg.k is ignored. Lets a stronger
+// upstream ranking (e.g. fused union-pool scores) anchor the relevance model.
+// Degenerate inputs (empty feedback, non-positive weight mass, alpha <= 0,
+// n_terms == 0) fall back to plain idx.score(query).
+void score_with_prf(const Bm25Index& idx, std::string_view query,
+                    std::span<const std::uint32_t> feedback_ids,
+                    std::span<const float> feedback_weights, std::span<float> out_scores,
+                    const PrfConfig& cfg = {});
+
 // Bendersky, Metzler, Croft 2011 (SIGIR) "Parameterized Concept Weighting in
 // Verbose Queries": expansion-term count K should scale with query clarity
 // (high clarity → relevance model is well-anchored, more expansion helps;

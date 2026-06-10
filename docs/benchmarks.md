@@ -119,6 +119,7 @@ read once on test.
 | cc_atire0.20_sab0.80 | 0.6777 | 0.6767 | 0.3000 | 0.3210 | 0.2391 | 0.2442 |
 | fusion_combsum_atire_wsdmat_sab | 0.6885 | 0.6891 | 0.2939 | 0.3212 | 0.2448 | 0.2451 |
 | fusion_rrf_atire_wsdmat_sab | 0.6828 | 0.6752 | 0.2722 | 0.3097 | — | — |
+| ccprf pf0.30 (promoted ⊕ fused-feedback RM3) | — | 0.6990 | — | 0.3261 | — | — |
 | 6-leg union pool oracle | 0.9368 | 0.9365 | 0.5760 | 0.5918 | 0.5880 | 0.6073 |
 
 ## Research outcomes
