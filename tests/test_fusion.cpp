@@ -213,6 +213,47 @@ void test_cosine_scores_matches_naive() {
     }
 }
 
+// convex_fuse_z: single leg with weight 1 reproduces the z-scored leg.
+void test_convex_fuse_z_single_leg_is_zscore() {
+    const std::vector<float> leg{1.0f, 2.0f, 3.0f, 4.0f};
+    const std::array<std::span<const float>, 1> legs{std::span<const float>(leg)};
+    const std::array<float, 1> w{1.0f};
+    std::vector<float> out(leg.size(), -99.0f);
+    simeon::convex_fuse_z(std::span<const std::span<const float>>(legs), w, out);
+    // mean 2.5, population sigma = sqrt(1.25)
+    const float sd = std::sqrt(1.25f);
+    for (std::size_t i = 0; i < leg.size(); ++i)
+        assert(std::fabs(out[i] - (leg[i] - 2.5f) / sd) < 1e-4f);
+}
+
+// convex_fuse_z: hand-computed two-leg blend.
+void test_convex_fuse_z_two_leg_hand_computed() {
+    const std::vector<float> a{0.0f, 1.0f}; // z = {-1, +1}
+    const std::vector<float> b{2.0f, 0.0f}; // z = {+1, -1}
+    const std::array<std::span<const float>, 2> legs{std::span<const float>(a),
+                                                     std::span<const float>(b)};
+    const std::array<float, 2> w{0.75f, 0.25f};
+    std::vector<float> out(2, 0.0f);
+    simeon::convex_fuse_z(std::span<const std::span<const float>>(legs), w, out);
+    assert(std::fabs(out[0] - (0.75f * -1.0f + 0.25f * 1.0f)) < 1e-4f);
+    assert(std::fabs(out[1] - (0.75f * 1.0f + 0.25f * -1.0f)) < 1e-4f);
+}
+
+// convex_fuse_z: mismatched sizes / empty legs are a no-op (defensive contract).
+void test_convex_fuse_z_degenerate_inputs() {
+    std::vector<float> out(3, 7.0f);
+    simeon::convex_fuse_z({}, {}, out);
+    assert(out[0] == 7.0f); // legs empty -> untouched
+
+    const std::vector<float> short_leg{1.0f, 2.0f};
+    const std::array<std::span<const float>, 1> legs{std::span<const float>(short_leg)};
+    const std::array<float, 1> w{1.0f};
+    simeon::convex_fuse_z(std::span<const std::span<const float>>(legs), w, out);
+    // size mismatch -> returns after zero-fill, no partial garbage
+    for (float v : out)
+        assert(v == 0.0f);
+}
+
 } // namespace
 
 int main() {
@@ -231,5 +272,8 @@ int main() {
     test_entropy_alpha_weights_low_entropy_leg_higher();
     test_entropy_alpha_deterministic();
     test_linear_alpha_entropy_fuse_recovers_equal_weight_at_tie();
+    test_convex_fuse_z_single_leg_is_zscore();
+    test_convex_fuse_z_two_leg_hand_computed();
+    test_convex_fuse_z_degenerate_inputs();
     return 0;
 }

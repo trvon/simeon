@@ -107,6 +107,20 @@ fixture × mode; see research.md for mechanism.
 | phss_pairwise_mean_us | 2016.4 | 1538.2 | 991.6 | 1989.0 | 1521.8 | 983.1 |
 | adjacency_mean_us | 737.3 | 502.2 | 323.9 | 718.4 | 544.3 | 355.9 |
 
+## Fusion pass (dev-tuned, frozen test validation)
+
+nDCG@10, MiniLM fixtures, `--fusion-only` research sweep. Winner frozen on dev,
+read once on test.
+
+| Config | SciFact dev | SciFact test | NFCorpus dev | NFCorpus test |
+|---|---|---|---|---|
+| best fixed (prior) | — | 0.6714 | — | 0.3182 |
+| cc_wsdmsab0.60_wsdmat0.40 (promoted) | 0.6950 | 0.6885 | 0.2977 | 0.3220 |
+| cc_atire0.20_sab0.80 | 0.6777 | 0.6767 | 0.3000 | 0.3210 |
+| fusion_combsum_atire_wsdmat_sab | 0.6885 | 0.6891 | 0.2939 | 0.3212 |
+| fusion_rrf_atire_wsdmat_sab | 0.6828 | 0.6752 | 0.2722 | 0.3097 |
+| 6-leg union pool oracle | 0.9368 | 0.9365 | 0.5760 | 0.5918 |
+
 ## Research outcomes
 
 See [research.md](research.md) for the full research summary including:

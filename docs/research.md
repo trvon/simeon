@@ -49,8 +49,12 @@ The default `bench_vs_reference` binary keeps the stable comparison surface:
 
 2. **BM25 variants matter, but corpus-specifically.**
    AtireLTD lifts long-doc corpora (avg_dl > 250). Atire is safest for short-doc.
-   BM25-variant RRF fusion helps NFCorpus but regresses on SciFact/FiQA.
    Use `recommend_recipe_by_avg_dl()` as a starting point.
+   *Fixture-version note:* the earlier claim that BM25-variant RRF fusion
+   "regresses on SciFact/FiQA" does not reproduce on the regenerated MiniLM
+   fixtures — `bm25_rrf_variants5` tops the SciFact test fold (0.6714). All
+   fusion conclusions were re-validated under the dev/test workflow in the
+   fusion pass below.
 
 3. **The pre-retrieval router (QueryRouter) works across the three shipped fixtures.**
    Step 1g.1 post-retrieval gates (pool Jaccard, score decay) and Step 1k B2 pre-retrieval
@@ -178,6 +182,41 @@ no quality cost but no meaningful speed win either; the knob stays default-off
 (0 = full dim) as a research config. Any future prefix-similarity attempt
 should operate on pre-whitening PMI coordinates, where the SVD ordering
 actually concentrates energy.
+
+## Fusion pass: soft per-query fusion over shipped legs
+
+Motivated by the router-oracle gap (best-of-3-recipes per query = 0.7219/0.3439
+vs best fixed 0.6714/0.3182 on SciFact/NFCorpus test) and by the routing-paradox
+literature: hard per-query routing underperforms the best fixed method because
+QPP signals are too weak for discrete selection, while *soft fusion* (per-query
+convex weights over methods, Bruch-Gai 2022) captures part of the oracle gap by
+hedging. `--fusion-only` in the research bench sweeps convex combinations of
+pool-restricted z-normalized legs — Atire, WSDM(Atire), SAB-smooth, WSDM(SAB),
+fragment geometry (pure, α=0), rrf_variants5 — against RRF / CombSUM / CombMNZ
+baselines over identical legs, with dev-fold tuning and frozen test validation.
+
+Findings (MiniLM fixtures, dev→test workflow):
+
+- **Promoted: `z(WSDM_sab)·0.6 + z(WSDM_atire)·0.4`** — dev winner on SciFact
+  (0.6950 dev), frozen test 0.6885 vs 0.6714 best fixed (+0.0171, > 3× the
+  ±0.005 noise gate), entire α-plateau above the old best. On NFCorpus the same
+  config is +0.0038 (within noise, no regression). Exported as
+  `convex_fuse_z()` in fusion.hpp. Proximity evidence fused across two
+  tokenization regimes (exact word vs subword-backoff) is the mechanism: the
+  two WSDM legs agree on topicality but disagree usefully on term-match
+  confidence.
+- Convex combination > CombSUM/CombMNZ > RRF over the same legs on both
+  corpora (dev), reproducing Bruch-Gai's ordering in a purely lexical setting.
+- **Signal-conditioned α (clarity/NQC quantile interpolation) never beat fixed
+  α** on dev — consistent with the QPP-correlation literature; not promoted.
+- The fragment-geometry leg did not enter winning combinations on these two
+  corpora; its value remains the quality-router path (semantic-tier queries).
+- **Union-pool recall**: the 6-leg union pool's oracle is 0.9365/0.5918 vs
+  0.8845/0.5275 for the BM25-only k100 pool — leg-diversified candidate
+  generation materially raises the rerank ceiling and is the natural input for
+  future rerank-precision work.
+- NFCorpus's own dev winner (`z(atire)·0.2+z(sab)·0.8`, test +0.0028) stays
+  below the promotion gate; treated as neutral.
 
 ## Components gated behind `enable_research`
 

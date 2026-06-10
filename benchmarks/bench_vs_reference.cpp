@@ -5831,6 +5831,392 @@ void run_bm25_fragment_glove_grid(const Fixture& fx, const std::string& glove_pa
                             .phss_config = simeon::PhssConfig{
                                 .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
 }
+
+// Soft per-query fusion sweep over shipped scoring legs (precision pass).
+// Legs are computed once per query, z-normalized over the union of their
+// top-100 pools, and combined with fixed convex weights (Bruch-Gai 2022 CC).
+// Includes RRF / CombSUM / CombMNZ baselines over identical legs, a union-
+// pool oracle ceiling, and signal-conditioned soft-alpha rows whose quantile
+// anchors come from SIMEON_FUSION_ANCHORS (computed on the dev fold, frozen
+// for the test run). See docs/research.md.
+void run_bm25_fusion_grid(const Fixture& fx) {
+    const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
+    const std::uint32_t nq = static_cast<std::uint32_t>(fx.query_ids.size());
+    constexpr std::uint32_t kPoolPerLeg = 100;
+
+    // ---- Index setup. Bigram-enabled Atire and SAB serve both the plain and
+    // WSDM legs; BM25+/BM25L/DLH13 only feed the rrf5 composite leg.
+    simeon::Bm25Config cfg_atire;
+    cfg_atire.build_word_bigrams = true;
+    auto atire = build_bm25(fx, cfg_atire);
+    simeon::Bm25Config cfg_sab;
+    cfg_sab.variant = simeon::Bm25Variant::SubwordAwareBackoff;
+    cfg_sab.delta = 1.0f;
+    cfg_sab.subword_gamma = 5.0f;
+    cfg_sab.build_word_bigrams = true;
+    auto sab = build_bm25(fx, cfg_sab);
+    simeon::Bm25Config cfg_plus;
+    cfg_plus.variant = simeon::Bm25Variant::BM25Plus;
+    auto plus = build_bm25(fx, cfg_plus);
+    simeon::Bm25Config cfg_l;
+    cfg_l.variant = simeon::Bm25Variant::BM25L;
+    auto bl = build_bm25(fx, cfg_l);
+    simeon::Bm25Config cfg_dlh;
+    cfg_dlh.variant = simeon::Bm25Variant::DLH13;
+    auto dlh = build_bm25(fx, cfg_dlh);
+    const std::array<const simeon::Bm25Index*, 5> rrf5_set{&atire.idx, &plus.idx, &bl.idx, &dlh.idx,
+                                                           &sab.idx};
+    simeon::WeightedSdmConfig wsdm_cfg; // beta = 1.0 (published recipe)
+
+    // ---- Fragment-geometry leg (pure: alpha = 0 -> z(geometry) only),
+    // richcov + PHSS approx production recipe.
+    std::vector<std::string_view> seed_views;
+    seed_views.reserve(fx.doc_texts.size());
+    for (const auto& d : fx.doc_texts)
+        seed_views.emplace_back(d);
+    simeon::PmiConfig pcfg;
+    pcfg.target_rank = 128;
+    pcfg.min_token_count = 5;
+    pcfg.max_vocab_size = 20'000;
+    auto pmi = simeon::PmiEmbeddings::learn(std::span<const std::string_view>(seed_views), pcfg);
+    simeon::EncoderConfig ecfg;
+    ecfg.ngram_mode = simeon::NGramMode::WordOnly;
+    ecfg.ngram_min = 1;
+    ecfg.ngram_max = 1;
+    ecfg.sketch_dim = 0;
+    ecfg.output_dim = pmi.dim();
+    ecfg.projection = simeon::ProjectionMode::None;
+    ecfg.l2_normalize = true;
+    ecfg.pmi_rows = &pmi;
+    simeon::Encoder enc(ecfg);
+    std::vector<std::vector<SemanticFragment>> frags(nd);
+    for (std::size_t i = 0; i < nd; ++i) {
+        const auto prep0 = simeon::prepare_doc(fx.doc_texts[i], atire.idx, 6, 8, 0.0f);
+        frags[i] = simeon::build_doc_semantic_fragments_rich_covered_from_prep(enc, fx.doc_texts[i],
+                                                                               prep0, 0.60f, 0.80f);
+    }
+    simeon::compress_fragments_to_bf16(frags, enc.output_dim());
+    GeometryGraphConfig gcfg{.pool_size = 100,
+                             .alpha = 0.0f,
+                             .top_fragments_per_doc = 8,
+                             .attention_scale = 8.0f,
+                             .knn = 8,
+                             .steps = 2,
+                             .use_phss = true,
+                             .phss_config = simeon::PhssConfig{
+                                 .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}};
+
+    // ---- Per-query routing signals for the soft-alpha rows.
+    simeon::QueryRouter router(atire.idx);
+    const std::array<const simeon::Bm25Index*, 2> sig_pools{&atire.idx, &sab.idx};
+
+    enum Leg : std::uint8_t { L_ATIRE = 0, L_WSDM_AT, L_SAB, L_WSDM_SAB, L_GEOM, L_RRF5, N_LEGS };
+    static constexpr const char* kLegName[N_LEGS] = {"atire",   "wsdmat", "sab",
+                                                     "wsdmsab", "geom",   "rrf5"};
+
+    // ---- Row table. Kind selects the combiner in the inner loop.
+    struct Row {
+        std::string name;
+        std::array<float, N_LEGS> w{}; // convex weights for Cc; participation mask otherwise
+        enum Kind : std::uint8_t { Cc, Rrf, CombSum, CombMnz, Oracle, SigAlpha } kind = Cc;
+        // SigAlpha: blend legs a/b with alpha(q) interpolated on signal s.
+        std::uint8_t leg_a = 0, leg_b = 0;
+        bool use_nqc = false; // false = simplified_clarity
+        float alpha_lo = 0.0f, alpha_hi = 1.0f;
+    };
+    std::vector<Row> rows;
+    const auto add_cc = [&](std::initializer_list<std::pair<Leg, float>> ws) {
+        Row r;
+        std::string nm = "fusion_cc";
+        for (const auto& [leg, w] : ws) {
+            r.w[leg] = w;
+            char buf[40];
+            std::snprintf(buf, sizeof(buf), "_%s%.2f", kLegName[leg], static_cast<double>(w));
+            nm += buf;
+        }
+        r.name = std::move(nm);
+        rows.push_back(std::move(r));
+    };
+    // 2-leg alpha grids.
+    const std::array<std::pair<Leg, Leg>, 8> cc_pairs{{{L_ATIRE, L_WSDM_AT},
+                                                       {L_WSDM_AT, L_SAB},
+                                                       {L_ATIRE, L_SAB},
+                                                       {L_WSDM_AT, L_GEOM},
+                                                       {L_SAB, L_GEOM},
+                                                       {L_RRF5, L_GEOM},
+                                                       {L_WSDM_SAB, L_GEOM},
+                                                       {L_WSDM_SAB, L_WSDM_AT}}};
+    for (const auto& [a, b] : cc_pairs)
+        for (int i = 1; i <= 9; ++i)
+            add_cc({{a, static_cast<float>(i) / 10.0f}, {b, 1.0f - static_cast<float>(i) / 10.0f}});
+    // 3-leg simplex points (strictly interior; vertices/edges covered above).
+    const std::array<std::array<Leg, 3>, 3> cc_triples{{{L_WSDM_AT, L_SAB, L_GEOM},
+                                                        {L_ATIRE, L_WSDM_AT, L_GEOM},
+                                                        {L_WSDM_SAB, L_WSDM_AT, L_GEOM}}};
+    for (const auto& tr : cc_triples) {
+        for (float wa : {0.25f, 0.5f}) {
+            for (float wb : {0.25f, 0.5f}) {
+                const float wc = 1.0f - wa - wb;
+                if (wc <= 0.01f)
+                    continue;
+                add_cc({{tr[0], wa}, {tr[1], wb}, {tr[2], wc}});
+            }
+        }
+    }
+    // Baselines over identical leg sets.
+    const auto add_baseline = [&](Row::Kind kind, const char* kname,
+                                  std::initializer_list<Leg> legs) {
+        Row r;
+        r.kind = kind;
+        std::string nm = std::string("fusion_") + kname;
+        for (Leg leg : legs) {
+            r.w[leg] = 1.0f;
+            nm += std::string("_") + kLegName[leg];
+        }
+        r.name = std::move(nm);
+        rows.push_back(std::move(r));
+    };
+    for (auto kind : {Row::Rrf, Row::CombSum, Row::CombMnz}) {
+        const char* kname =
+            kind == Row::Rrf ? "rrf" : (kind == Row::CombSum ? "combsum" : "combmnz");
+        add_baseline(kind, kname, {L_ATIRE, L_WSDM_AT, L_SAB});
+        add_baseline(kind, kname, {L_WSDM_AT, L_WSDM_SAB, L_GEOM});
+    }
+    add_baseline(Row::Oracle, "pool_oracle",
+                 {L_ATIRE, L_WSDM_AT, L_SAB, L_WSDM_SAB, L_GEOM, L_RRF5});
+    // Signal-conditioned soft alpha on the three most promising pairs.
+    {
+        const std::array<std::pair<Leg, Leg>, 3> sig_pairs{
+            {{L_WSDM_AT, L_SAB}, {L_WSDM_AT, L_GEOM}, {L_WSDM_SAB, L_GEOM}}};
+        for (const auto& [a, b] : sig_pairs) {
+            for (bool use_nqc : {false, true}) {
+                for (float lo : {0.2f, 0.4f, 0.6f}) {
+                    for (float hi : {0.6f, 0.8f, 1.0f}) {
+                        if (hi <= lo)
+                            continue;
+                        Row r;
+                        r.kind = Row::SigAlpha;
+                        r.leg_a = a;
+                        r.leg_b = b;
+                        r.use_nqc = use_nqc;
+                        r.alpha_lo = lo;
+                        r.alpha_hi = hi;
+                        char buf[96];
+                        std::snprintf(buf, sizeof(buf), "fusion_sig%s_%s_%s_a%.1f_%.1f",
+                                      use_nqc ? "nqc" : "clar", kLegName[a], kLegName[b],
+                                      static_cast<double>(lo), static_cast<double>(hi));
+                        r.name = buf;
+                        rows.push_back(std::move(r));
+                    }
+                }
+            }
+        }
+    }
+    std::fprintf(stderr, "[fusion] rows=%zu queries=%u docs=%u\n", rows.size(), nq, nd);
+
+    // ---- Signal anchors: SIMEON_FUSION_ANCHORS="clar_lo,clar_hi,nqc_lo,nqc_hi"
+    // (computed on dev, passed frozen to the test run). Unset -> quantiles of
+    // the current run (only legitimate on the dev fold).
+    std::vector<float> sig_clarity(nq, 0.0f), sig_nqc(nq, 0.0f);
+    for (std::uint32_t qi = 0; qi < nq; ++qi) {
+        const auto f = router.features_with_pool(
+            fx.query_texts[qi], std::span<const simeon::Bm25Index* const>(sig_pools), 50);
+        sig_clarity[qi] = f.simplified_clarity;
+        sig_nqc[qi] = f.nqc;
+    }
+    float anchors[4]; // clar_lo, clar_hi, nqc_lo, nqc_hi
+    const char* anchors_env = std::getenv("SIMEON_FUSION_ANCHORS");
+    if (anchors_env != nullptr && std::sscanf(anchors_env, "%f,%f,%f,%f", &anchors[0], &anchors[1],
+                                              &anchors[2], &anchors[3]) == 4) {
+        std::fprintf(stderr, "[fusion] anchors (frozen): %.4f,%.4f,%.4f,%.4f\n", anchors[0],
+                     anchors[1], anchors[2], anchors[3]);
+    } else {
+        const auto quant = [](std::vector<float> v, double q) {
+            std::sort(v.begin(), v.end());
+            return v.empty() ? 0.0f : v[static_cast<std::size_t>(q * (v.size() - 1))];
+        };
+        anchors[0] = quant(sig_clarity, 0.25);
+        anchors[1] = quant(sig_clarity, 0.75);
+        anchors[2] = quant(sig_nqc, 0.25);
+        anchors[3] = quant(sig_nqc, 0.75);
+        std::fprintf(stderr,
+                     "[fusion] anchors (computed; freeze for test): "
+                     "SIMEON_FUSION_ANCHORS=%.4f,%.4f,%.4f,%.4f\n",
+                     anchors[0], anchors[1], anchors[2], anchors[3]);
+    }
+
+    // ---- Main loop: legs once per query, all rows in the inner loop.
+    std::unordered_map<std::uint32_t, std::unordered_map<std::uint32_t, std::uint32_t>> rel;
+    for (const auto& q : fx.qrels)
+        rel[q.q][q.d] = q.rel;
+
+    std::vector<std::vector<std::vector<std::pair<float, std::uint32_t>>>> row_rankings(
+        rows.size(), std::vector<std::vector<std::pair<float, std::uint32_t>>>(nq));
+    std::array<std::vector<float>, N_LEGS> leg_scores;
+    for (auto& v : leg_scores)
+        v.assign(nd, 0.0f);
+    std::array<std::vector<std::pair<std::uint32_t, float>>, N_LEGS> leg_topk;
+    Timing t;
+    t.index_build_us = atire.build_us + sab.build_us + plus.build_us + bl.build_us + dlh.build_us;
+    auto t0 = Clock::now();
+    for (std::uint32_t qi = 0; qi < nq; ++qi) {
+        const auto& query = fx.query_texts[qi];
+        atire.idx.score(query, leg_scores[L_ATIRE]);
+        atire.idx.score_wsdm(query, leg_scores[L_WSDM_AT], wsdm_cfg);
+        sab.idx.score(query, leg_scores[L_SAB]);
+        sab.idx.score_wsdm(query, leg_scores[L_WSDM_SAB], wsdm_cfg);
+        leg_scores[L_GEOM] = simeon::score_fragment_geometry(query, atire.idx, enc, frags, gcfg);
+        std::fill(leg_scores[L_RRF5].begin(), leg_scores[L_RRF5].end(), 0.0f);
+        simeon::score_bm25_variants_rrf(std::span<const simeon::Bm25Index* const>(rrf5_set), query,
+                                        leg_scores[L_RRF5]);
+
+        // Union pool over per-leg top-K.
+        std::vector<std::uint32_t> pool;
+        {
+            std::unordered_set<std::uint32_t> seen;
+            for (int leg = 0; leg < N_LEGS; ++leg) {
+                leg_topk[leg] = simeon::top_k(leg_scores[leg], kPoolPerLeg);
+                for (const auto& [did, _s] : leg_topk[leg])
+                    if (seen.insert(did).second)
+                        pool.push_back(did);
+            }
+        }
+        const std::size_t np = pool.size();
+
+        // Pool-restricted z-normalization per leg. The geometry leg's -inf
+        // (outside its internal BM25 pool) is floored at the leg's pool
+        // minimum finite score first.
+        std::array<std::vector<float>, N_LEGS> z;
+        for (int leg = 0; leg < N_LEGS; ++leg) {
+            auto& zl = z[leg];
+            zl.resize(np);
+            for (std::size_t p = 0; p < np; ++p)
+                zl[p] = leg_scores[leg][pool[p]];
+            if (leg == L_GEOM) {
+                float mn = std::numeric_limits<float>::infinity();
+                for (float v : zl)
+                    if (std::isfinite(v))
+                        mn = std::min(mn, v);
+                if (!std::isfinite(mn))
+                    mn = 0.0f;
+                for (float& v : zl)
+                    if (!std::isfinite(v))
+                        v = mn;
+            }
+            zscore_inplace(zl);
+        }
+
+        for (std::size_t row_i = 0; row_i < rows.size(); ++row_i) {
+            const Row& r = rows[row_i];
+            auto& out = row_rankings[row_i][qi];
+            out.reserve(np);
+            switch (r.kind) {
+                case Row::Cc: {
+                    for (std::size_t p = 0; p < np; ++p) {
+                        float s = 0.0f;
+                        for (int leg = 0; leg < N_LEGS; ++leg)
+                            if (r.w[leg] != 0.0f)
+                                s += r.w[leg] * z[leg][p];
+                        out.emplace_back(s, pool[p]);
+                    }
+                    break;
+                }
+                case Row::SigAlpha: {
+                    const float s_raw = r.use_nqc ? sig_nqc[qi] : sig_clarity[qi];
+                    const float lo = r.use_nqc ? anchors[2] : anchors[0];
+                    const float hi = r.use_nqc ? anchors[3] : anchors[1];
+                    const float span = hi - lo;
+                    float lam = span > 0.0f ? (s_raw - lo) / span : 0.5f;
+                    lam = std::clamp(lam, 0.0f, 1.0f);
+                    const float alpha = r.alpha_lo + (r.alpha_hi - r.alpha_lo) * lam;
+                    for (std::size_t p = 0; p < np; ++p)
+                        out.emplace_back(alpha * z[r.leg_a][p] + (1.0f - alpha) * z[r.leg_b][p],
+                                         pool[p]);
+                    break;
+                }
+                case Row::Rrf: {
+                    std::vector<simeon::Ranking> rankings;
+                    for (int leg = 0; leg < N_LEGS; ++leg)
+                        if (r.w[leg] != 0.0f)
+                            rankings.emplace_back(leg_topk[leg]);
+                    auto fused = simeon::rrf_fuse(std::span<const simeon::Ranking>(rankings));
+                    std::unordered_map<std::uint32_t, float> fused_map;
+                    fused_map.reserve(fused.size());
+                    for (const auto& [did, s] : fused)
+                        fused_map[did] = s;
+                    for (std::size_t p = 0; p < np; ++p) {
+                        const auto it = fused_map.find(pool[p]);
+                        out.emplace_back(it != fused_map.end() ? it->second : 0.0f, pool[p]);
+                    }
+                    break;
+                }
+                case Row::CombSum:
+                case Row::CombMnz: {
+                    // Min-max normalize each participating leg over the pool,
+                    // sum; MNZ multiplies by the number of legs whose top-K
+                    // contains the doc.
+                    std::vector<std::uint8_t> hits(np, 0u);
+                    if (r.kind == Row::CombMnz) {
+                        std::unordered_map<std::uint32_t, std::size_t> pidx;
+                        pidx.reserve(np);
+                        for (std::size_t p = 0; p < np; ++p)
+                            pidx[pool[p]] = p;
+                        for (int leg = 0; leg < N_LEGS; ++leg) {
+                            if (r.w[leg] == 0.0f)
+                                continue;
+                            for (const auto& [did, _s] : leg_topk[leg])
+                                ++hits[pidx[did]];
+                        }
+                    }
+                    std::vector<float> acc(np, 0.0f);
+                    for (int leg = 0; leg < N_LEGS; ++leg) {
+                        if (r.w[leg] == 0.0f)
+                            continue;
+                        float mn = std::numeric_limits<float>::infinity();
+                        float mx = -std::numeric_limits<float>::infinity();
+                        for (std::size_t p = 0; p < np; ++p) {
+                            const float v = z[leg][p];
+                            mn = std::min(mn, v);
+                            mx = std::max(mx, v);
+                        }
+                        const float vspan = mx - mn;
+                        if (vspan <= 0.0f)
+                            continue;
+                        for (std::size_t p = 0; p < np; ++p)
+                            acc[p] += (z[leg][p] - mn) / vspan;
+                    }
+                    for (std::size_t p = 0; p < np; ++p) {
+                        const float mult =
+                            r.kind == Row::CombMnz ? static_cast<float>(hits[p]) : 1.0f;
+                        out.emplace_back(acc[p] * mult, pool[p]);
+                    }
+                    break;
+                }
+                case Row::Oracle: {
+                    const auto rit = rel.find(qi);
+                    for (std::size_t p = 0; p < np; ++p) {
+                        float g = 0.0f;
+                        if (rit != rel.end()) {
+                            const auto qit = rit->second.find(pool[p]);
+                            if (qit != rit->second.end())
+                                g = static_cast<float>(qit->second);
+                        }
+                        out.emplace_back(g, pool[p]);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    t.query_us = elapsed_us(t0);
+
+    for (std::size_t row_i = 0; row_i < rows.size(); ++row_i) {
+        std::vector<double> per_q;
+        auto m = score_rankings_full(row_rankings[row_i], fx, &per_q);
+        dump_per_query_ndcg_if_env(rows[row_i].name.c_str(), fx, per_q);
+        emit(rows[row_i].name.c_str(), fx, m, 0, t);
+    }
+}
 #endif // SIMEON_RESEARCH_BENCH
 
 void run_simeon_bm25_rrf(const char* name, simeon::EncoderConfig cfg, const Fixture& fx,
@@ -6645,6 +7031,7 @@ int main(int argc, char** argv) {
     bool xprod_only = false;
     bool dual_only = false;
     bool fragment_quality_router_only = false;
+    bool fusion_only = false;
     std::string fragment_glove_path;
 #endif
 
@@ -6683,6 +7070,8 @@ int main(int argc, char** argv) {
             cluster_only = true;
         } else if (a == "--fragment-only") {
             fragment_only = true;
+        } else if (a == "--fusion-only") {
+            fusion_only = true;
         } else if (a == "--xprod-only") {
             fragment_only = true;
             xprod_only = true;
@@ -6713,6 +7102,7 @@ int main(int argc, char** argv) {
                 "  --graph-only                 run graph transport rows only\n"
                 "  --cluster-only               run fragment/cluster topology rows only\n"
                 "  --fragment-only              run PMI fragment graph rows only\n"
+                "  --fusion-only                run soft-fusion sweep rows only\n"
                 "  --fragment-quality-router-only run only the quality-routed fragment row\n"
                 "  --fragment-glove <path>      run GloVe/fastText fragment grid (C9)\n"
                 "  --router-per-query <path>    write per-query router telemetry JSONL\n"
@@ -6856,6 +7246,11 @@ int main(int argc, char** argv) {
         return 0;
     } else if (fragment_only) {
         run_bm25_fragment_graph_grid(fx, xprod_only, dual_only);
+        if (g_router_per_query_fp)
+            std::fclose(g_router_per_query_fp);
+        return 0;
+    } else if (fusion_only) {
+        run_bm25_fusion_grid(fx);
         if (g_router_per_query_fp)
             std::fclose(g_router_per_query_fp);
         return 0;

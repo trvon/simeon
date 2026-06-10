@@ -194,4 +194,22 @@ void linear_alpha_entropy_fuse(std::span<const float> a_scores, std::span<const 
     }
 }
 
+void convex_fuse_z(std::span<const std::span<const float>> legs, std::span<const float> weights,
+                   std::span<float> out_scores) noexcept {
+    const std::size_t n = out_scores.size();
+    if (legs.empty() || weights.size() != legs.size())
+        return;
+    std::fill(out_scores.begin(), out_scores.end(), 0.0f);
+    std::vector<float> z;
+    for (std::size_t l = 0; l < legs.size(); ++l) {
+        if (legs[l].size() != n)
+            return;
+        z.assign(legs[l].begin(), legs[l].end());
+        zscore_inplace(z);
+        const float w = weights[l];
+        for (std::size_t i = 0; i < n; ++i)
+            out_scores[i] += w * z[i];
+    }
+}
+
 } // namespace simeon

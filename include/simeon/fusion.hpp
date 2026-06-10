@@ -100,4 +100,11 @@ void linear_alpha_entropy_fuse(std::span<const float> a_scores, std::span<const 
                                float pool_jaccard, const EntropyAlphaConfig& cfg,
                                std::span<float> out_scores) noexcept;
 
+// Fixed-weight convex combination of z-normalized score legs (Bruch-Gai 2022).
+// Each leg is z-scored over its full span (callers pass pool-restricted
+// vectors), then out[i] = Σ_l weights[l] · z(legs[l])[i]. Validated dev→test
+// on the WSDM(SAB)+WSDM(Atire) pair; see docs/research.md fusion pass.
+void convex_fuse_z(std::span<const std::span<const float>> legs, std::span<const float> weights,
+                   std::span<float> out_scores) noexcept;
+
 } // namespace simeon
