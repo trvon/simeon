@@ -6050,6 +6050,18 @@ void run_bm25_fusion_grid(const Fixture& fx) {
     for (const auto& q : fx.qrels)
         rel[q.q][q.d] = q.rel;
 
+    // Optional rerank-workbench dump: one JSONL line per query with the union
+    // pool, each leg's raw scores over the pool (-inf -> -1e30 sentinel), the
+    // QPP signals, per-pool-doc relevance grades, and the query's full grade
+    // multiset (for offline IDCG), enabling out-of-tree rerank iteration
+    // without re-running leg setup. nDCG semantics match score_rankings_full.
+    FILE* wb_fp = nullptr;
+    if (const char* wb_path = std::getenv("SIMEON_WORKBENCH_OUT")) {
+        wb_fp = std::fopen(wb_path, "w");
+        if (wb_fp == nullptr)
+            std::fprintf(stderr, "[fusion] cannot open workbench path %s\n", wb_path);
+    }
+
     std::vector<std::vector<std::vector<std::pair<float, std::uint32_t>>>> row_rankings(
         rows.size(), std::vector<std::vector<std::pair<float, std::uint32_t>>>(nq));
     std::array<std::vector<float>, N_LEGS> leg_scores;
@@ -6104,6 +6116,44 @@ void run_bm25_fusion_grid(const Fixture& fx) {
                         v = mn;
             }
             zscore_inplace(zl);
+        }
+
+        if (wb_fp != nullptr) {
+            const auto rit = rel.find(qi);
+            std::fprintf(wb_fp, "{\"qid\":\"%s\",\"clarity\":%.6f,\"nqc\":%.6f,\"pool\":[",
+                         fx.query_ids[qi].c_str(), static_cast<double>(sig_clarity[qi]),
+                         static_cast<double>(sig_nqc[qi]));
+            for (std::size_t p = 0; p < np; ++p)
+                std::fprintf(wb_fp, "%s%u", p ? "," : "", pool[p]);
+            std::fprintf(wb_fp, "],\"rel\":[");
+            for (std::size_t p = 0; p < np; ++p) {
+                std::uint32_t g = 0;
+                if (rit != rel.end()) {
+                    const auto qit = rit->second.find(pool[p]);
+                    if (qit != rit->second.end())
+                        g = qit->second;
+                }
+                std::fprintf(wb_fp, "%s%u", p ? "," : "", g);
+            }
+            std::fprintf(wb_fp, "],\"all_rels\":[");
+            if (rit != rel.end()) {
+                bool first = true;
+                for (const auto& [_, g] : rit->second) {
+                    std::fprintf(wb_fp, "%s%u", first ? "" : ",", g);
+                    first = false;
+                }
+            }
+            std::fprintf(wb_fp, "],\"legs\":{");
+            for (int leg = 0; leg < N_LEGS; ++leg) {
+                std::fprintf(wb_fp, "%s\"%s\":[", leg ? "," : "", kLegName[leg]);
+                for (std::size_t p = 0; p < np; ++p) {
+                    const float v = leg_scores[leg][pool[p]];
+                    std::fprintf(wb_fp, "%s%.6g", p ? "," : "",
+                                 std::isfinite(v) ? static_cast<double>(v) : -1e30);
+                }
+                std::fprintf(wb_fp, "]");
+            }
+            std::fprintf(wb_fp, "}}\n");
         }
 
         for (std::size_t row_i = 0; row_i < rows.size(); ++row_i) {
@@ -6209,6 +6259,8 @@ void run_bm25_fusion_grid(const Fixture& fx) {
         }
     }
     t.query_us = elapsed_us(t0);
+    if (wb_fp != nullptr)
+        std::fclose(wb_fp);
 
     for (std::size_t row_i = 0; row_i < rows.size(); ++row_i) {
         std::vector<double> per_q;
