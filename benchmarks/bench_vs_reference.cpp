@@ -5906,6 +5906,23 @@ void run_bm25_fusion_grid(const Fixture& fx) {
                              .phss_config = simeon::PhssConfig{
                                  .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}};
 
+    // ---- Whole-doc PMI dense leg (rank 256): the stronger semantic variant
+    // of the fragment-pooled geom leg, for the FiQA vocabulary-mismatch
+    // frontier. All-doc embeddings precomputed once; per-query cosine over the
+    // pool. Training-free (corpus PMI SVD).
+    simeon::PmiConfig pcfg256 = pcfg;
+    pcfg256.target_rank = 256;
+    auto pmi256 =
+        simeon::PmiEmbeddings::learn(std::span<const std::string_view>(seed_views), pcfg256);
+    simeon::EncoderConfig ecfg256 = ecfg;
+    ecfg256.output_dim = pmi256.dim();
+    ecfg256.pmi_rows = &pmi256;
+    simeon::Encoder enc256(ecfg256);
+    const std::uint32_t pdim = enc256.output_dim();
+    std::vector<float> dembs256(static_cast<std::size_t>(nd) * pdim, 0.0f);
+    for (std::size_t i = 0; i < nd; ++i)
+        enc256.encode(fx.doc_texts[i], dembs256.data() + i * pdim);
+
     // ---- Per-query routing signals for the soft-alpha rows.
     simeon::QueryRouter router(atire.idx);
     const std::array<const simeon::Bm25Index*, 2> sig_pools{&atire.idx, &sab.idx};
@@ -6088,11 +6105,12 @@ void run_bm25_fusion_grid(const Fixture& fx) {
         F_PRF_ITER2,
         F_PASSAGE,
         F_PROX,
+        F_PMI256,
         N_FEATS
     };
-    static constexpr const char* kFeatName[N_FEATS] = {"prf_at",    "prf_fused",   "maxsim",
-                                                       "tkm3",      "sms",         "gmean",
-                                                       "prf_iter2", "passage_w50", "prox_pair"};
+    static constexpr const char* kFeatName[N_FEATS] = {
+        "prf_at", "prf_fused", "maxsim",      "tkm3",      "sms",
+        "gmean",  "prf_iter2", "passage_w50", "prox_pair", "pmi256_doc"};
 
     // Lazy doc-token cache for the text-evidence features (passage windows,
     // proximity); tokenization matches the index (word-only + hash_term).
@@ -6376,6 +6394,15 @@ void run_bm25_fusion_grid(const Fixture& fx) {
                             feat[F_PROX][p] = std::exp(-static_cast<float>(min_dist - 1) / 10.0f);
                     }
                 }
+            }
+            // Whole-doc PMI-256 dense cosine over the pool.
+            {
+                std::vector<float> qemb(pdim, 0.0f);
+                enc256.encode(query, qemb.data());
+                feat[F_PMI256].assign(np, 0.0f);
+                for (std::size_t p = 0; p < np; ++p)
+                    feat[F_PMI256][p] =
+                        simeon::simd::dot(qemb.data(), dembs256.data() + pool[p] * pdim, pdim);
             }
             std::fprintf(wb_fp, "},\"feats\":{");
             for (int fi = 0; fi < N_FEATS; ++fi) {

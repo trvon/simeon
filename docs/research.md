@@ -263,6 +263,37 @@ workbench feature legs:
   pool with bag/window/proximity heuristics. The feature columns remain in
   the workbench dump as instrumentation.
 
+### The learning-free ceiling: beating MiniLM except on FiQA
+
+The pool-oracle gap (≈0.2–0.3) is a recall ceiling, not an achievable ranking
+target — the honest yardstick is the frozen learned dense reference
+(`all-MiniLM-L6-v2`). Against it, the promoted fusion stack already wins on the
+two lexical-signal-rich corpora and trails only on the paraphrase-heavy one:
+
+| Test nDCG@10 | learning-free best | MiniLM reference | Δ |
+|---|---|---|---|
+| SciFact | 0.6990 | 0.6451 | **+0.054** |
+| NFCorpus | 0.3261 | 0.3167 | **+0.009** |
+| FiQA | 0.2512 | 0.3687 | −0.117 |
+
+FiQA (financial QA, short colloquial questions, paraphrase-heavy) is the one
+corpus where a learned model demonstrably achieves what lexical fusion cannot —
+the vocabulary-mismatch regime. The only in-bounds (training-free) semantic
+lever is in-corpus PMI; a whole-doc **PMI-256 dense cosine** leg was screened
+as the strongest variant of the fragment-pooled geometry leg. Result: it is the
+weakest signal in the entire workbench on FiQA (single-feature nDCG@10 **0.0805**
+vs MiniLM 0.3687) and adds nothing in fusion on any corpus (best blend gain
+≤ +0.0024 dev, at near-zero weight). This is the documented confirmation of
+Peat & Willett 1991 ("the limitations of term co-occurrence data for query
+expansion"): the paraphrase bridges FiQA needs are not present in the corpus
+co-occurrence statistics — they require the broad-world pretraining a learned
+encoder carries and a learning-free system structurally cannot. Higher PMI rank
+cannot recover information the corpus does not contain, so no rank-512 follow-up
+was run. **Conclusion of the precision arc**: learning-free fusion is at or above
+the learned-dense frontier wherever lexical signal carries relevance; the FiQA
+gap is a structural property of the learning-free constraint, not a tuning
+deficit.
+
 ## Components gated behind `enable_research`
 
 When `-Denable_research=false` (production default), the following are excluded:
