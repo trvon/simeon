@@ -217,6 +217,10 @@ Findings (MiniLM fixtures, dev→test workflow):
   future rerank-precision work.
 - NFCorpus's own dev winner (`z(atire)·0.2+z(sab)·0.8`, test +0.0028) stays
   below the promotion gate; treated as neutral.
+- **FiQA cross-check**: the promoted config is the top non-oracle row on the
+  FiQA test fold (0.2512 vs 0.2375 bm25_only, +0.0137), with the same
+  WSDM-pair plateau shape. Final tally: promoted on SciFact + FiQA, neutral on
+  NFCorpus, regression on none. FiQA's 6-leg union-pool oracle is 0.6073.
 
 ## Components gated behind `enable_research`
 

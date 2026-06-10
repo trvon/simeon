@@ -112,14 +112,14 @@ fixture × mode; see research.md for mechanism.
 nDCG@10, MiniLM fixtures, `--fusion-only` research sweep. Winner frozen on dev,
 read once on test.
 
-| Config | SciFact dev | SciFact test | NFCorpus dev | NFCorpus test |
-|---|---|---|---|---|
-| best fixed (prior) | — | 0.6714 | — | 0.3182 |
-| cc_wsdmsab0.60_wsdmat0.40 (promoted) | 0.6950 | 0.6885 | 0.2977 | 0.3220 |
-| cc_atire0.20_sab0.80 | 0.6777 | 0.6767 | 0.3000 | 0.3210 |
-| fusion_combsum_atire_wsdmat_sab | 0.6885 | 0.6891 | 0.2939 | 0.3212 |
-| fusion_rrf_atire_wsdmat_sab | 0.6828 | 0.6752 | 0.2722 | 0.3097 |
-| 6-leg union pool oracle | 0.9368 | 0.9365 | 0.5760 | 0.5918 |
+| Config | SciFact dev | SciFact test | NFCorpus dev | NFCorpus test | FiQA dev | FiQA test |
+|---|---|---|---|---|---|---|
+| best fixed (prior; FiQA = bm25_only) | — | 0.6714 | — | 0.3182 | 0.2378 | 0.2375 |
+| cc_wsdmsab0.60_wsdmat0.40 (promoted) | 0.6950 | 0.6885 | 0.2977 | 0.3220 | 0.2480 | 0.2512 |
+| cc_atire0.20_sab0.80 | 0.6777 | 0.6767 | 0.3000 | 0.3210 | 0.2391 | 0.2442 |
+| fusion_combsum_atire_wsdmat_sab | 0.6885 | 0.6891 | 0.2939 | 0.3212 | 0.2448 | 0.2451 |
+| fusion_rrf_atire_wsdmat_sab | 0.6828 | 0.6752 | 0.2722 | 0.3097 | — | — |
+| 6-leg union pool oracle | 0.9368 | 0.9365 | 0.5760 | 0.5918 | 0.5880 | 0.6073 |
 
 ## Research outcomes
 
