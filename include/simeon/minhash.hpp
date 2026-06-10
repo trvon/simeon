@@ -9,13 +9,15 @@
 
 namespace simeon {
 
-// One-permutation MinHash with optimal densification (Shrivastava 2017,
-// arXiv:1703.04664). Tokenizes the input as character n-grams, hashes each
-// n-gram once, slots the hash into one of `k` bins by `bin = h % k`, and
-// keeps the minimum `value = h / k` per bin. Empty bins are filled by the
-// rotation-based densification scheme so the resulting signature has the
-// same variance as classical k-permutation MinHash but is computed in
-// O(d + k) instead of O(d * k).
+// One-permutation MinHash with strided densification. Tokenizes the input as
+// character n-grams, hashes each n-gram once, slots the hash into one of `k`
+// bins by `bin = h % k`, and keeps the minimum `value = h >> 32` per bin.
+// Empty bins are filled by a seeded-stride donor scan with attempt-index
+// mixing, computed in O(d + k) instead of O(d * k). Measured against the
+// per-bin hashed-probe scheme of Shrivastava 2017 (arXiv:1703.04664) the
+// strided scan is equal-or-better at the sparsity levels we serve, and the
+// sparse-regime MSE sits at the one-permutation information floor (see
+// test_densification_variance_sparse).
 //
 // Output is `k` uint32 slot values; matching slot count between two
 // signatures is an unbiased Jaccard estimator (jaccard_estimate below).
@@ -46,14 +48,14 @@ private:
 
 // Unbiased Jaccard estimator: matching slots / k. Both signatures must have
 // the same length `k`; mismatched k produces undefined results.
-float jaccard_estimate(const std::uint32_t* a, const std::uint32_t* b,
-                       std::uint32_t k) noexcept;
+float jaccard_estimate(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t k) noexcept;
 
 // Score every doc in `corpus` (row-major, n_docs * k uint32 signatures)
 // against `query` (k uint32s) using jaccard_estimate, then return the top-N
 // docs sorted descending. Mirrors fusion::cosine_topk but on Jaccard space.
-std::vector<std::pair<std::uint32_t, float>>
-jaccard_topk(const std::uint32_t* query, const std::uint32_t* corpus,
-             std::uint32_t n_docs, std::uint32_t k, std::uint32_t topn);
+std::vector<std::pair<std::uint32_t, float>> jaccard_topk(const std::uint32_t* query,
+                                                          const std::uint32_t* corpus,
+                                                          std::uint32_t n_docs, std::uint32_t k,
+                                                          std::uint32_t topn);
 
-}  // namespace simeon
+} // namespace simeon

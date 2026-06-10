@@ -2,12 +2,14 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <random>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 #include "simeon/minhash.hpp"
+#include "simeon/tokenizer.hpp"
 
 using simeon::MinHashConfig;
 using simeon::MinHashEncoder;
@@ -223,6 +225,79 @@ void test_jaccard_topk_basic() {
     assert(top[1].first == 1); // high-overlap doc next
 }
 
+// Statistical regression guard on densification quality in the sparse regime
+// (|tokens| << k, most bins densified). One-permutation MinHash cannot beat
+// the information floor of ~|occupied bins| effective samples, so MSE sits a
+// few-fold above the classical k-permutation bound J(1-J)/k here by design.
+// Measured 2026-06: the shipped strided+mixed scheme lands at ~3.6x (4-word
+// cell) / ~7.8x (2-word cell); a per-bin hashed-probe variant (textbook
+// "optimal densification", arXiv:1703.04664) measured no better (9.2x on the
+// 2-word cell), so the strided scheme stays. This test pins the 4-word cell
+// at <6x to catch future regressions in donor selection.
+void test_densification_variance_sparse() {
+    constexpr std::uint32_t k = 512;
+    MinHashConfig cfg;
+    cfg.k = k;
+    MinHashEncoder enc(cfg);
+
+    struct SetSink final : simeon::NGramEmitter {
+        std::unordered_set<std::string> toks;
+        void on_token(std::string_view t, float) override { toks.emplace(t); }
+    };
+    const simeon::TokenizerConfig tcfg{cfg.ngram_min, cfg.ngram_max, true, false};
+
+    auto vocab = make_vocab(64);
+
+    double se_sum = 0.0;
+    double bound_sum = 0.0;
+    std::uint32_t n_pairs = 0;
+
+    std::vector<std::uint32_t> sig_a(k);
+    std::vector<std::uint32_t> sig_b(k);
+
+    for (std::uint32_t trial = 0; trial < 400; ++trial) {
+        const auto text_a = make_string_with_jaccard(vocab, 4, 2, 1000 + trial * 2);
+        const auto text_b = make_string_with_jaccard(vocab, 4, 2, 1001 + trial * 2);
+
+        SetSink sa;
+        SetSink sb;
+        simeon::tokenize(text_a, tcfg, sa);
+        simeon::tokenize(text_b, tcfg, sb);
+        if (sa.toks.empty() || sb.toks.empty())
+            continue;
+
+        std::uint32_t inter = 0;
+        for (const auto& t : sa.toks) {
+            if (sb.toks.count(t))
+                ++inter;
+        }
+        const std::uint32_t uni =
+            static_cast<std::uint32_t>(sa.toks.size() + sb.toks.size()) - inter;
+        const double j_exact = static_cast<double>(inter) / static_cast<double>(uni);
+        if (j_exact <= 0.02 || j_exact >= 0.98)
+            continue;
+
+        enc.encode(text_a, sig_a.data());
+        enc.encode(text_b, sig_b.data());
+        const double j_est = simeon::jaccard_estimate(sig_a.data(), sig_b.data(), k);
+
+        const double err = j_est - j_exact;
+        se_sum += err * err;
+        bound_sum += j_exact * (1.0 - j_exact) / static_cast<double>(k);
+        ++n_pairs;
+    }
+
+    assert(n_pairs > 300);
+    const double mse = se_sum / n_pairs;
+    const double classical = bound_sum / n_pairs;
+    const double inflation = mse / classical;
+    std::printf("  densification sparse-regime MSE inflation vs classical: %.2fx "
+                "(mse=%.3e classical=%.3e, %u pairs)\n",
+                inflation, mse, classical, n_pairs);
+    assert(inflation < 6.0 && "densification MSE regressed past the measured "
+                              "one-permutation floor for this cell");
+}
+
 } // namespace
 
 int main() {
@@ -234,5 +309,6 @@ int main() {
     test_densification_short_text_stable();
     test_jaccard_disjoint_low_score();
     test_jaccard_topk_basic();
+    test_densification_variance_sparse();
     return 0;
 }
