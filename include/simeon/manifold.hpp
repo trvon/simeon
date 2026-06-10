@@ -20,6 +20,14 @@ struct EuclideanCosineManifold {
         return simd::dot(a, b, dim);
     }
 
+    // Blocked similarity: one query row against four candidate rows. Bit-identical
+    // to four similarity() calls; used by the pairwise fragment loop.
+    static inline void similarity4(const float* a, const float* b0, const float* b1,
+                                   const float* b2, const float* b3, float* out4,
+                                   std::uint32_t dim) noexcept {
+        simd::dot4(a, b0, b1, b2, b3, out4, dim);
+    }
+
     // Bounded similarity-derived distance. Range [0, 2] for unit-norm vectors.
     static inline float distance(const float* a, const float* b, std::uint32_t dim) noexcept {
         return 1.0f - similarity(a, b, dim);

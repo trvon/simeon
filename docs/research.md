@@ -72,6 +72,52 @@ The default `bench_vs_reference` binary keeps the stable comparison surface:
    The dense 256-col goto table outperforms the double-array variant in throughput
    despite larger memory footprint. The DA prototype was removed (commit 7faf23e+).
 
+## PHSS engineering pass (phaseD-perf)
+
+The production `LargestGapApprox` criterion previously copied all m ≈ n(n−1)/2
+pairwise similarities and ran a full `std::sort` — only to locate one largest
+adjacent gap. Profiling on extracted SciFact/NFCorpus corpora put that sort at
+~59% of richcov rerank time. Three bit-identical changes landed:
+
+1. **O(m) pigeonhole maximum-gap** replaces gather+sort in
+   `phss_select_scale` (`src/persistent_homology.cpp`). With nb bins over
+   [vmin, vmax], any adjacent gap wider than the bin width span/nb must cross a
+   bin boundary, so per-bin min/max suffice to find it; the gap value and
+   midpoint are then computed from the same two adjacent sorted values the
+   sorted scan would subtract, giving bit-identical `selected_scale`/`max_gap`
+   with first-maximum (strict `>`) tie-breaking. The bin count is capped at
+   8192 to stay cache-resident; whenever the best cross-bin gap is not strictly
+   above the mean spacing (≈ uniform spacing, where the sort's tie-break could
+   pick an intra-bin pair), the code falls back to the retained sorted
+   reference `detail::phss_largest_gap_sorted`, so the degenerate regime is
+   bit-exact by construction rather than by argument. NaN inputs remain
+   unsupported (they were already UB under `std::sort`). Differential tests
+   (`tests/test_persistent_homology.cpp`) assert bit equality against the
+   sorted oracle across edge cases and 1,500 seeded randomized trials.
+2. **Blocked `dot4` kernel** for the pairwise fragment similarity loop
+   (`simd.hpp`, `src/arch/*`). One query row against four candidate rows; each
+   output keeps the exact accumulator structure of `dot` (NEON: 2 accumulators,
+   8 floats/iter, `vaddvq` reduction; AVX2: 16 floats/iter, 8-lane scalar
+   reduction; scalar: double accumulation), so results are bit-identical to
+   four independent `dot` calls — the win is amortized `a` loads and ILP, not
+   reassociation. Parity asserted bit-exactly in `tests/test_simd_parity.cpp`.
+   The AVX2 variant is textually parallel to `dot_avx2` but was authored on an
+   arm64 host; it needs one x86 CI run of `test_simd_parity` before being
+   relied on.
+3. **Adjacency loop**: per-row temp vector hoisted out of the loop and the
+   upper-triangle row for j > i read contiguously instead of through the
+   per-element triangular index; iteration order unchanged, outputs
+   bit-identical.
+
+Effect (`simeon_profile_fragment_geometry`, richcov, 50 queries × 5 iters,
+Apple Silicon; per-phase tables in benchmarks.md): approx-mode rerank mean
+8729 → 3321 µs/query on SciFact and 8533 → 3273 µs on NFCorpus (~2.6×);
+`phss_select` itself 5568 → 926 µs (6.0×). `phss_scale_mean` and
+`graph_edges_mean` are unchanged to all printed digits on every fixture × mode,
+and the exact `LargestGap` path is untouched (timings within noise), so nDCG is
+provably unaffected. The remaining approx-mode profile is pairwise dot products
+(~46%), scale selection (~28%, two streaming passes), and adjacency (~15%).
+
 ## Components gated behind `enable_research`
 
 When `-Denable_research=false` (production default), the following are excluded:

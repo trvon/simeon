@@ -63,57 +63,170 @@ struct UnionFind {
     }
 };
 
+using Clock = std::chrono::steady_clock;
+
+inline double elapsed_us(Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double, std::micro>(b - a).count();
+}
+
 } // anonymous namespace
+
+namespace detail {
+
+PhssResult phss_largest_gap_sorted(std::span<const float> similarities, float threshold) {
+    PhssResult result;
+
+    const auto t_gather0 = Clock::now();
+    std::vector<float> sims;
+    sims.reserve(similarities.size());
+    for (float s : similarities) {
+        if (threshold <= 0.0f || s >= threshold)
+            sims.push_back(s);
+    }
+    result.n_edges = static_cast<std::uint32_t>(sims.size());
+    const auto t_gather1 = Clock::now();
+    result.edge_gather_us = elapsed_us(t_gather0, t_gather1);
+
+    if (sims.empty()) {
+        result.selected_scale = 0.0f;
+        return result;
+    }
+    const auto t_sort0 = Clock::now();
+    std::sort(sims.begin(), sims.end());
+    const auto t_sort1 = Clock::now();
+    result.edge_sort_us = elapsed_us(t_sort0, t_sort1);
+
+    result.n_pairs = static_cast<std::uint32_t>(sims.size());
+    if (sims.size() < 2) {
+        result.selected_scale = sims[0];
+        return result;
+    }
+    const auto t_crit0 = Clock::now();
+    float max_gap = -1.0f;
+    std::size_t best_idx = 0;
+    for (std::size_t i = 0; i + 1 < sims.size(); ++i) {
+        const float gap = sims[i + 1] - sims[i];
+        if (gap > max_gap) {
+            max_gap = gap;
+            best_idx = i;
+        }
+    }
+    result.max_gap = max_gap > 0.0f ? max_gap : 0.0f;
+    result.selected_scale = (sims[best_idx] + sims[best_idx + 1]) * 0.5f;
+    const auto t_crit1 = Clock::now();
+    result.criterion_us = elapsed_us(t_crit0, t_crit1);
+    return result;
+}
+
+} // namespace detail
 
 PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t n,
                              const PhssConfig& cfg) {
-    using Clock = std::chrono::steady_clock;
-    const auto elapsed_us = [](Clock::time_point a, Clock::time_point b) {
-        return std::chrono::duration<double, std::micro>(b - a).count();
-    };
-
     PhssResult result;
     if (n == 0)
         return result;
 
     if (cfg.criterion == PhssConfig::Criterion::LargestGapApprox) {
+        // O(m) pigeonhole maximum-gap. Pass 1 summarizes the (threshold-filtered)
+        // similarities; pass 2 buckets them with per-bucket min/max; pass 3 scans
+        // consecutive nonempty buckets for the largest cross-bucket gap. With
+        // nb = m-1 buckets at least one is empty, so the true largest adjacent
+        // gap is a cross-bucket gap whenever it exceeds the mean spacing
+        // (vmax-vmin)/(m-1); the gap value and midpoint are then the same float
+        // operations the sorted scan performs, so selected_scale/max_gap are
+        // bit-identical. In the degenerate regime (gap not strictly above mean
+        // spacing, e.g. ~uniform spacing) we defer to the sorted reference to
+        // keep first-maximum tie-breaking exact.
         const auto t_gather0 = Clock::now();
-        std::vector<float> sims;
-        sims.reserve(similarities.size());
+        const bool use_threshold = cfg.threshold > 0.0f;
+        std::uint32_t m = 0;
+        float vmin = std::numeric_limits<float>::infinity();
+        float vmax = -std::numeric_limits<float>::infinity();
         for (float s : similarities) {
-            if (cfg.threshold <= 0.0f || s >= cfg.threshold)
-                sims.push_back(s);
+            if (use_threshold && s < cfg.threshold)
+                continue;
+            ++m;
+            vmin = std::min(vmin, s);
+            vmax = std::max(vmax, s);
         }
-        result.n_edges = static_cast<std::uint32_t>(sims.size());
+        result.n_edges = m;
         const auto t_gather1 = Clock::now();
         result.edge_gather_us = elapsed_us(t_gather0, t_gather1);
 
-        if (sims.empty()) {
+        if (m == 0) {
             result.selected_scale = 0.0f;
             return result;
         }
+        result.n_pairs = m;
+        if (m == 1) {
+            result.selected_scale = vmin;
+            return result;
+        }
+        if (vmin == vmax) {
+            result.max_gap = 0.0f;
+            result.selected_scale = (vmin + vmin) * 0.5f;
+            return result;
+        }
+
+        // Pass 2: bucket the values (timed under the phase the sort replaced).
+        // Pigeonhole uses m-1 bins, but the correctness argument only needs the
+        // largest gap to exceed the bin width span/nb; capping nb keeps the bin
+        // arrays cache-resident for large edge counts (m ~ n²/2), and any gap
+        // narrower than the wider bin width falls through to the sorted oracle.
         const auto t_sort0 = Clock::now();
-        std::sort(sims.begin(), sims.end());
+        const std::uint32_t nb = std::min<std::uint32_t>(m - 1, 8192u);
+        std::vector<float> bmin(nb, std::numeric_limits<float>::infinity());
+        std::vector<float> bmax(nb, -std::numeric_limits<float>::infinity());
+        const double span = static_cast<double>(vmax) - static_cast<double>(vmin);
+        const double idx_scale = static_cast<double>(nb) / span;
+        for (float s : similarities) {
+            if (use_threshold && s < cfg.threshold)
+                continue;
+            std::size_t idx = static_cast<std::size_t>(
+                (static_cast<double>(s) - static_cast<double>(vmin)) * idx_scale);
+            if (idx >= nb)
+                idx = nb - 1;
+            if (s < bmin[idx])
+                bmin[idx] = s;
+            if (s > bmax[idx])
+                bmax[idx] = s;
+        }
         const auto t_sort1 = Clock::now();
         result.edge_sort_us = elapsed_us(t_sort0, t_sort1);
 
-        result.n_pairs = static_cast<std::uint32_t>(sims.size());
-        if (sims.size() < 2) {
-            result.selected_scale = sims[0];
+        // Pass 3: largest cross-bucket gap, first maximum (strict >).
+        const auto t_crit0 = Clock::now();
+        float best_gap = -1.0f;
+        float best_lo = vmin;
+        float best_hi = vmin;
+        float prev_max = -std::numeric_limits<float>::infinity();
+        bool have_prev = false;
+        for (std::uint32_t k = 0; k < nb; ++k) {
+            if (bmin[k] > bmax[k])
+                continue; // empty bucket
+            if (have_prev) {
+                const float gap = bmin[k] - prev_max;
+                if (gap > best_gap) {
+                    best_gap = gap;
+                    best_lo = prev_max;
+                    best_hi = bmin[k];
+                }
+            }
+            prev_max = bmax[k];
+            have_prev = true;
+        }
+
+        const double mean_spacing = span / static_cast<double>(nb);
+        if (best_gap < 0.0f || static_cast<double>(best_gap) <= mean_spacing) {
+            // Degenerate/tie regime — defer to the bit-exact sorted reference.
+            const auto fb = detail::phss_largest_gap_sorted(similarities, cfg.threshold);
+            result.selected_scale = fb.selected_scale;
+            result.max_gap = fb.max_gap;
+            result.criterion_us = elapsed_us(t_crit0, Clock::now());
             return result;
         }
-        const auto t_crit0 = Clock::now();
-        float max_gap = -1.0f;
-        std::size_t best_idx = 0;
-        for (std::size_t i = 0; i + 1 < sims.size(); ++i) {
-            const float gap = sims[i + 1] - sims[i];
-            if (gap > max_gap) {
-                max_gap = gap;
-                best_idx = i;
-            }
-        }
-        result.max_gap = max_gap > 0.0f ? max_gap : 0.0f;
-        result.selected_scale = (sims[best_idx] + sims[best_idx + 1]) * 0.5f;
+        result.max_gap = best_gap > 0.0f ? best_gap : 0.0f;
+        result.selected_scale = (best_lo + best_hi) * 0.5f;
         const auto t_crit1 = Clock::now();
         result.criterion_us = elapsed_us(t_crit0, t_crit1);
         return result;

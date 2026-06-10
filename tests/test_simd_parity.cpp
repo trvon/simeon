@@ -339,6 +339,43 @@ void test_dot_dispatch_matches_public_tier() {
     assert(std::fabs(via_public - via_tier) <= 1e-5f * std::max(1.0f, std::fabs(via_tier)));
 }
 
+// dot4 contract: bit-identical to four independent dot() calls on the active
+// tier (the blocked kernel keeps each output's accumulator structure exactly,
+// so this is equality, not tolerance).
+void test_dot4_bit_equal_dim(std::uint32_t n) {
+    auto a = make_random(n, 0xD074AAAAu ^ n);
+    auto b0 = make_random(n, 0xD074BBB0u ^ n);
+    auto b1 = make_random(n, 0xD074BBB1u ^ n);
+    auto b2 = make_random(n, 0xD074BBB2u ^ n);
+    auto b3 = make_random(n, 0xD074BBB3u ^ n);
+
+    float out4[4];
+    simeon::simd::dot4(a.data(), b0.data(), b1.data(), b2.data(), b3.data(), out4, n);
+    const float r0 = simeon::simd::dot(a.data(), b0.data(), n);
+    const float r1 = simeon::simd::dot(a.data(), b1.data(), n);
+    const float r2 = simeon::simd::dot(a.data(), b2.data(), n);
+    const float r3 = simeon::simd::dot(a.data(), b3.data(), n);
+    assert(out4[0] == r0);
+    assert(out4[1] == r1);
+    assert(out4[2] == r2);
+    assert(out4[3] == r3);
+
+    // Scalar tier must also be bit-equal to four dot_scalar calls.
+    float s4[4];
+    simeon::simd::dot4_scalar(a.data(), b0.data(), b1.data(), b2.data(), b3.data(), s4, n);
+    assert(s4[0] == simeon::simd::dot_scalar(a.data(), b0.data(), n));
+    assert(s4[1] == simeon::simd::dot_scalar(a.data(), b1.data(), n));
+    assert(s4[2] == simeon::simd::dot_scalar(a.data(), b2.data(), n));
+    assert(s4[3] == simeon::simd::dot_scalar(a.data(), b3.data(), n));
+}
+
+void test_dot4_dimensions() {
+    for (std::uint32_t n :
+         {1u, 2u, 3u, 4u, 7u, 8u, 9u, 15u, 16u, 17u, 33u, 127u, 128u, 257u, 384u, 768u, 1024u}) {
+        test_dot4_bit_equal_dim(n);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -354,5 +391,6 @@ int main() {
     test_dispatchers_round_trip();
     test_active_tier_matches_host();
     test_dot_dispatch_matches_public_tier();
+    test_dot4_dimensions();
     return 0;
 }

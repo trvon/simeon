@@ -117,4 +117,13 @@ struct PhssResult {
 PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t n,
                              const PhssConfig& cfg);
 
+namespace detail {
+
+// Reference O(m log m) LargestGapApprox: threshold-filter + full sort + largest
+// adjacent-gap scan. Retained as the differential-test oracle and as the
+// degenerate-case fallback for the O(m) bucket path in phss_select_scale.
+PhssResult phss_largest_gap_sorted(std::span<const float> similarities, float threshold);
+
+} // namespace detail
+
 } // namespace simeon

@@ -84,6 +84,19 @@ inline float dot(const float* a, const float* b, std::size_t n) {
     return ActiveManifold::similarity(a, b, static_cast<std::uint32_t>(n));
 }
 
+inline void dot4(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
+                 float* out4, std::size_t n) {
+    const auto dim = static_cast<std::uint32_t>(n);
+    if constexpr (requires { ActiveManifold::similarity4(a, b0, b1, b2, b3, out4, dim); }) {
+        ActiveManifold::similarity4(a, b0, b1, b2, b3, out4, dim);
+    } else {
+        out4[0] = ActiveManifold::similarity(a, b0, dim);
+        out4[1] = ActiveManifold::similarity(a, b1, dim);
+        out4[2] = ActiveManifold::similarity(a, b2, dim);
+        out4[3] = ActiveManifold::similarity(a, b3, dim);
+    }
+}
+
 // BF16 (bfloat16) compression helpers.
 // Truncates the lower 16 bits of a float32 mantissa; preserves exponent exactly.
 inline std::uint16_t float_to_bf16(float f) noexcept {
@@ -1145,12 +1158,17 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     const std::uint32_t nf = static_cast<std::uint32_t>(frags.size());
     const std::uint32_t tri_count = nf * (nf - 1) / 2;
     const auto t_pair0 = profile ? Clock::now() : Clock::time_point{};
-    std::vector<float> sims_tri;
-    sims_tri.reserve(tri_count);
+    std::vector<float> sims_tri(tri_count);
     for (std::uint32_t i = 0; i < nf; ++i) {
-        for (std::uint32_t j = i + 1; j < nf; ++j) {
-            sims_tri.push_back(dot(fvecs.data() + i * dim, fvecs.data() + j * dim, dim));
+        const float* vi = fvecs.data() + i * dim;
+        float* row = sims_tri.data() + static_cast<std::size_t>(i) * (2 * nf - i - 1) / 2;
+        std::uint32_t j = i + 1;
+        for (; j + 4 <= nf; j += 4) {
+            const float* vj = fvecs.data() + j * dim;
+            dot4(vi, vj, vj + dim, vj + 2 * dim, vj + 3 * dim, row + (j - i - 1), dim);
         }
+        for (; j < nf; ++j)
+            row[j - i - 1] = dot(vi, fvecs.data() + j * dim, dim);
     }
     const auto t_pair1 = profile ? Clock::now() : Clock::time_point{};
     if (profile)
@@ -1227,19 +1245,23 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     std::vector<float> ns(frags.size(), 0.0f);
     std::uint64_t graph_edges = 0;
 
+    std::vector<std::pair<float, std::uint32_t>> sims;
+    sims.reserve(frags.size() > 0 ? frags.size() - 1 : 0);
     for (std::size_t i = 0; i < frags.size(); ++i) {
-        std::vector<std::pair<float, std::uint32_t>> sims;
-        sims.reserve(frags.size() > 0 ? frags.size() - 1 : 0);
-        for (std::size_t j = 0; j < frags.size(); ++j) {
-            if (i == j)
-                continue;
+        sims.clear();
+        for (std::size_t j = 0; j < i; ++j) {
             const float sim = sim_at(static_cast<std::uint32_t>(i), static_cast<std::uint32_t>(j));
-            if (use_phss_for_graph) {
-                if (sim >= phss_selected_scale)
-                    sims.emplace_back(sim, static_cast<std::uint32_t>(j));
-            } else {
+            if (!use_phss_for_graph || sim >= phss_selected_scale)
                 sims.emplace_back(sim, static_cast<std::uint32_t>(j));
-            }
+        }
+        // Row i of the upper triangle is contiguous: entries (i, j) for j > i
+        // start at offset i*(2*nf - i - 1)/2.
+        const float* row =
+            sims_tri.data() + static_cast<std::size_t>(i) * (2 * frags.size() - i - 1) / 2;
+        for (std::size_t j = i + 1; j < frags.size(); ++j) {
+            const float sim = row[j - i - 1];
+            if (!use_phss_for_graph || sim >= phss_selected_scale)
+                sims.emplace_back(sim, static_cast<std::uint32_t>(j));
         }
 
         if (use_phss_for_graph) {

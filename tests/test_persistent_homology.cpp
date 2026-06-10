@@ -1,7 +1,10 @@
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <random>
 #include <span>
 #include <vector>
 
@@ -11,6 +14,26 @@ using simeon::phss_select_scale;
 using simeon::PhssConfig;
 
 namespace {
+
+bool bit_eq(float a, float b) {
+    return std::memcmp(&a, &b, sizeof(float)) == 0;
+}
+
+// Differential oracle check: the production LargestGapApprox path (O(m) bucket
+// max-gap) must be bit-identical to the O(m log m) sorted reference for the
+// same values and threshold. The LargestGapApprox path streams the span as a
+// flat list, so arbitrary float vectors are valid inputs.
+void assert_matches_sorted(const std::vector<float>& v, float threshold) {
+    PhssConfig cfg;
+    cfg.criterion = PhssConfig::Criterion::LargestGapApprox;
+    cfg.threshold = threshold;
+    const auto got = phss_select_scale(v, /*n=*/100u, cfg);
+    const auto ref = simeon::detail::phss_largest_gap_sorted(v, threshold);
+    assert(bit_eq(got.selected_scale, ref.selected_scale));
+    assert(bit_eq(got.max_gap, ref.max_gap));
+    assert(got.n_edges == ref.n_edges);
+    assert(got.n_pairs == ref.n_pairs);
+}
 
 // Dense upper-triangular packing: index(i,j) = i*(2*n - i - 1)/2 + (j - i - 1) for i < j
 std::vector<float> make_tri(std::uint32_t n, const std::vector<float>& sims) {
@@ -226,6 +249,82 @@ void test_threshold_filters_partial_edges() {
     assert(r.selected_scale > 0.0f); // should pick the 0.9 death
 }
 
+// Bucket vs sorted oracle: hand-picked degenerate and edge-case inputs.
+void test_approx_differential_edge_cases() {
+    // empty / single / pairs
+    assert_matches_sorted({}, 0.0f);
+    assert_matches_sorted({0.42f}, 0.0f);
+    assert_matches_sorted({0.42f, 0.42f}, 0.0f);
+    assert_matches_sorted({0.1f, 0.9f}, 0.0f);
+
+    // all-equal, large m
+    assert_matches_sorted(std::vector<float>(10'000, 0.73f), 0.0f);
+
+    // duplicate-heavy: 5 distinct values repeated 1000x, shuffled
+    {
+        std::vector<float> v;
+        for (float base : {0.11f, 0.32f, 0.55f, 0.71f, 0.94f})
+            v.insert(v.end(), 1000, base);
+        std::mt19937 rng(7);
+        std::shuffle(v.begin(), v.end(), rng);
+        assert_matches_sorted(v, 0.0f);
+        assert_matches_sorted(v, 0.5f);
+    }
+
+    // adversarial evenly-spaced values (every adjacent gap ties — must hit the
+    // sorted fallback and still agree bit-for-bit)
+    {
+        std::vector<float> v;
+        for (int i = 0; i < 1024; ++i)
+            v.push_back(static_cast<float>(i) / 1024.0f);
+        std::mt19937 rng(13);
+        std::shuffle(v.begin(), v.end(), rng);
+        assert_matches_sorted(v, 0.0f);
+    }
+
+    // negative similarities (cosines can be < 0)
+    assert_matches_sorted({-0.8f, -0.2f, 0.1f, 0.65f, 0.9f}, 0.0f);
+
+    // threshold variants: filters nothing / some / everything; boundary value
+    // exactly == threshold must pass (>= semantics)
+    {
+        const std::vector<float> v{0.1f, 0.3f, 0.3f, 0.5f, 0.7f, 0.9f};
+        assert_matches_sorted(v, -1.0f); // <=0 disables filtering
+        assert_matches_sorted(v, 0.3f);  // boundary inclusive
+        assert_matches_sorted(v, 0.45f);
+        assert_matches_sorted(v, 0.95f); // filters everything
+    }
+}
+
+// Bucket vs sorted oracle: seeded randomized property loop over sizes and
+// distributions matching the production regime (m up to ~80k edges).
+void test_approx_differential_randomized() {
+    std::mt19937 rng(0xC0FFEE);
+    const std::size_t sizes[] = {3, 10, 100, 4950, 79800};
+    for (int trial = 0; trial < 100; ++trial) {
+        for (std::size_t m : sizes) {
+            std::vector<float> v(m);
+            if (trial % 2 == 0) {
+                std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+                for (auto& x : v)
+                    x = uni(rng);
+            } else {
+                // clustered bimodal: mimics intra- vs cross-cluster cosines
+                std::normal_distribution<float> lo(0.15f, 0.05f), hi(0.8f, 0.05f);
+                std::bernoulli_distribution pick(0.7);
+                for (auto& x : v)
+                    x = std::clamp(pick(rng) ? lo(rng) : hi(rng), -1.0f, 1.0f);
+            }
+            auto sorted = v;
+            std::sort(sorted.begin(), sorted.end());
+            const float p25 = sorted[m / 4];
+            const float p75 = sorted[(3 * m) / 4];
+            for (float threshold : {0.0f, p25, p75})
+                assert_matches_sorted(v, threshold);
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -238,5 +337,7 @@ int main() {
     test_no_diagram_still_selects_scale();
     test_threshold_filters_all_edges();
     test_threshold_filters_partial_edges();
+    test_approx_differential_edge_cases();
+    test_approx_differential_randomized();
     return 0;
 }

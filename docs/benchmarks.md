@@ -92,6 +92,21 @@ Throughput benchmark for the TextRank sentence ranker on synthetic documents.
 | `simeon_profile_sab_smooth` | Isolated SAB-smooth BM25 query loop for xctrace/sample profiling |
 | `simeon_profile_fragment_geometry` | Isolated fragment-geometry pipeline for profiling |
 
+### Fragment-geometry rerank, phaseD-perf engineering pass
+
+`simeon_profile_fragment_geometry`, richcov builder, mode=approx, 50 queries ×
+5 iters, Apple Silicon (arm64/NEON), mean µs per query. Differential signals
+(`phss_scale_mean`, `graph_edges_mean`) identical before/after on every
+fixture × mode; see research.md for mechanism.
+
+| Phase | SciFact before | SciFact after | NFCorpus before | NFCorpus after |
+|---|---|---|---|---|
+| query_total_mean_us | 8729.3 | 3321.1 | 8533.5 | 3273.0 |
+| phss_select_mean_us | 5567.8 | 925.8 | 5474.3 | 918.6 |
+| phss_select_edge_sort_mean_us | 5170.8 | 764.0 | 5090.7 | 758.0 |
+| phss_pairwise_mean_us | 2016.4 | 1538.2 | 1989.0 | 1521.8 |
+| adjacency_mean_us | 737.3 | 502.2 | 718.4 | 544.3 |
+
 ## Research outcomes
 
 See [research.md](research.md) for the full research summary including:

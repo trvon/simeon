@@ -31,6 +31,23 @@ float dot_neon(const float* a, const float* b, std::uint32_t n) noexcept;
 float dot_avx2(const float* a, const float* b, std::uint32_t n) noexcept;
 #endif
 
+// Blocked inner product: one row `a` against four rows `b0..b3`, writing
+// out4[0..3]. Each output keeps the accumulator structure of dot_*, so results
+// are bit-identical to four independent dot() calls; the win is amortizing the
+// `a` loads and instruction-level parallelism in pairwise similarity loops.
+void dot4_scalar(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
+                 float* out4, std::uint32_t n) noexcept;
+
+#if defined(SIMEON_HAS_NEON)
+void dot4_neon(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
+               float* out4, std::uint32_t n) noexcept;
+#endif
+
+#if defined(SIMEON_HAS_AVX2)
+void dot4_avx2(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
+               float* out4, std::uint32_t n) noexcept;
+#endif
+
 // dst[i] += src[i]. Used on the PMI-sum encode path (once per in-vocab token
 // per doc) and as an accumulate building block elsewhere.
 void add_vec_scalar(float* dst, const float* src, std::uint32_t n) noexcept;
@@ -96,6 +113,26 @@ inline float dot(const float* a, const float* b, std::uint32_t n) noexcept {
 #endif
         default:
             return dot_scalar(a, b, n);
+    }
+}
+
+inline void dot4(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
+                 float* out4, std::uint32_t n) noexcept {
+    SimdTier tier = active_simd_tier();
+    switch (tier) {
+#if defined(SIMEON_HAS_NEON)
+        case SimdTier::Neon:
+            dot4_neon(a, b0, b1, b2, b3, out4, n);
+            return;
+#endif
+#if defined(SIMEON_HAS_AVX2)
+        case SimdTier::Avx2:
+            dot4_avx2(a, b0, b1, b2, b3, out4, n);
+            return;
+#endif
+        default:
+            dot4_scalar(a, b0, b1, b2, b3, out4, n);
+            return;
     }
 }
 
