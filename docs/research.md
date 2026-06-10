@@ -252,6 +252,16 @@ workbench feature legs:
 - The best-leg-or-feat oracle (0.7678 vs 0.7382 legs-only, SciFact dev) shows
   features add per-query headroom that fixed blends barely capture — the
   routing-paradox pattern recurs at the feature level.
+- **Second screening round, three more negatives** (dev, both corpora):
+  iterated PRF (`prf_iter2`, re-anchoring on the prf_fused blend's top-10) is
+  dominated by the single fused-feedback round; Callan-style passage windows
+  (`passage_w50`, max window-50 saturating-tf score) and Tao-Zhai pair
+  proximity (`prox_pair`, exp(−min distance)) are flat-to-negative as blend
+  features and nearly signal-free standalone. With the MaxSim family this
+  exhausts the obvious within-pool lexical-evidence axis: the remaining
+  ~0.2-0.3 pool-oracle gap is not reachable by reweighting or re-reading the
+  pool with bag/window/proximity heuristics. The feature columns remain in
+  the workbench dump as instrumentation.
 
 ## Components gated behind `enable_research`
 

@@ -6085,10 +6085,36 @@ void run_bm25_fusion_grid(const Fixture& fx) {
         F_TKM3,
         F_SMS,
         F_GMEAN,
+        F_PRF_ITER2,
+        F_PASSAGE,
+        F_PROX,
         N_FEATS
     };
-    static constexpr const char* kFeatName[N_FEATS] = {"prf_at", "prf_fused", "maxsim",
-                                                       "tkm3",   "sms",       "gmean"};
+    static constexpr const char* kFeatName[N_FEATS] = {"prf_at",    "prf_fused",   "maxsim",
+                                                       "tkm3",      "sms",         "gmean",
+                                                       "prf_iter2", "passage_w50", "prox_pair"};
+
+    // Lazy doc-token cache for the text-evidence features (passage windows,
+    // proximity); tokenization matches the index (word-only + hash_term).
+    std::vector<std::vector<std::uint64_t>> doc_tok(nd);
+    std::vector<std::uint8_t> doc_tok_ready(nd, 0u);
+    struct HashOnlySink final : simeon::NGramEmitter {
+        std::vector<std::uint64_t>* out = nullptr;
+        const simeon::Bm25Index* hidx = nullptr;
+        void on_token(std::string_view tok, float) override {
+            out->push_back(hidx->hash_term(tok));
+        }
+    };
+    const auto ensure_doc_tokens = [&](std::uint32_t did) -> const std::vector<std::uint64_t>& {
+        if (!doc_tok_ready[did]) {
+            HashOnlySink sink;
+            sink.out = &doc_tok[did];
+            sink.hidx = &atire.idx;
+            simeon::tokenize(fx.doc_texts[did], simeon::TokenizerConfig{0, 0, false, true}, sink);
+            doc_tok_ready[did] = 1u;
+        }
+        return doc_tok[did];
+    };
     std::array<GeometryGraphConfig, 4> ms_cfgs;
     for (auto& c : ms_cfgs) {
         c = GeometryGraphConfig{.pool_size = 100,
@@ -6248,6 +6274,108 @@ void run_bm25_fusion_grid(const Fixture& fx) {
                 f.assign(np, 0.0f);
                 for (std::size_t p = 0; p < np; ++p)
                     f[p] = ms[pool[p]];
+            }
+
+            // prf_iter2: re-anchor RM3 on the prf_fused blend's top-10
+            // (one more feedback iteration than prf_fused).
+            {
+                std::vector<float> blend(np);
+                for (std::size_t p = 0; p < np; ++p)
+                    blend[p] = 0.3f * z_prf_fused[p] +
+                               0.7f * (0.6f * z[L_WSDM_SAB][p] + 0.4f * z[L_WSDM_AT][p]);
+                std::vector<std::size_t> ord(np);
+                std::iota(ord.begin(), ord.end(), std::size_t{0});
+                const std::size_t kfb = std::min<std::size_t>(10, np);
+                std::partial_sort(ord.begin(), ord.begin() + kfb, ord.end(),
+                                  [&](std::size_t a, std::size_t b) {
+                                      if (blend[a] != blend[b])
+                                          return blend[a] > blend[b];
+                                      return pool[a] < pool[b];
+                                  });
+                std::vector<std::uint32_t> fb_ids(kfb);
+                std::vector<float> fb_w(kfb);
+                const float bmax = kfb > 0 ? blend[ord[0]] : 0.0f;
+                for (std::size_t i = 0; i < kfb; ++i) {
+                    fb_ids[i] = pool[ord[i]];
+                    fb_w[i] = std::exp(blend[ord[i]] - bmax);
+                }
+                std::fill(full.begin(), full.end(), 0.0f);
+                simeon::score_with_prf(atire.idx, query, fb_ids, fb_w, full, simeon::PrfConfig{});
+                feat[F_PRF_ITER2].assign(np, 0.0f);
+                for (std::size_t p = 0; p < np; ++p)
+                    feat[F_PRF_ITER2][p] = full[pool[p]];
+            }
+
+            // Text-evidence features over pool docs: passage windows (Callan
+            // 1994 — max saturating-tf window score) and Tao-Zhai 2007 pair
+            // proximity (exp(-min distance between distinct query terms)).
+            {
+                struct QTermSink final : simeon::NGramEmitter {
+                    std::vector<std::pair<std::uint64_t, float>>* out = nullptr;
+                    const simeon::Bm25Index* hidx = nullptr;
+                    void on_token(std::string_view tok, float) override {
+                        out->push_back({hidx->hash_term(tok), hidx->idf(tok)});
+                    }
+                };
+                std::vector<std::pair<std::uint64_t, float>> q_terms;
+                QTermSink qsink;
+                qsink.out = &q_terms;
+                qsink.hidx = &atire.idx;
+                simeon::tokenize(query, simeon::TokenizerConfig{0, 0, false, true}, qsink);
+                std::sort(q_terms.begin(), q_terms.end());
+                q_terms.erase(std::unique(q_terms.begin(), q_terms.end()), q_terms.end());
+
+                feat[F_PASSAGE].assign(np, 0.0f);
+                feat[F_PROX].assign(np, 0.0f);
+                constexpr std::size_t kWin = 50, kStride = 25;
+                std::unordered_map<std::uint64_t, std::pair<float, std::size_t>> qmap;
+                for (std::size_t p = 0; p < np && !q_terms.empty(); ++p) {
+                    const auto& toks = ensure_doc_tokens(pool[p]);
+                    // Passage: max over windows of Σ_t idf(t)·tf/(tf+1.2).
+                    float best_win = 0.0f;
+                    for (std::size_t w0 = 0; w0 < toks.size(); w0 += kStride) {
+                        const std::size_t w1 = std::min(toks.size(), w0 + kWin);
+                        qmap.clear();
+                        for (const auto& [h, qidf] : q_terms)
+                            qmap[h] = {qidf, 0};
+                        for (std::size_t i = w0; i < w1; ++i) {
+                            const auto it = qmap.find(toks[i]);
+                            if (it != qmap.end())
+                                ++it->second.second;
+                        }
+                        float s = 0.0f;
+                        for (const auto& [h, iv] : qmap) {
+                            const float tf = static_cast<float>(iv.second);
+                            if (tf > 0.0f)
+                                s += iv.first * tf / (tf + 1.2f);
+                        }
+                        best_win = std::max(best_win, s);
+                        if (w1 == toks.size())
+                            break;
+                    }
+                    feat[F_PASSAGE][p] = best_win;
+
+                    // Proximity: min distance between occurrences of two
+                    // DIFFERENT query terms; feature = exp(-min_dist).
+                    if (q_terms.size() >= 2) {
+                        qmap.clear();
+                        std::size_t min_dist = SIZE_MAX;
+                        for (std::size_t i = 0; i < toks.size(); ++i) {
+                            const auto self =
+                                std::find_if(q_terms.begin(), q_terms.end(),
+                                             [&](const auto& qt) { return qt.first == toks[i]; });
+                            if (self == q_terms.end())
+                                continue;
+                            for (const auto& [h, last] : qmap) {
+                                if (h != toks[i])
+                                    min_dist = std::min(min_dist, i - last.second);
+                            }
+                            qmap[toks[i]] = {0.0f, i};
+                        }
+                        if (min_dist != SIZE_MAX)
+                            feat[F_PROX][p] = std::exp(-static_cast<float>(min_dist - 1) / 10.0f);
+                    }
+                }
             }
             std::fprintf(wb_fp, "},\"feats\":{");
             for (int fi = 0; fi < N_FEATS; ++fi) {
