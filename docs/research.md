@@ -230,19 +230,22 @@ rest needs new document-level evidence. First candidate family tested via
 workbench feature legs:
 
 - **Fused-feedback RM3 beats classic RM3 as a standalone leg on every
-  corpus** (dev single-leg: 0.6648 vs 0.5747 SciFact, 0.2884 vs 0.2633
-  NFCorpus). Mechanism: RM3's known weak point is feedback quality; anchoring
+  corpus** (single-leg: 0.6648 vs 0.5747 SciFact dev, 0.2884 vs 0.2633
+  NFCorpus dev, 0.2249 vs 0.1971 FiQA test — three for three, both folds).
+  Mechanism: RM3's known weak point is feedback quality; anchoring
   the relevance model on the *promoted fusion's* top-10 (softmax(z) doc
   weights) instead of the BM25 first pass gives a cleaner pseudo-relevant
   set. Library support: the `score_with_prf` overload taking an explicit
   feedback set (prf.hpp).
-- **Blend promoted**: `0.3·z(prf_fused) + 0.7·(0.6·z(wsdm_sab)+0.4·z(wsdm_at))`
-  — test nDCG@10 0.6990 SciFact (+0.0105 over the WSDM fusion) and 0.3261
-  NFCorpus (+0.0042); the whole pf-weight plateau (0.1–0.5) sits above the
-  baseline on both test folds. Cross-fold note: SciFact's train-proxy dev fold
-  had the sign *flipped* (−0.002) — the ±0.005 fold-disagreement rule in
-  action; promotion rests on the frozen test reads and the cross-corpus
-  plateau.
+- **Blend (corpus-sensitive, opt-in)**:
+  `0.3·z(prf_fused) + 0.7·(0.6·z(wsdm_sab)+0.4·z(wsdm_at))` — test nDCG@10
+  0.6990 SciFact (+0.0105 over the WSDM fusion), 0.3261 NFCorpus (+0.0042),
+  0.2469 FiQA (−0.0043). The pf-weight plateau (0.1–0.5) clears the baseline
+  on both SciFact and NFCorpus test folds, but FiQA is flat-to-negative —
+  the same corpus profile RM3 has always shown (short scientific corpora
+  benefit; financial QA does not). Keep opt-in per corpus, like RM3 itself.
+  Cross-fold note: SciFact's train-proxy dev fold had the sign *flipped*
+  (−0.002 dev vs +0.0105 test) — the ±0.005 fold-disagreement rule in action.
 - **MaxSim-family doc scorers are flat as features** (MaxSim / TopKMean /
   SoftMaxSum / GeoMean over fragment qsims: ≤ +0.0015 in any blend) — the
   fragment signal's aggregation is not the bottleneck on these corpora.
