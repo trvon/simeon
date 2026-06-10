@@ -1171,6 +1171,25 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     const std::uint32_t nf = static_cast<std::uint32_t>(frags.size());
     const std::uint32_t tri_count = nf * (nf - 1) / 2;
     const auto t_pair0 = profile ? Clock::now() : Clock::time_point{};
+
+    // Optional prefix-dim graph vectors: copy the leading dims of each
+    // whitened fragment and renormalize, so pairwise graph similarities stay
+    // cosines. Query attention (qsim, above) is untouched. Default off.
+    const bool use_graph_prefix = cfg.graph_prefix_dim > 0 && cfg.graph_prefix_dim < dim;
+    const std::uint32_t gdim = use_graph_prefix ? cfg.graph_prefix_dim : dim;
+    std::vector<float> gvecs;
+    const float* gbase = fvecs.data();
+    if (use_graph_prefix) {
+        gvecs.resize(static_cast<std::size_t>(nf) * gdim);
+        for (std::uint32_t i = 0; i < nf; ++i) {
+            float* dst = gvecs.data() + static_cast<std::size_t>(i) * gdim;
+            std::memcpy(dst, fvecs.data() + static_cast<std::size_t>(i) * dim,
+                        gdim * sizeof(float));
+            simd::l2_normalize(dst, gdim);
+        }
+        gbase = gvecs.data();
+    }
+
     std::vector<float> sims_tri(tri_count);
     PhssStats sims_stats;
     sims_stats.count = tri_count;
@@ -1190,21 +1209,21 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
         sims_max = std::max(sims_max, row_max);
     };
     for (std::uint32_t i = 0; i + 2 <= nf; i += 2) {
-        const float* vi0 = fvecs.data() + i * dim;
-        const float* vi1 = fvecs.data() + (i + 1) * dim;
+        const float* vi0 = gbase + static_cast<std::size_t>(i) * gdim;
+        const float* vi1 = gbase + static_cast<std::size_t>(i + 1) * gdim;
         float* row0 = sims_tri.data() + static_cast<std::size_t>(i) * (2 * nf - i - 1) / 2;
         float* row1 = sims_tri.data() + static_cast<std::size_t>(i + 1) * (2 * nf - i - 2) / 2;
-        row0[0] = dot(vi0, vi1, dim);
+        row0[0] = dot(vi0, vi1, gdim);
         std::uint32_t j = i + 2;
         for (; j + 4 <= nf; j += 4) {
-            const float* vj = fvecs.data() + j * dim;
-            dot2x4(vi0, vi1, vj, vj + dim, vj + 2 * dim, vj + 3 * dim, row0 + (j - i - 1),
-                   row1 + (j - i - 2), dim);
+            const float* vj = gbase + static_cast<std::size_t>(j) * gdim;
+            dot2x4(vi0, vi1, vj, vj + gdim, vj + 2 * gdim, vj + 3 * gdim, row0 + (j - i - 1),
+                   row1 + (j - i - 2), gdim);
         }
         for (; j < nf; ++j) {
-            const float* vj = fvecs.data() + j * dim;
-            row0[j - i - 1] = dot(vi0, vj, dim);
-            row1[j - i - 2] = dot(vi1, vj, dim);
+            const float* vj = gbase + static_cast<std::size_t>(j) * gdim;
+            row0[j - i - 1] = dot(vi0, vj, gdim);
+            row1[j - i - 2] = dot(vi1, vj, gdim);
         }
         fold_range(row0, nf - i - 1);
         fold_range(row1, nf - i - 2);

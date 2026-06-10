@@ -50,6 +50,7 @@ double us(Clock::time_point a, Clock::time_point b) {
 struct RunConfig {
     const char* builder = "basic";
     const char* mode = "phss";
+    std::uint32_t graph_prefix_dim = 0;
 };
 
 simeon::FragmentGeometryConfig make_geom_cfg(const RunConfig& run) {
@@ -67,6 +68,7 @@ simeon::FragmentGeometryConfig make_geom_cfg(const RunConfig& run) {
     cfg.phss_confidence_threshold = 0.55f;
     const std::string_view builder = run.builder;
     cfg.top_fragments_per_doc = (builder == "basic" || builder == "basicpos") ? 4u : 8u;
+    cfg.graph_prefix_dim = run.graph_prefix_dim;
     return cfg;
 }
 
@@ -110,13 +112,15 @@ int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: profile_fragment_geometry <fixture_dir> "
                              "<builder:basic|basicpos|richcov|richmmr> "
-                             "<mode:fixed|phss|adaptive|approx> [iters=5]\n");
+                             "<mode:fixed|phss|adaptive|approx> [iters=5] [graph_prefix_dim=0]\n");
         return 2;
     }
 
     const std::string dir = argv[1];
-    const RunConfig run{argv[2], argv[3]};
+    RunConfig run{argv[2], argv[3]};
     const int iters = argc >= 5 ? std::atoi(argv[4]) : 5;
+    if (argc >= 6)
+        run.graph_prefix_dim = static_cast<std::uint32_t>(std::atoi(argv[5]));
 
     namespace fs = std::filesystem;
     auto corpus = read_tsv2((fs::path(dir) / "corpus.tsv").string());

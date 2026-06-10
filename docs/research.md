@@ -100,10 +100,9 @@ adjacent gap. Profiling on extracted SciFact/NFCorpus corpora put that sort at
    8 floats/iter, `vaddvq` reduction; AVX2: 16 floats/iter, 8-lane scalar
    reduction; scalar: double accumulation), so results are bit-identical to
    four independent `dot` calls — the win is amortized `a` loads and ILP, not
-   reassociation. Parity asserted bit-exactly in `tests/test_simd_parity.cpp`.
-   The AVX2 variant is textually parallel to `dot_avx2` but was authored on an
-   arm64 host; it needs one x86 CI run of `test_simd_parity` before being
-   relied on.
+   reassociation. Parity asserted bit-exactly in `tests/test_simd_parity.cpp`,
+   validated on x86 (Zen 2, Debian 13) under both gcc and clang in addition to
+   the arm64 development host.
 3. **Adjacency loop**: per-row temp vector hoisted out of the loop and the
    upper-triangle row for j > i read contiguously instead of through the
    per-element triangular index; iteration order unchanged, outputs
@@ -140,6 +139,12 @@ A second pass extended the same bit-identity discipline:
    that shift. Removing the float→double convert chain was worth 3.7× on the
    bucket pass.
 
+Bit-identity is a per-architecture guarantee: `dot_neon` and `dot_avx2` use
+different accumulator widths by design, so cross-architecture similarity values
+(and hence `phss_scale_mean`, e.g. 0.538512 arm64 vs 0.538508 Zen 2 on the
+SciFact profile corpus) differ at the 1e-5 level. This predates the engineering
+pass; determinism holds within an architecture.
+
 Effect (`simeon_profile_fragment_geometry`, richcov, 50 queries × 5 iters,
 Apple Silicon; per-phase tables in benchmarks.md): approx-mode rerank mean
 8729 → 1896 µs/query on SciFact and 8533 → 1823 µs on NFCorpus (~4.6×
@@ -151,6 +156,28 @@ unaffected. The remaining approx-mode profile is pairwise dot products (~52%,
 near the NEON FMA roofline for this layout), adjacency (~17%, dominated by the
 kNN-path queries), BM25 pool scoring (~14%), and scale selection (~12%, one
 streaming bucket pass).
+
+### graph_prefix_dim: prefix-dim graph similarities (neutral, not promoted)
+
+`FragmentGeometryConfig::graph_prefix_dim` computes the fragment-graph pairwise
+cosines (PHSS selection + adjacency) on a renormalized prefix of the whitened
+fragment dims, hoping to trade graph fidelity for the dominant pairwise cost.
+The PMI-SVD energy-concentration argument does not survive whitening: whitening
+equalizes per-dim variance, so a 64-of-128 prefix carries ~half the norm and
+prefix cosines have a markedly different distribution. PHSS adapts by selecting
+a much lower scale (SciFact profile corpus: 0.539 → 0.104 at gpfx=64), the
+graph densifies ~2× and adjacency + diffusion costs grow, eating most of the
+2× pairwise saving (total 1897 → 1750 µs at gpfx=64; gpfx=96 is *slower* than
+baseline at 2062 µs).
+
+Quality on regenerated MiniLM fixtures (test split, richcov + LargestGapApprox,
+nDCG@10): SciFact baseline 0.6657 vs gpfx96/64/48 = 0.6644/0.6647/0.6652;
+NFCorpus baseline 0.3028 vs 0.3022/0.3031/0.3037 — deltas within the ±0.005
+noise band on both corpora, so neutral rather than harmful. Verdict:
+no quality cost but no meaningful speed win either; the knob stays default-off
+(0 = full dim) as a research config. Any future prefix-similarity attempt
+should operate on pre-whitening PMI coordinates, where the SVD ordering
+actually concentrates energy.
 
 ## Components gated behind `enable_research`
 

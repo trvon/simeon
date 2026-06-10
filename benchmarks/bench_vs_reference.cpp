@@ -5195,6 +5195,26 @@ void run_bm25_fragment_graph_grid(const Fixture& fx, bool xprod_only = false,
                                 .use_phss = true,
                                 .phss_config = simeon::PhssConfig{
                                     .criterion = simeon::PhssConfig::Criterion::LargestGapApprox}});
+        // graph_prefix_dim sweep: pairwise graph similarities on a renormalized
+        // PMI prefix (quality gate for the latency knob; see docs/research.md).
+        for (std::uint32_t gpfx : {96u, 64u, 48u}) {
+            const std::string gpfx_name =
+                "bm25_fragment_geom_phssapprox_k100_t8_richcov_gap_gpfx" + std::to_string(gpfx);
+            run_bm25_fragment_geometry(
+                gpfx_name.c_str(), fx, idx.idx, rich_cov_total_build_us, enc, rich_cov_doc_frags,
+                GeometryGraphConfig{
+                    .pool_size = 100,
+                    .alpha = 0.8f,
+                    .top_fragments_per_doc = 8,
+                    .attention_scale = 8.0f,
+                    .knn = 8,
+                    .steps = 2,
+                    .use_phss = true,
+                    .phss_config =
+                        simeon::PhssConfig{.criterion =
+                                               simeon::PhssConfig::Criterion::LargestGapApprox},
+                    .graph_prefix_dim = gpfx});
+        }
         // Per-corpus α sweep — Bruch & Gai 2023 fusion analysis. Convex blend
         // α tuned on dev fold, validated on test fold. Sweep on production
         // frontier (richcov + Sum + LargestGapApprox).

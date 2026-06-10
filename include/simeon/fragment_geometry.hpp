@@ -122,6 +122,15 @@ struct FragmentGeometryConfig {
     // floats; doc_dense_vecs->size() must equal the corpus doc count.
     std::uint32_t dense_pool_size = 0;
     const std::vector<std::vector<float>>* doc_dense_vecs = nullptr;
+
+    // Prefix dimensionality for the fragment-graph pairwise similarities
+    // (PHSS scale selection + adjacency edges). 0 = full encoder dim
+    // (default). When set, pairwise cosines use the leading dims of the
+    // whitened fragments, renormalized to unit length; PMI rows come from a
+    // truncated SVD so leading dims carry most of the energy (matryoshka
+    // principle). Query attention always uses full dim. Quality-gate per
+    // corpus before enabling (see docs/research.md).
+    std::uint32_t graph_prefix_dim = 0;
 };
 
 struct FragmentGeometryProfile {
