@@ -99,13 +99,13 @@ Throughput benchmark for the TextRank sentence ranker on synthetic documents.
 (`phss_scale_mean`, `graph_edges_mean`) identical before/after on every
 fixture × mode; see research.md for mechanism.
 
-| Phase | SciFact before | SciFact after | NFCorpus before | NFCorpus after |
-|---|---|---|---|---|
-| query_total_mean_us | 8729.3 | 3321.1 | 8533.5 | 3273.0 |
-| phss_select_mean_us | 5567.8 | 925.8 | 5474.3 | 918.6 |
-| phss_select_edge_sort_mean_us | 5170.8 | 764.0 | 5090.7 | 758.0 |
-| phss_pairwise_mean_us | 2016.4 | 1538.2 | 1989.0 | 1521.8 |
-| adjacency_mean_us | 737.3 | 502.2 | 718.4 | 544.3 |
+| Phase | SciFact before | pass 1 | pass 2 | NFCorpus before | pass 1 | pass 2 |
+|---|---|---|---|---|---|---|
+| query_total_mean_us | 8729.3 | 3321.1 | 1896.2 | 8533.5 | 3273.0 | 1822.8 |
+| phss_select_mean_us | 5567.8 | 925.8 | 221.6 | 5474.3 | 918.6 | 218.8 |
+| phss_select_edge_sort_mean_us | 5170.8 | 764.0 | 207.2 | 5090.7 | 758.0 | 204.4 |
+| phss_pairwise_mean_us | 2016.4 | 1538.2 | 991.6 | 1989.0 | 1521.8 | 983.1 |
+| adjacency_mean_us | 737.3 | 502.2 | 323.9 | 718.4 | 544.3 | 355.9 |
 
 ## Research outcomes
 

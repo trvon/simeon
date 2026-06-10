@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -376,6 +377,80 @@ void test_dot4_dimensions() {
     }
 }
 
+// dot2x4 contract: bit-identical to eight independent dot() calls.
+void test_dot2x4_bit_equal_dim(std::uint32_t n) {
+    auto a0 = make_random(n, 0x24AAAA00u ^ n);
+    auto a1 = make_random(n, 0x24AAAA01u ^ n);
+    auto b0 = make_random(n, 0x24BBBB00u ^ n);
+    auto b1 = make_random(n, 0x24BBBB01u ^ n);
+    auto b2 = make_random(n, 0x24BBBB02u ^ n);
+    auto b3 = make_random(n, 0x24BBBB03u ^ n);
+
+    float out0[4], out1[4];
+    simeon::simd::dot2x4(a0.data(), a1.data(), b0.data(), b1.data(), b2.data(), b3.data(), out0,
+                         out1, n);
+    const float* bs[4] = {b0.data(), b1.data(), b2.data(), b3.data()};
+    for (int k = 0; k < 4; ++k) {
+        assert(out0[k] == simeon::simd::dot(a0.data(), bs[k], n));
+        assert(out1[k] == simeon::simd::dot(a1.data(), bs[k], n));
+    }
+}
+
+void test_dot2x4_dimensions() {
+    for (std::uint32_t n :
+         {1u, 2u, 3u, 4u, 7u, 8u, 9u, 15u, 16u, 17u, 33u, 127u, 128u, 257u, 384u, 768u}) {
+        test_dot2x4_bit_equal_dim(n);
+    }
+}
+
+// scan_ge contract: index list on the active tier equals the scalar scan
+// exactly (same >= predicate, ascending order).
+void test_scan_ge_parity() {
+    std::mt19937 rng(0x5CA40000u);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (std::uint32_t n : {0u, 1u, 3u, 4u, 5u, 8u, 17u, 63u, 64u, 257u, 4096u}) {
+        std::vector<float> v(n);
+        for (auto& x : v)
+            x = dist(rng);
+        // Mix in exact-threshold values to pin >= semantics.
+        for (std::uint32_t i = 0; i + 7 < n; i += 7)
+            v[i] = 0.25f;
+        for (float threshold : {-2.0f, -0.5f, 0.25f, 0.5f, 2.0f}) {
+            std::vector<std::uint32_t> ref(n + 1), got(n + 1);
+            const auto nref = simeon::simd::scan_ge_scalar(v.data(), n, threshold, ref.data());
+            const auto ngot = simeon::simd::scan_ge(v.data(), n, threshold, got.data());
+            assert(nref == ngot);
+            for (std::uint32_t k = 0; k < nref; ++k)
+                assert(ref[k] == got[k]);
+        }
+    }
+}
+
+// range contract: min/max equal the sequential scan exactly (associativity;
+// NaN-free inputs).
+void test_range_parity() {
+    std::mt19937 rng(0x4A4E4745u);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (std::uint32_t n : {1u, 2u, 3u, 4u, 7u, 8u, 9u, 16u, 17u, 255u, 4096u}) {
+        std::vector<float> v(n);
+        for (auto& x : v)
+            x = dist(rng);
+        float seq_min = v[0], seq_max = v[0];
+        for (float x : v) {
+            seq_min = std::min(seq_min, x);
+            seq_max = std::max(seq_max, x);
+        }
+        float got_min = 0.0f, got_max = 0.0f;
+        simeon::simd::range(v.data(), n, &got_min, &got_max);
+        assert(got_min == seq_min);
+        assert(got_max == seq_max);
+        float sc_min = 0.0f, sc_max = 0.0f;
+        simeon::simd::range_scalar(v.data(), n, &sc_min, &sc_max);
+        assert(sc_min == seq_min);
+        assert(sc_max == seq_max);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -392,5 +467,8 @@ int main() {
     test_active_tier_matches_host();
     test_dot_dispatch_matches_public_tier();
     test_dot4_dimensions();
+    test_dot2x4_dimensions();
+    test_scan_ge_parity();
+    test_range_parity();
     return 0;
 }

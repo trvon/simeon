@@ -117,6 +117,20 @@ struct PhssResult {
 PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t n,
                              const PhssConfig& cfg);
 
+// Precomputed summary of `similarities` (unfiltered): element count and value
+// range. Producers that already stream the values (e.g. the pairwise loop)
+// can supply this to skip the LargestGapApprox gather pass. Only consulted
+// when cfg.threshold <= 0; min/max are order-independent, so values are
+// identical to the internally computed ones.
+struct PhssStats {
+    std::uint32_t count = 0;
+    float vmin = 0.0f;
+    float vmax = 0.0f;
+};
+
+PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t n,
+                             const PhssConfig& cfg, const PhssStats* precomputed);
+
 namespace detail {
 
 // Reference O(m log m) LargestGapApprox: threshold-filter + full sort + largest

@@ -122,6 +122,11 @@ PhssResult phss_largest_gap_sorted(std::span<const float> similarities, float th
 
 PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t n,
                              const PhssConfig& cfg) {
+    return phss_select_scale(similarities, n, cfg, nullptr);
+}
+
+PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t n,
+                             const PhssConfig& cfg, const PhssStats* precomputed) {
     PhssResult result;
     if (n == 0)
         return result;
@@ -142,12 +147,20 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
         std::uint32_t m = 0;
         float vmin = std::numeric_limits<float>::infinity();
         float vmax = -std::numeric_limits<float>::infinity();
-        for (float s : similarities) {
-            if (use_threshold && s < cfg.threshold)
-                continue;
-            ++m;
-            vmin = std::min(vmin, s);
-            vmax = std::max(vmax, s);
+        if (precomputed != nullptr && !use_threshold) {
+            m = precomputed->count;
+            if (m > 0) {
+                vmin = precomputed->vmin;
+                vmax = precomputed->vmax;
+            }
+        } else {
+            for (float s : similarities) {
+                if (use_threshold && s < cfg.threshold)
+                    continue;
+                ++m;
+                vmin = std::min(vmin, s);
+                vmax = std::max(vmax, s);
+            }
         }
         result.n_edges = m;
         const auto t_gather1 = Clock::now();
@@ -178,18 +191,27 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
         std::vector<float> bmin(nb, std::numeric_limits<float>::infinity());
         std::vector<float> bmax(nb, -std::numeric_limits<float>::infinity());
         const double span = static_cast<double>(vmax) - static_cast<double>(vmin);
-        const double idx_scale = static_cast<double>(nb) / span;
-        for (float s : similarities) {
-            if (use_threshold && s < cfg.threshold)
-                continue;
-            std::size_t idx = static_cast<std::size_t>(
-                (static_cast<double>(s) - static_cast<double>(vmin)) * idx_scale);
+        // Index math in float: (s - vmin) is exact-signed >= +0 and monotone,
+        // scaling by a positive constant and truncating preserve weak
+        // monotonicity, so this is a valid bucketing. Float rounding can shift
+        // bucket boundaries by a few ulps of nb (< 1% of a bucket width); the
+        // fallback margin below absorbs that.
+        const float idx_scale = static_cast<float>(static_cast<double>(nb) / span);
+        const auto bucket_update = [&](float s) {
+            std::uint32_t idx = static_cast<std::uint32_t>((s - vmin) * idx_scale);
             if (idx >= nb)
                 idx = nb - 1;
-            if (s < bmin[idx])
-                bmin[idx] = s;
-            if (s > bmax[idx])
-                bmax[idx] = s;
+            bmin[idx] = std::min(bmin[idx], s);
+            bmax[idx] = std::max(bmax[idx], s);
+        };
+        if (use_threshold) {
+            for (float s : similarities) {
+                if (s >= cfg.threshold)
+                    bucket_update(s);
+            }
+        } else {
+            for (float s : similarities)
+                bucket_update(s);
         }
         const auto t_sort1 = Clock::now();
         result.edge_sort_us = elapsed_us(t_sort0, t_sort1);
@@ -216,8 +238,11 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
             have_prev = true;
         }
 
-        const double mean_spacing = span / static_cast<double>(nb);
-        if (best_gap < 0.0f || static_cast<double>(best_gap) <= mean_spacing) {
+        // Margin 1/64 over the bucket width covers the float-index boundary
+        // shift (a few ulps of nb, < 1% of a width); anything closer to the
+        // degenerate regime defers to the bit-exact sorted reference.
+        const double fallback_width = (span / static_cast<double>(nb)) * (1.0 + 1.0 / 64.0);
+        if (best_gap < 0.0f || static_cast<double>(best_gap) <= fallback_width) {
             // Degenerate/tie regime — defer to the bit-exact sorted reference.
             const auto fb = detail::phss_largest_gap_sorted(similarities, cfg.threshold);
             result.selected_scale = fb.selected_scale;

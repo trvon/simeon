@@ -28,6 +28,14 @@ struct EuclideanCosineManifold {
         simd::dot4(a, b0, b1, b2, b3, out4, dim);
     }
 
+    // 2x4 blocked similarity: two query rows against four candidate rows.
+    // Bit-identical to eight similarity() calls.
+    static inline void similarity2x4(const float* a0, const float* a1, const float* b0,
+                                     const float* b1, const float* b2, const float* b3, float* out0,
+                                     float* out1, std::uint32_t dim) noexcept {
+        simd::dot2x4(a0, a1, b0, b1, b2, b3, out0, out1, dim);
+    }
+
     // Bounded similarity-derived distance. Range [0, 2] for unit-norm vectors.
     static inline float distance(const float* a, const float* b, std::uint32_t dim) noexcept {
         return 1.0f - similarity(a, b, dim);

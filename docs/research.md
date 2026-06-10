@@ -109,14 +109,48 @@ adjacent gap. Profiling on extracted SciFact/NFCorpus corpora put that sort at
    per-element triangular index; iteration order unchanged, outputs
    bit-identical.
 
+A second pass extended the same bit-identity discipline:
+
+4. **Sparse adjacency via `simd::scan_ge`** (`simd.hpp`, `src/arch/*`).
+   Survivor density above the PHSS scale is typically <1%, so the PHSS-graph
+   build extracts surviving pairs with a SIMD `>=` index scan over the
+   contiguous triangle rows and does the softmax bookkeeping on the sparse
+   edge list. A row-major edge stream delivers each row's partners in the
+   same ascending order the per-row scan used, so `row_sum` accumulation and
+   the normalized weights are bit-identical; `row_max` is an order-independent
+   float max. The kNN (non-PHSS) graph path is untouched —
+   `std::partial_sort`'s tie behavior is implementation-defined and can't be
+   replicated provably.
+5. **PHSS range stats fused into the pairwise loop** (`PhssStats`,
+   `persistent_homology.hpp`). The pairwise loop computes count/min/max via
+   `simd::range` while each row is cache-hot (min/max are associative, so
+   lane-parallel reduction returns identical values) and hands them to
+   `phss_select_scale`, eliminating the select gather pass when no edge
+   threshold is set.
+6. **2x4 blocked pairwise kernel `dot2x4`** (NEON; AVX2 dispatches to two
+   `dot4` calls — 16 ymm registers can't hold 16 accumulators without
+   spills). Sharing each b-row load across two a-rows cuts load traffic ~40%
+   versus `dot4`; every output keeps `dot`'s accumulator structure, so results
+   stay bit-identical. 1.55× measured on the pairwise phase.
+7. **Float-index bucketing** in the max-gap pass. (s − vmin) is exact and
+   monotone in float; scaling by a positive constant and truncating preserve
+   weak monotonicity, so float index math is a valid bucketing — it only
+   shifts bin boundaries by a few ulps of nb (<1% of a bin width). The
+   degenerate fallback margin is widened to bin width × (1 + 1/64) to absorb
+   that shift. Removing the float→double convert chain was worth 3.7× on the
+   bucket pass.
+
 Effect (`simeon_profile_fragment_geometry`, richcov, 50 queries × 5 iters,
 Apple Silicon; per-phase tables in benchmarks.md): approx-mode rerank mean
-8729 → 3321 µs/query on SciFact and 8533 → 3273 µs on NFCorpus (~2.6×);
-`phss_select` itself 5568 → 926 µs (6.0×). `phss_scale_mean` and
-`graph_edges_mean` are unchanged to all printed digits on every fixture × mode,
-and the exact `LargestGap` path is untouched (timings within noise), so nDCG is
-provably unaffected. The remaining approx-mode profile is pairwise dot products
-(~46%), scale selection (~28%, two streaming passes), and adjacency (~15%).
+8729 → 1896 µs/query on SciFact and 8533 → 1823 µs on NFCorpus (~4.6×
+cumulative); `phss_select` itself 5568 → 222 µs (25×), pairwise 2016 → 992 µs,
+adjacency 737 → 324 µs. `phss_scale_mean` and `graph_edges_mean` are unchanged
+to all printed digits on every fixture × mode, and the exact `LargestGap`
+select path is untouched (timings within noise), so nDCG is provably
+unaffected. The remaining approx-mode profile is pairwise dot products (~52%,
+near the NEON FMA roofline for this layout), adjacency (~17%, dominated by the
+kNN-path queries), BM25 pool scoring (~14%), and scale selection (~12%, one
+streaming bucket pass).
 
 ## Components gated behind `enable_research`
 

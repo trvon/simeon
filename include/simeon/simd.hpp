@@ -48,6 +48,50 @@ void dot4_avx2(const float* a, const float* b0, const float* b1, const float* b2
                float* out4, std::uint32_t n) noexcept;
 #endif
 
+// 2x4 blocked inner product: rows a0, a1 against rows b0..b3, writing
+// out0[0..3] (a0·b) and out1[0..3] (a1·b). Same bit-identical-to-dot contract
+// as dot4; reusing the b loads across both a rows roughly halves load traffic
+// in pairwise loops. AVX2 dispatches to two dot4 calls (register budget).
+void dot2x4_scalar(const float* a0, const float* a1, const float* b0, const float* b1,
+                   const float* b2, const float* b3, float* out0, float* out1,
+                   std::uint32_t n) noexcept;
+
+#if defined(SIMEON_HAS_NEON)
+void dot2x4_neon(const float* a0, const float* a1, const float* b0, const float* b1,
+                 const float* b2, const float* b3, float* out0, float* out1,
+                 std::uint32_t n) noexcept;
+#endif
+
+// Min/max over v[0..n). min/max are associative and commutative, so the
+// lane-parallel reduction returns the same values as a sequential scan
+// (NaN-free inputs assumed, as elsewhere). No-op when n == 0.
+void range_scalar(const float* v, std::uint32_t n, float* out_min, float* out_max) noexcept;
+
+#if defined(SIMEON_HAS_NEON)
+void range_neon(const float* v, std::uint32_t n, float* out_min, float* out_max) noexcept;
+#endif
+
+#if defined(SIMEON_HAS_AVX2)
+void range_avx2(const float* v, std::uint32_t n, float* out_min, float* out_max) noexcept;
+#endif
+
+// Sparse threshold scan: write the indices of every v[i] >= threshold into
+// out (caller provides capacity n) and return the count. Selection matches the
+// scalar `>=` exactly on every tier; used by sparse graph construction where
+// survivor density is low.
+std::uint32_t scan_ge_scalar(const float* v, std::uint32_t n, float threshold,
+                             std::uint32_t* out) noexcept;
+
+#if defined(SIMEON_HAS_NEON)
+std::uint32_t scan_ge_neon(const float* v, std::uint32_t n, float threshold,
+                           std::uint32_t* out) noexcept;
+#endif
+
+#if defined(SIMEON_HAS_AVX2)
+std::uint32_t scan_ge_avx2(const float* v, std::uint32_t n, float threshold,
+                           std::uint32_t* out) noexcept;
+#endif
+
 // dst[i] += src[i]. Used on the PMI-sum encode path (once per in-vocab token
 // per doc) and as an accumulate building block elsewhere.
 void add_vec_scalar(float* dst, const float* src, std::uint32_t n) noexcept;
@@ -133,6 +177,66 @@ inline void dot4(const float* a, const float* b0, const float* b1, const float* 
         default:
             dot4_scalar(a, b0, b1, b2, b3, out4, n);
             return;
+    }
+}
+
+inline void dot2x4(const float* a0, const float* a1, const float* b0, const float* b1,
+                   const float* b2, const float* b3, float* out0, float* out1,
+                   std::uint32_t n) noexcept {
+    SimdTier tier = active_simd_tier();
+    switch (tier) {
+#if defined(SIMEON_HAS_NEON)
+        case SimdTier::Neon:
+            dot2x4_neon(a0, a1, b0, b1, b2, b3, out0, out1, n);
+            return;
+#endif
+#if defined(SIMEON_HAS_AVX2)
+        case SimdTier::Avx2:
+            // 16 ymm registers can't hold the 16 accumulators a true 2x4 tile
+            // needs; two dot4 passes are bit-identical and spill-free.
+            dot4_avx2(a0, b0, b1, b2, b3, out0, n);
+            dot4_avx2(a1, b0, b1, b2, b3, out1, n);
+            return;
+#endif
+        default:
+            dot2x4_scalar(a0, a1, b0, b1, b2, b3, out0, out1, n);
+            return;
+    }
+}
+
+inline void range(const float* v, std::uint32_t n, float* out_min, float* out_max) noexcept {
+    SimdTier tier = active_simd_tier();
+    switch (tier) {
+#if defined(SIMEON_HAS_NEON)
+        case SimdTier::Neon:
+            range_neon(v, n, out_min, out_max);
+            return;
+#endif
+#if defined(SIMEON_HAS_AVX2)
+        case SimdTier::Avx2:
+            range_avx2(v, n, out_min, out_max);
+            return;
+#endif
+        default:
+            range_scalar(v, n, out_min, out_max);
+            return;
+    }
+}
+
+inline std::uint32_t scan_ge(const float* v, std::uint32_t n, float threshold,
+                             std::uint32_t* out) noexcept {
+    SimdTier tier = active_simd_tier();
+    switch (tier) {
+#if defined(SIMEON_HAS_NEON)
+        case SimdTier::Neon:
+            return scan_ge_neon(v, n, threshold, out);
+#endif
+#if defined(SIMEON_HAS_AVX2)
+        case SimdTier::Avx2:
+            return scan_ge_avx2(v, n, threshold, out);
+#endif
+        default:
+            return scan_ge_scalar(v, n, threshold, out);
     }
 }
 

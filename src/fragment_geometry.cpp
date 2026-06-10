@@ -97,6 +97,19 @@ inline void dot4(const float* a, const float* b0, const float* b1, const float* 
     }
 }
 
+inline void dot2x4(const float* a0, const float* a1, const float* b0, const float* b1,
+                   const float* b2, const float* b3, float* out0, float* out1, std::size_t n) {
+    const auto dim = static_cast<std::uint32_t>(n);
+    if constexpr (requires {
+                      ActiveManifold::similarity2x4(a0, a1, b0, b1, b2, b3, out0, out1, dim);
+                  }) {
+        ActiveManifold::similarity2x4(a0, a1, b0, b1, b2, b3, out0, out1, dim);
+    } else {
+        dot4(a0, b0, b1, b2, b3, out0, n);
+        dot4(a1, b0, b1, b2, b3, out1, n);
+    }
+}
+
 // BF16 (bfloat16) compression helpers.
 // Truncates the lower 16 bits of a float32 mantissa; preserves exponent exactly.
 inline std::uint16_t float_to_bf16(float f) noexcept {
@@ -1159,17 +1172,45 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     const std::uint32_t tri_count = nf * (nf - 1) / 2;
     const auto t_pair0 = profile ? Clock::now() : Clock::time_point{};
     std::vector<float> sims_tri(tri_count);
-    for (std::uint32_t i = 0; i < nf; ++i) {
-        const float* vi = fvecs.data() + i * dim;
-        float* row = sims_tri.data() + static_cast<std::size_t>(i) * (2 * nf - i - 1) / 2;
-        std::uint32_t j = i + 1;
+    PhssStats sims_stats;
+    sims_stats.count = tri_count;
+    float sims_min = std::numeric_limits<float>::infinity();
+    float sims_max = -std::numeric_limits<float>::infinity();
+    // Rows are processed in pairs so the 2x4 kernel can share each b-row load
+    // across both a-rows; every entry is still an independent dot, bit-identical
+    // to the row-at-a-time form. Range stats for PHSS scale selection are taken
+    // while rows are cache-hot; min/max are order-independent so the values
+    // match a post-hoc scan exactly.
+    const auto fold_range = [&](const float* row, std::uint32_t len) {
+        if (len == 0)
+            return;
+        float row_min = sims_min, row_max = sims_max;
+        simd::range(row, len, &row_min, &row_max);
+        sims_min = std::min(sims_min, row_min);
+        sims_max = std::max(sims_max, row_max);
+    };
+    for (std::uint32_t i = 0; i + 2 <= nf; i += 2) {
+        const float* vi0 = fvecs.data() + i * dim;
+        const float* vi1 = fvecs.data() + (i + 1) * dim;
+        float* row0 = sims_tri.data() + static_cast<std::size_t>(i) * (2 * nf - i - 1) / 2;
+        float* row1 = sims_tri.data() + static_cast<std::size_t>(i + 1) * (2 * nf - i - 2) / 2;
+        row0[0] = dot(vi0, vi1, dim);
+        std::uint32_t j = i + 2;
         for (; j + 4 <= nf; j += 4) {
             const float* vj = fvecs.data() + j * dim;
-            dot4(vi, vj, vj + dim, vj + 2 * dim, vj + 3 * dim, row + (j - i - 1), dim);
+            dot2x4(vi0, vi1, vj, vj + dim, vj + 2 * dim, vj + 3 * dim, row0 + (j - i - 1),
+                   row1 + (j - i - 2), dim);
         }
-        for (; j < nf; ++j)
-            row[j - i - 1] = dot(vi, fvecs.data() + j * dim, dim);
+        for (; j < nf; ++j) {
+            const float* vj = fvecs.data() + j * dim;
+            row0[j - i - 1] = dot(vi0, vj, dim);
+            row1[j - i - 2] = dot(vi1, vj, dim);
+        }
+        fold_range(row0, nf - i - 1);
+        fold_range(row1, nf - i - 2);
     }
+    sims_stats.vmin = sims_min;
+    sims_stats.vmax = sims_max;
     const auto t_pair1 = profile ? Clock::now() : Clock::time_point{};
     if (profile)
         profile->phss_pairwise_us = elapsed_us(t_pair0, t_pair1);
@@ -1195,7 +1236,7 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
             PhssConfig phss_cfg = cfg.phss_config;
             phss_cfg.dim_max = 0;
             const auto t_sel0 = profile ? Clock::now() : Clock::time_point{};
-            auto phss_result = phss_select_scale(sims_tri, nf, phss_cfg);
+            auto phss_result = phss_select_scale(sims_tri, nf, phss_cfg, &sims_stats);
             const auto t_sel1 = profile ? Clock::now() : Clock::time_point{};
             if (profile) {
                 profile->phss_select_us = elapsed_us(t_sel0, t_sel1);
@@ -1245,44 +1286,69 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     std::vector<float> ns(frags.size(), 0.0f);
     std::uint64_t graph_edges = 0;
 
-    std::vector<std::pair<float, std::uint32_t>> sims;
-    sims.reserve(frags.size() > 0 ? frags.size() - 1 : 0);
-    for (std::size_t i = 0; i < frags.size(); ++i) {
-        sims.clear();
-        for (std::size_t j = 0; j < i; ++j) {
-            const float sim = sim_at(static_cast<std::uint32_t>(i), static_cast<std::uint32_t>(j));
-            if (!use_phss_for_graph || sim >= phss_selected_scale)
-                sims.emplace_back(sim, static_cast<std::uint32_t>(j));
-        }
-        // Row i of the upper triangle is contiguous: entries (i, j) for j > i
-        // start at offset i*(2*nf - i - 1)/2.
-        const float* row =
-            sims_tri.data() + static_cast<std::size_t>(i) * (2 * frags.size() - i - 1) / 2;
-        for (std::size_t j = i + 1; j < frags.size(); ++j) {
-            const float sim = row[j - i - 1];
-            if (!use_phss_for_graph || sim >= phss_selected_scale)
-                sims.emplace_back(sim, static_cast<std::uint32_t>(j));
+    if (use_phss_for_graph) {
+        // Survivor density above the PHSS scale is typically <1%, so extract
+        // surviving pairs once with a SIMD threshold scan over the contiguous
+        // triangle rows, then do the softmax bookkeeping on the sparse edge
+        // list. In a row-major scan, row r receives partners in ascending index
+        // order — the same order the per-row scan used — so row_sum
+        // accumulation and the normalized weights are bit-identical; row_max
+        // is a float max, order-independent.
+        struct SurvivorEdge {
+            std::uint32_t i, j;
+            float sim;
+        };
+        std::vector<SurvivorEdge> survivors;
+        std::vector<std::uint32_t> hits(frags.size());
+        const std::uint32_t nfr = static_cast<std::uint32_t>(frags.size());
+        for (std::uint32_t i = 0; i < nfr; ++i) {
+            const float* row =
+                sims_tri.data() + static_cast<std::size_t>(i) * (2 * nfr - i - 1) / 2;
+            const std::uint32_t len = nfr - i - 1;
+            const std::uint32_t cnt = simd::scan_ge(row, len, phss_selected_scale, hits.data());
+            for (std::uint32_t k = 0; k < cnt; ++k)
+                survivors.push_back({i, i + 1 + hits[k], row[hits[k]]});
         }
 
-        if (use_phss_for_graph) {
-            if (sims.empty())
-                continue;
-            float row_max = -std::numeric_limits<float>::infinity();
-            for (const auto& [sim, _] : sims)
-                row_max = std::max(row_max, query_scale * sim);
-            float row_sum = 0.0f;
-            adj[i].reserve(sims.size());
-            for (const auto& [sim, j] : sims) {
-                const float w = std::exp(query_scale * sim - row_max);
-                adj[i].push_back({j, w});
-                row_sum += w;
-            }
-            if (row_sum > 0.0f) {
+        std::vector<float> row_maxes(frags.size(), -std::numeric_limits<float>::infinity());
+        std::vector<float> row_sums(frags.size(), 0.0f);
+        for (const auto& e : survivors) {
+            const float qsim_ij = query_scale * e.sim;
+            row_maxes[e.i] = std::max(row_maxes[e.i], qsim_ij);
+            row_maxes[e.j] = std::max(row_maxes[e.j], qsim_ij);
+        }
+        for (const auto& e : survivors) {
+            const float wi = std::exp(query_scale * e.sim - row_maxes[e.i]);
+            adj[e.i].push_back({e.j, wi});
+            row_sums[e.i] += wi;
+            const float wj = std::exp(query_scale * e.sim - row_maxes[e.j]);
+            adj[e.j].push_back({e.i, wj});
+            row_sums[e.j] += wj;
+        }
+        for (std::size_t i = 0; i < frags.size(); ++i) {
+            if (row_sums[i] > 0.0f) {
                 for (auto& [j, w] : adj[i])
-                    w /= row_sum;
+                    w /= row_sums[i];
             }
             graph_edges += adj[i].size();
-        } else {
+        }
+    } else {
+        std::vector<std::pair<float, std::uint32_t>> sims;
+        sims.reserve(frags.size() > 0 ? frags.size() - 1 : 0);
+        for (std::size_t i = 0; i < frags.size(); ++i) {
+            sims.clear();
+            for (std::size_t j = 0; j < i; ++j) {
+                const float sim =
+                    sim_at(static_cast<std::uint32_t>(i), static_cast<std::uint32_t>(j));
+                sims.emplace_back(sim, static_cast<std::uint32_t>(j));
+            }
+            // Row i of the upper triangle is contiguous: entries (i, j) for j > i
+            // start at offset i*(2*nf - i - 1)/2.
+            const float* row =
+                sims_tri.data() + static_cast<std::size_t>(i) * (2 * frags.size() - i - 1) / 2;
+            for (std::size_t j = i + 1; j < frags.size(); ++j)
+                sims.emplace_back(row[j - i - 1], static_cast<std::uint32_t>(j));
+
             std::partial_sort(
                 sims.begin(), sims.begin() + std::min<std::size_t>(query_knn, sims.size()),
                 sims.end(), [](const auto& a, const auto& b) { return a.first > b.first; });

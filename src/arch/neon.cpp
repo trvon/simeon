@@ -3,6 +3,7 @@
 #if defined(__aarch64__)
 
 #include <arm_neon.h>
+#include <algorithm>
 #include <cmath>
 
 namespace simeon::simd {
@@ -88,6 +89,138 @@ void dot4_neon(const float* a, const float* b0, const float* b1, const float* b2
     out4[1] = s1;
     out4[2] = s2;
     out4[3] = s3;
+}
+
+void dot2x4_neon(const float* a0, const float* a1, const float* b0, const float* b1,
+                 const float* b2, const float* b3, float* out0, float* out1,
+                 std::uint32_t n) noexcept {
+    // 16 accumulators (2 per output, mirroring dot_neon) + 4 a-row registers;
+    // each b load is shared by both a rows. Every output is bit-identical to
+    // an independent dot_neon call.
+    float32x4_t c000 = vdupq_n_f32(0.0f), c001 = vdupq_n_f32(0.0f);
+    float32x4_t c010 = vdupq_n_f32(0.0f), c011 = vdupq_n_f32(0.0f);
+    float32x4_t c020 = vdupq_n_f32(0.0f), c021 = vdupq_n_f32(0.0f);
+    float32x4_t c030 = vdupq_n_f32(0.0f), c031 = vdupq_n_f32(0.0f);
+    float32x4_t c100 = vdupq_n_f32(0.0f), c101 = vdupq_n_f32(0.0f);
+    float32x4_t c110 = vdupq_n_f32(0.0f), c111 = vdupq_n_f32(0.0f);
+    float32x4_t c120 = vdupq_n_f32(0.0f), c121 = vdupq_n_f32(0.0f);
+    float32x4_t c130 = vdupq_n_f32(0.0f), c131 = vdupq_n_f32(0.0f);
+    std::uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const float32x4_t x00 = vld1q_f32(a0 + i);
+        const float32x4_t x01 = vld1q_f32(a0 + i + 4);
+        const float32x4_t x10 = vld1q_f32(a1 + i);
+        const float32x4_t x11 = vld1q_f32(a1 + i + 4);
+        float32x4_t y0 = vld1q_f32(b0 + i);
+        float32x4_t y1 = vld1q_f32(b0 + i + 4);
+        c000 = vfmaq_f32(c000, x00, y0);
+        c001 = vfmaq_f32(c001, x01, y1);
+        c100 = vfmaq_f32(c100, x10, y0);
+        c101 = vfmaq_f32(c101, x11, y1);
+        y0 = vld1q_f32(b1 + i);
+        y1 = vld1q_f32(b1 + i + 4);
+        c010 = vfmaq_f32(c010, x00, y0);
+        c011 = vfmaq_f32(c011, x01, y1);
+        c110 = vfmaq_f32(c110, x10, y0);
+        c111 = vfmaq_f32(c111, x11, y1);
+        y0 = vld1q_f32(b2 + i);
+        y1 = vld1q_f32(b2 + i + 4);
+        c020 = vfmaq_f32(c020, x00, y0);
+        c021 = vfmaq_f32(c021, x01, y1);
+        c120 = vfmaq_f32(c120, x10, y0);
+        c121 = vfmaq_f32(c121, x11, y1);
+        y0 = vld1q_f32(b3 + i);
+        y1 = vld1q_f32(b3 + i + 4);
+        c030 = vfmaq_f32(c030, x00, y0);
+        c031 = vfmaq_f32(c031, x01, y1);
+        c130 = vfmaq_f32(c130, x10, y0);
+        c131 = vfmaq_f32(c131, x11, y1);
+    }
+    float s00 = vaddvq_f32(vaddq_f32(c000, c001));
+    float s01 = vaddvq_f32(vaddq_f32(c010, c011));
+    float s02 = vaddvq_f32(vaddq_f32(c020, c021));
+    float s03 = vaddvq_f32(vaddq_f32(c030, c031));
+    float s10 = vaddvq_f32(vaddq_f32(c100, c101));
+    float s11 = vaddvq_f32(vaddq_f32(c110, c111));
+    float s12 = vaddvq_f32(vaddq_f32(c120, c121));
+    float s13 = vaddvq_f32(vaddq_f32(c130, c131));
+    for (; i < n; ++i) {
+        s00 += a0[i] * b0[i];
+        s01 += a0[i] * b1[i];
+        s02 += a0[i] * b2[i];
+        s03 += a0[i] * b3[i];
+        s10 += a1[i] * b0[i];
+        s11 += a1[i] * b1[i];
+        s12 += a1[i] * b2[i];
+        s13 += a1[i] * b3[i];
+    }
+    out0[0] = s00;
+    out0[1] = s01;
+    out0[2] = s02;
+    out0[3] = s03;
+    out1[0] = s10;
+    out1[1] = s11;
+    out1[2] = s12;
+    out1[3] = s13;
+}
+
+void range_neon(const float* v, std::uint32_t n, float* out_min, float* out_max) noexcept {
+    if (n == 0)
+        return;
+    if (n < 8) {
+        float mn = v[0], mx = v[0];
+        for (std::uint32_t i = 1; i < n; ++i) {
+            mn = std::min(mn, v[i]);
+            mx = std::max(mx, v[i]);
+        }
+        *out_min = mn;
+        *out_max = mx;
+        return;
+    }
+    float32x4_t mn0 = vld1q_f32(v), mn1 = vld1q_f32(v + 4);
+    float32x4_t mx0 = mn0, mx1 = mn1;
+    std::uint32_t i = 8;
+    for (; i + 8 <= n; i += 8) {
+        const float32x4_t a = vld1q_f32(v + i);
+        const float32x4_t b = vld1q_f32(v + i + 4);
+        mn0 = vminq_f32(mn0, a);
+        mx0 = vmaxq_f32(mx0, a);
+        mn1 = vminq_f32(mn1, b);
+        mx1 = vmaxq_f32(mx1, b);
+    }
+    float mn = vminvq_f32(vminq_f32(mn0, mn1));
+    float mx = vmaxvq_f32(vmaxq_f32(mx0, mx1));
+    for (; i < n; ++i) {
+        mn = std::min(mn, v[i]);
+        mx = std::max(mx, v[i]);
+    }
+    *out_min = mn;
+    *out_max = mx;
+}
+
+std::uint32_t scan_ge_neon(const float* v, std::uint32_t n, float threshold,
+                           std::uint32_t* out) noexcept {
+    const float32x4_t vt = vdupq_n_f32(threshold);
+    std::uint32_t cnt = 0;
+    std::uint32_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const uint32x4_t m = vcgeq_f32(vld1q_f32(v + i), vt);
+        if (vmaxvq_u32(m) == 0)
+            continue;
+        if (vgetq_lane_u32(m, 0))
+            out[cnt++] = i;
+        if (vgetq_lane_u32(m, 1))
+            out[cnt++] = i + 1;
+        if (vgetq_lane_u32(m, 2))
+            out[cnt++] = i + 2;
+        if (vgetq_lane_u32(m, 3))
+            out[cnt++] = i + 3;
+    }
+    for (; i < n; ++i) {
+        if (v[i] >= threshold)
+            out[cnt++] = i;
+    }
+    return cnt;
 }
 
 void add_vec_neon(float* dst, const float* src, std::uint32_t n) noexcept {

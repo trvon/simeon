@@ -3,6 +3,7 @@
 #if defined(__AVX2__)
 
 #include <immintrin.h>
+#include <algorithm>
 #include <cmath>
 
 namespace simeon::simd {
@@ -91,6 +92,67 @@ void dot4_avx2(const float* a, const float* b0, const float* b1, const float* b2
             s += a[t] * bs[k][t];
         out4[k] = s;
     }
+}
+
+void range_avx2(const float* v, std::uint32_t n, float* out_min, float* out_max) noexcept {
+    if (n == 0)
+        return;
+    if (n < 16) {
+        float mn = v[0], mx = v[0];
+        for (std::uint32_t i = 1; i < n; ++i) {
+            mn = std::min(mn, v[i]);
+            mx = std::max(mx, v[i]);
+        }
+        *out_min = mn;
+        *out_max = mx;
+        return;
+    }
+    __m256 mn0 = _mm256_loadu_ps(v), mn1 = _mm256_loadu_ps(v + 8);
+    __m256 mx0 = mn0, mx1 = mn1;
+    std::uint32_t i = 16;
+    for (; i + 16 <= n; i += 16) {
+        const __m256 a = _mm256_loadu_ps(v + i);
+        const __m256 b = _mm256_loadu_ps(v + i + 8);
+        mn0 = _mm256_min_ps(mn0, a);
+        mx0 = _mm256_max_ps(mx0, a);
+        mn1 = _mm256_min_ps(mn1, b);
+        mx1 = _mm256_max_ps(mx1, b);
+    }
+    alignas(32) float tmn[8], tmx[8];
+    _mm256_store_ps(tmn, _mm256_min_ps(mn0, mn1));
+    _mm256_store_ps(tmx, _mm256_max_ps(mx0, mx1));
+    float mn = tmn[0], mx = tmx[0];
+    for (int k = 1; k < 8; ++k) {
+        mn = std::min(mn, tmn[k]);
+        mx = std::max(mx, tmx[k]);
+    }
+    for (; i < n; ++i) {
+        mn = std::min(mn, v[i]);
+        mx = std::max(mx, v[i]);
+    }
+    *out_min = mn;
+    *out_max = mx;
+}
+
+std::uint32_t scan_ge_avx2(const float* v, std::uint32_t n, float threshold,
+                           std::uint32_t* out) noexcept {
+    const __m256 vt = _mm256_set1_ps(threshold);
+    std::uint32_t cnt = 0;
+    std::uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 x = _mm256_loadu_ps(v + i);
+        int mask = _mm256_movemask_ps(_mm256_cmp_ps(x, vt, _CMP_GE_OQ));
+        while (mask != 0) {
+            const int lane = __builtin_ctz(static_cast<unsigned>(mask));
+            out[cnt++] = i + static_cast<std::uint32_t>(lane);
+            mask &= mask - 1;
+        }
+    }
+    for (; i < n; ++i) {
+        if (v[i] >= threshold)
+            out[cnt++] = i;
+    }
+    return cnt;
 }
 
 void add_vec_avx2(float* dst, const float* src, std::uint32_t n) noexcept {
