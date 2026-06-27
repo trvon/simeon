@@ -50,12 +50,4 @@ private:
 // the same length `k`; mismatched k produces undefined results.
 float jaccard_estimate(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t k) noexcept;
 
-// Score every doc in `corpus` (row-major, n_docs * k uint32 signatures)
-// against `query` (k uint32s) using jaccard_estimate, then return the top-N
-// docs sorted descending. Mirrors fusion::cosine_topk but on Jaccard space.
-std::vector<std::pair<std::uint32_t, float>> jaccard_topk(const std::uint32_t* query,
-                                                          const std::uint32_t* corpus,
-                                                          std::uint32_t n_docs, std::uint32_t k,
-                                                          std::uint32_t topn);
-
 } // namespace simeon

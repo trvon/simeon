@@ -1,6 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -252,6 +255,15 @@ public:
                                std::span<const float> doc_weights,
                                std::vector<std::pair<std::uint64_t, float>>& out_terms) const;
 
+    // Reference O(total postings) RM1 builder: scans every posting list rather
+    // than the feedback docs' forward lists. Retained only for benchmark and
+    // regression validation against build_relevance_model() (must produce
+    // bit-identical out_terms as a set). Not on any production path.
+    void
+    build_relevance_model_inverted(std::span<const std::uint32_t> top_k_docs,
+                                   std::span<const float> doc_weights,
+                                   std::vector<std::pair<std::uint64_t, float>>& out_terms) const;
+
     // Score each doc by Σ_w weight(w) * per-term-contribution(w, d), using
     // the same Bm25Variant-dispatched scoring inner loop score() uses.
     // `weighted_terms` is (term_hash, weight) — hashes must be produced via
@@ -261,18 +273,6 @@ public:
     // on the exact word-posting path only.
     void score_weighted_hashes(std::span<const std::pair<std::uint64_t, float>> weighted_terms,
                                std::span<float> out_scores) const;
-
-    // LM-style score interpolation: score each doc as
-    //   Σ_t body_w(t) * body_contrib(t,d) + aux_w(t) * aux_contrib(t,d)
-    // using separate body and aux postings.  `body_weighted_terms` are scored
-    // against postings_ (body) and `aux_weighted_terms` against aux_postings_.
-    // Both spans use the same (term_hash, per-term-weight) format as
-    // score_weighted_hashes.  out_scores must be pre-zeroed and sized to
-    // doc_count().  Does not invoke SAB n-gram fallback (no term strings).
-    void
-    score_lm_interpolation(std::span<const std::pair<std::uint64_t, float>> body_weighted_terms,
-                           std::span<const std::pair<std::uint64_t, float>> aux_weighted_terms,
-                           std::span<float> out_scores) const;
 
     // SDM (Metzler & Croft 2005): three-leg blend of unigram BM25 (via the
     // configured Bm25Variant), ordered-bigram BM25, and windowed-unordered-
@@ -318,6 +318,32 @@ private:
     std::vector<std::uint32_t> doc_lengths_;
     FlatHashMapU64<TermPostings> postings_;
     float avg_dl_ = 0.0f;
+
+    // Lazily-built forward index (doc_id -> [(term_hash, tf)]) over the body
+    // postings_. Built on first build_relevance_model() call — its sole
+    // consumer — so non-PRF query paths pay no memory or finalize cost.
+    // mutable: a transparent cache behind the const scoring API. Reset by
+    // finalize() so a re-finalized index never serves a stale forward view.
+    //
+    // Thread-safety: build_relevance_model() is const and may be called
+    // concurrently (the yams daemon scores one shared index from many query
+    // threads). forward_ is published via double-checked locking on the atomic
+    // ready flag — readers that observe forward_ready_ (acquire) see the fully
+    // built forward_ (release), and concurrent first-time builders serialize on
+    // the mutex.
+    mutable std::vector<std::vector<std::pair<std::uint64_t, std::uint32_t>>> forward_;
+    // Synchronization for the lazy forward_ build. Heap-held via unique_ptr so
+    // Bm25Index stays movable (std::mutex/std::atomic are non-movable, and the
+    // index is returned by value from builder helpers). One per index.
+    struct ForwardSync {
+        std::atomic<bool> ready{false};
+        std::mutex mtx;
+    };
+    mutable std::unique_ptr<ForwardSync> forward_sync_ = std::make_unique<ForwardSync>();
+    // One-time O(total postings) inversion of postings_ into forward_; a no-op
+    // once built. Thread-safe.
+    void ensure_forward_index() const;
+
     // Cached at finalize(): Σ doc_lengths_ (used by Dcm, computed once).
     std::uint64_t total_tokens_ = 0;
     // Cached at finalize() when variant == Dcm: α_sum override or avg_dl.

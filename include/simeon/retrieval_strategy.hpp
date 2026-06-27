@@ -71,19 +71,6 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// SelfAssessRouter — score all strategies, pick best by assess_quality.
-// Research-only: gated behind SIMEON_ENABLE_RESEARCH.
-// ---------------------------------------------------------------------------
-#ifdef SIMEON_ENABLE_RESEARCH
-class SelfAssessRouter final : public StrategyRouter {
-public:
-    void route(std::string_view query, const QueryProfile& profile, const AdapterEvidence& evidence,
-               std::span<RetrievalStrategy* const> pool,
-               std::span<float> out_scores) const override;
-};
-#endif // SIMEON_ENABLE_RESEARCH
-
-// ---------------------------------------------------------------------------
 // Bm25Strategy — wraps a Bm25Index
 // ---------------------------------------------------------------------------
 class Bm25Strategy final : public RetrievalStrategy {
@@ -114,34 +101,6 @@ private:
     std::vector<std::string> lead_texts_;
     float body_w_, aux_w_;
 };
-
-// ---------------------------------------------------------------------------
-// Rm3DiverseStrategy — MMR-diverse PRF via simeon embeddings (β=0.25).
-// query_embs is row-major: query_embs[qi * sdim + d].
-// Use score_query() with a query INDEX, not score() with query text.
-// Research-only: gated behind SIMEON_ENABLE_RESEARCH.
-// ---------------------------------------------------------------------------
-#ifdef SIMEON_ENABLE_RESEARCH
-class Rm3DiverseStrategy final : public RetrievalStrategy {
-public:
-    Rm3DiverseStrategy(const Bm25Index& idx, std::span<const float> doc_embs,
-                       std::span<const float> query_embs, std::uint32_t sdim,
-                       float mmr_beta = 0.25f, std::uint32_t cand_k = 20, std::uint32_t sel_k = 10,
-                       std::uint32_t n_terms = 30);
-    void score(std::string_view query, const AdapterEvidence& evidence,
-               std::span<float> out_scores) const override;
-    void score_indexed(std::string_view query, std::uint32_t qi, const AdapterEvidence& evidence,
-                       std::span<float> out_scores) const override;
-
-private:
-    const Bm25Index* idx_;
-    const float* doc_embs_;
-    const float* query_embs_;
-    std::uint32_t sdim_;
-    float mmr_beta_;
-    std::uint32_t cand_k_, sel_k_, n_terms_;
-};
-#endif // SIMEON_ENABLE_RESEARCH
 
 // Utility: vector dot product
 inline float emb_dot(const float* a, const float* b, std::size_t n) {

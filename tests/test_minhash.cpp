@@ -195,36 +195,6 @@ void test_jaccard_disjoint_low_score() {
     assert(j < 0.1f);
 }
 
-void test_jaccard_topk_basic() {
-    constexpr std::uint32_t k = 256;
-    MinHashConfig cfg;
-    cfg.k = k;
-    MinHashEncoder enc(cfg);
-
-    auto vocab = make_vocab(40);
-    auto query_text = make_string_with_jaccard(vocab, 30, 30, 42); // == itself
-
-    std::vector<std::uint32_t> q(k);
-    enc.encode(query_text, q.data());
-
-    constexpr std::uint32_t n_docs = 6;
-    std::vector<std::uint32_t> corpus(n_docs * k);
-    // Doc 0 == query, doc 1 = high overlap, others random.
-    enc.encode(query_text, corpus.data());
-    auto t1 = make_string_with_jaccard(vocab, 30, 25, 1234);
-    enc.encode(t1, corpus.data() + k);
-    for (std::uint32_t d = 2; d < n_docs; ++d) {
-        auto t = make_string_with_jaccard(vocab, 30, 0, 9000 + d);
-        enc.encode(t, corpus.data() + d * k);
-    }
-
-    auto top = simeon::jaccard_topk(q.data(), corpus.data(), n_docs, k, 3);
-    assert(top.size() == 3);
-    assert(top[0].first == 0); // identical doc must rank first
-    assert(std::fabs(top[0].second - 1.0f) < 1e-6f);
-    assert(top[1].first == 1); // high-overlap doc next
-}
-
 // Statistical regression guard on densification quality in the sparse regime
 // (|tokens| << k, most bins densified). One-permutation MinHash cannot beat
 // the information floor of ~|occupied bins| effective samples, so MSE sits a
@@ -308,7 +278,6 @@ int main() {
     test_densification_no_empty_slots();
     test_densification_short_text_stable();
     test_jaccard_disjoint_low_score();
-    test_jaccard_topk_basic();
     test_densification_variance_sparse();
     return 0;
 }

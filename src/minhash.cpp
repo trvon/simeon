@@ -26,7 +26,8 @@ struct MinSink final : NGramEmitter {
         // gives a uniform-in-bin value uncorrelated with the bin assignment,
         // which is the correctness condition for one-permutation MinHash.
         const std::uint32_t val = static_cast<std::uint32_t>(h >> 32);
-        if (val < slots[bin]) slots[bin] = val;
+        if (val < slots[bin])
+            slots[bin] = val;
     }
 };
 
@@ -48,15 +49,16 @@ void densify(std::uint32_t* slots, std::uint32_t k, std::uint64_t seed) noexcept
     const std::uint32_t step = static_cast<std::uint32_t>(splitmix64_mix(seed) | 1ULL);
 
     for (std::uint32_t i = 0; i < k; ++i) {
-        if (slots[i] != kEmpty) continue;
+        if (slots[i] != kEmpty)
+            continue;
         std::uint32_t r = 1;
         for (; r <= k; ++r) {
             const std::uint32_t j = (i + r * step) % k;
             if (slots[j] != kEmpty) {
                 // Mix the donor value with the attempt index so that
                 // donors at different rotation distances are distinguishable.
-                const std::uint64_t mixed = splitmix64_mix(
-                    (static_cast<std::uint64_t>(slots[j]) << 32) | r);
+                const std::uint64_t mixed =
+                    splitmix64_mix((static_cast<std::uint64_t>(slots[j]) << 32) | r);
                 slots[i] = static_cast<std::uint32_t>(mixed);
                 break;
             }
@@ -64,19 +66,19 @@ void densify(std::uint32_t* slots, std::uint32_t k, std::uint64_t seed) noexcept
         if (r > k) {
             // Entire signature was empty (unusable input). Fill with the
             // mixed seed so two empty signatures collide deterministically.
-            const std::uint32_t fill =
-                static_cast<std::uint32_t>(splitmix64_mix(seed ^ i));
+            const std::uint32_t fill = static_cast<std::uint32_t>(splitmix64_mix(seed ^ i));
             slots[i] = fill;
         }
     }
 }
 
-}  // namespace
+} // namespace
 
 MinHashEncoder::MinHashEncoder(MinHashConfig cfg) noexcept : cfg_(cfg) {}
 
 void MinHashEncoder::encode(std::string_view text, std::uint32_t* out) const {
-    if (cfg_.k == 0) throw std::runtime_error("MinHashEncoder: k must be > 0");
+    if (cfg_.k == 0)
+        throw std::runtime_error("MinHashEncoder: k must be > 0");
     std::fill_n(out, cfg_.k, kEmpty);
 
     MinSink sink{};
@@ -91,39 +93,15 @@ void MinHashEncoder::encode(std::string_view text, std::uint32_t* out) const {
     densify(out, cfg_.k, cfg_.hash_seed);
 }
 
-float jaccard_estimate(const std::uint32_t* a, const std::uint32_t* b,
-                       std::uint32_t k) noexcept {
-    if (k == 0) return 0.0f;
+float jaccard_estimate(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t k) noexcept {
+    if (k == 0)
+        return 0.0f;
     std::uint32_t matches = 0;
     for (std::uint32_t i = 0; i < k; ++i) {
-        if (a[i] == b[i]) ++matches;
+        if (a[i] == b[i])
+            ++matches;
     }
     return static_cast<float>(matches) / static_cast<float>(k);
 }
 
-std::vector<std::pair<std::uint32_t, float>>
-jaccard_topk(const std::uint32_t* query, const std::uint32_t* corpus,
-             std::uint32_t n_docs, std::uint32_t k, std::uint32_t topn) {
-    std::vector<std::pair<std::uint32_t, float>> all(n_docs);
-    for (std::uint32_t d = 0; d < n_docs; ++d) {
-        all[d].first = d;
-        all[d].second = jaccard_estimate(query, corpus + static_cast<std::size_t>(d) * k, k);
-    }
-    const std::uint32_t take = std::min(topn, n_docs);
-    if (take < n_docs) {
-        std::partial_sort(all.begin(), all.begin() + take, all.end(),
-                          [](const auto& x, const auto& y) {
-                              if (x.second != y.second) return x.second > y.second;
-                              return x.first < y.first;
-                          });
-        all.resize(take);
-    } else {
-        std::sort(all.begin(), all.end(), [](const auto& x, const auto& y) {
-            if (x.second != y.second) return x.second > y.second;
-            return x.first < y.first;
-        });
-    }
-    return all;
-}
-
-}  // namespace simeon
+} // namespace simeon

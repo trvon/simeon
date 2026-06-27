@@ -338,7 +338,7 @@ std::uint64_t Bm25Index::total_tf_by_hash(std::uint64_t term_hash) const noexcep
     return it->second.total_tf;
 }
 
-void Bm25Index::build_relevance_model(
+void Bm25Index::build_relevance_model_inverted(
     std::span<const std::uint32_t> top_k_docs, std::span<const float> doc_weights,
     std::vector<std::pair<std::uint64_t, float>>& out_terms) const {
     out_terms.clear();
@@ -365,6 +365,79 @@ void Bm25Index::build_relevance_model(
                 continue;
             acc += (static_cast<float>(tf) / dl) * wit->second;
         }
+        if (acc > 0.0f)
+            out_terms.emplace_back(h, acc);
+    }
+}
+
+void Bm25Index::ensure_forward_index() const {
+    // Fast path: already published (acquire pairs with the release store below).
+    if (forward_sync_->ready.load(std::memory_order_acquire))
+        return;
+    // Serialize concurrent first-time builders; re-check under the lock.
+    std::lock_guard<std::mutex> lk(forward_sync_->mtx);
+    if (forward_sync_->ready.load(std::memory_order_relaxed))
+        return;
+
+    const std::size_t n = doc_lengths_.size();
+    // Exact per-doc sizing pass so each forward list is allocated once.
+    std::vector<std::uint32_t> counts(n, 0);
+    for (const auto& [h, tp] : postings_) {
+        (void)h;
+        for (const auto& [did, tf] : tp.docs) {
+            (void)tf;
+            if (did < n)
+                ++counts[did];
+        }
+    }
+    forward_.assign(n, {});
+    for (std::size_t d = 0; d < n; ++d)
+        forward_[d].reserve(counts[d]);
+    for (const auto& [h, tp] : postings_) {
+        for (const auto& [did, tf] : tp.docs) {
+            if (did < n)
+                forward_[did].emplace_back(h, tf);
+        }
+    }
+    forward_sync_->ready.store(true, std::memory_order_release);
+}
+
+void Bm25Index::build_relevance_model(
+    std::span<const std::uint32_t> top_k_docs, std::span<const float> doc_weights,
+    std::vector<std::pair<std::uint64_t, float>>& out_terms) const {
+    out_terms.clear();
+    if (!finalized_ || top_k_docs.empty() || top_k_docs.size() != doc_weights.size())
+        return;
+
+    ensure_forward_index();
+
+    // Forward scan: only the ~K feedback docs' term lists are touched, instead
+    // of every posting list in the corpus. Dedup feedback docs keeping the
+    // first weight (matching the prior weight_by_doc.emplace semantics), then
+    // visit them in ascending doc-id order. Posting lists are ascending-id, so
+    // each term accumulates its contributions in the exact same order the old
+    // per-posting walk used → bit-identical weights.
+    std::unordered_map<std::uint32_t, float> weight_by_doc;
+    weight_by_doc.reserve(top_k_docs.size() * 2);
+    for (std::size_t i = 0; i < top_k_docs.size(); ++i)
+        weight_by_doc.emplace(top_k_docs[i], doc_weights[i]);
+    std::vector<std::pair<std::uint32_t, float>> feedback(weight_by_doc.begin(),
+                                                          weight_by_doc.end());
+    std::sort(feedback.begin(), feedback.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::unordered_map<std::uint64_t, float> term_acc;
+    for (const auto& [did, w] : feedback) {
+        if (did >= forward_.size())
+            continue;
+        const float dl = static_cast<float>(doc_lengths_[did]);
+        if (dl <= 0.0f)
+            continue;
+        for (const auto& [h, tf] : forward_[did])
+            term_acc[h] += (static_cast<float>(tf) / dl) * w;
+    }
+    out_terms.reserve(term_acc.size());
+    for (const auto& [h, acc] : term_acc) {
         if (acc > 0.0f)
             out_terms.emplace_back(h, acc);
     }
@@ -454,53 +527,6 @@ void Bm25Index::score_weighted_hashes(
                 return score_atire(tff, dl, idf, k1, b, avg);
             });
             break;
-    }
-}
-
-void Bm25Index::score_lm_interpolation(
-    std::span<const std::pair<std::uint64_t, float>> body_weighted_terms,
-    std::span<const std::pair<std::uint64_t, float>> aux_weighted_terms,
-    std::span<float> out_scores) const {
-    if (!finalized_)
-        throw std::runtime_error("Bm25Index::score_lm_interpolation before finalize()");
-    if (out_scores.size() != doc_lengths_.size())
-        throw std::runtime_error("Bm25Index::score_lm_interpolation out_scores size mismatch");
-
-    const float k1 = cfg_.k1;
-    const float b = cfg_.b;
-    const float avg = avg_dl_ > 0.0f ? avg_dl_ : 1.0f;
-    const float aux_avg = aux_avg_dl_ > 0.0f ? aux_avg_dl_ : 1.0f;
-
-    // Body pass — same as score_weighted_hashes but without zeroing out_scores.
-    for (const auto& [h, w] : body_weighted_terms) {
-        if (w <= 0.0f)
-            continue;
-        const auto pit = postings_.find(h);
-        if (pit == postings_.end())
-            continue;
-        const float idf = pit->second.idf;
-        for (const auto& [did, tf] : pit->second.docs) {
-            const float tff = static_cast<float>(tf);
-            const float dl = static_cast<float>(doc_lengths_[did]);
-            out_scores[did] += w * score_atire(tff, dl, idf, k1, b, avg);
-        }
-    }
-
-    // Aux pass — iterate aux_postings_ separately.
-    if (!aux_weighted_terms.empty() && !aux_postings_.empty()) {
-        for (const auto& [h, w] : aux_weighted_terms) {
-            if (w <= 0.0f)
-                continue;
-            const auto pit = aux_postings_.find(h);
-            if (pit == aux_postings_.end())
-                continue;
-            const float idf = pit->second.idf;
-            for (const auto& [did, tf] : pit->second.docs) {
-                const float tff = static_cast<float>(tf);
-                const float dl = static_cast<float>(aux_doc_lengths_[did]);
-                out_scores[did] += w * score_atire(tff, dl, idf, k1, b, aux_avg);
-            }
-        }
     }
 }
 
@@ -632,6 +658,10 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
 void Bm25Index::finalize() {
     if (finalized_)
         return;
+    // A re-finalized index must rebuild the forward view on next use. finalize()
+    // is single-threaded, so a plain reset is sufficient.
+    forward_sync_->ready.store(false, std::memory_order_relaxed);
+    forward_.clear();
     auto finalize_word_field = [&](const std::vector<std::uint32_t>& lengths,
                                    FlatHashMapU64<TermPostings>& postings, float& avg_dl,
                                    std::uint64_t& total_tokens, float& alpha_sum) {

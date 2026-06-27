@@ -99,16 +99,6 @@ common_srcs = [
   'src/persistent_homology.cpp',
 ]
 
-research_srcs = [
-  'src/glove_embeddings.cpp',
-]
-
-if get_option('enable_research')
-  simd_defines += '-DSIMEON_ENABLE_RESEARCH=1'
-  common_srcs += research_srcs
-  message('simeon: research components enabled')
-endif
-
 arch_srcs = []
 if has_neon
   arch_srcs += 'src/arch/neon.cpp'
@@ -165,7 +155,6 @@ install_headers(
     'include/simeon/hash_tabulation.hpp',
     'include/simeon/matryoshka.hpp',
     'include/simeon/pmi.hpp',
-    'include/simeon/glove_embeddings.hpp',
     'include/simeon/manifold.hpp',
     'include/simeon/query_router.hpp',
     'include/simeon/prf.hpp',
@@ -184,7 +173,7 @@ if get_option('enable_tests')
   subdir('tests')
 endif
 
-if get_option('enable_benchmarks') or get_option('enable_research')
+if get_option('enable_benchmarks')
   subdir('benchmarks')
 endif
 
@@ -199,7 +188,6 @@ summary({
   'AVX2+FMA': has_avx2,
   'Tests': get_option('enable_tests'),
   'Benchmarks': get_option('enable_benchmarks'),
-  'Research': get_option('enable_research'),
   'Fuzz harnesses': get_option('enable_fuzz'),
   'Coverage': get_option('enable_coverage'),
 }, section: 'simeon configuration')

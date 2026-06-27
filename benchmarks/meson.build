@@ -10,28 +10,9 @@ accuracy_exe = executable('simeon_accuracy_bench',
   install: false,
 )
 
-# Comparison vs a learned reference embedding model. Requires an external
-# fixture (corpus.tsv, queries.tsv, qrels.tsv, reference.bin); not run as a
-# meson test because the fixture is not committed. Gated behind enable_research
-# because it depends on research-only components (GloVe, SelfAssessRouter, etc.).
-if get_option('enable_research')
-vs_reference_exe = executable('simeon_bench_vs_reference',
-  'bench_vs_reference.cpp',
-  dependencies: simeon_dep,
-  install: false,
-)
-
-vs_reference_research_exe = executable('simeon_bench_vs_reference_research',
-  'bench_vs_reference_research.cpp',
-  dependencies: simeon_dep,
-  install: false,
-)
-endif
-
 # Isolated SAB-smooth profile harness. Builds one Bm25Index with
 # SubwordAwareBackoff/γ=5 and runs N repeats of the query loop, so
-# `xctrace record --launch` / `sample` see a single busy phase without
-# dilution from the 40+ other configs in simeon_bench_vs_reference.
+# `xctrace record --launch` / `sample` see a single busy phase.
 profile_sab_exe = executable('simeon_profile_sab_smooth',
   'profile_sab_smooth.cpp',
   dependencies: simeon_dep,
@@ -52,6 +33,15 @@ aho_corasick_exe = executable('simeon_aho_corasick_bench',
 
 text_rank_exe = executable('simeon_text_rank_bench',
   'text_rank_bench.cpp',
+  dependencies: simeon_dep,
+  install: false,
+)
+
+# RM1-build microbench: forward-index build_relevance_model vs the reference
+# O(corpus) inverted scan, across corpus scales. Doubles as a bit-identity
+# regression gate (exits non-zero on RM mismatch).
+bench_prf_exe = executable('simeon_bench_prf',
+  'bench_prf.cpp',
   dependencies: simeon_dep,
   install: false,
 )
@@ -85,4 +75,11 @@ test('simeon_text_rank_smoke', text_rank_exe,
   args: ['20'],
   suite: 'simeon',
   timeout: 30,
+)
+
+# PRF RM1-build smoke — two tiny scales; asserts forward/inverted RM bit-identity.
+test('simeon_bench_prf_smoke', bench_prf_exe,
+  args: ['500', '2000'],
+  suite: 'simeon',
+  timeout: 60,
 )

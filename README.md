@@ -21,6 +21,24 @@ text -> char/word n-grams -> hashed count sketch -> optional random projection
 
 Same input + same config + same seed = same bytes across supported architectures.
 
+The retrieval side composes these primitives into a first-pass + rerank pipeline.
+A first-pass BM25 (SAB-smooth by default) produces the candidate scores; a routed
+recipe then either returns them, expands them with RM3 pseudo-relevance feedback,
+or reranks with fragment-geometry topology:
+
+```mermaid
+flowchart LR
+    D[docs] --> IDX[Bm25Index<br/>SAB-smooth and variants]
+    D --> FR[semantic fragments<br/>PMI embeddings]
+    Q[query] --> FP[first-pass BM25]
+    IDX --> FP
+    FP --> R{routed recipe}
+    R -->|lexical| OUT[ranked docs]
+    R -->|RM3 PRF| PRF[score_with_prf<br/>forward-index RM1] --> OUT
+    R -->|topology rerank| GEO[fragment-geometry<br/>PHSS LargestGapApprox plus outer-MaxSim] --> OUT
+    FR --> GEO
+```
+
 ## What Ships
 
 - Embedding core: Achlioptas sparse, very-sparse JL, dense Gaussian.
@@ -74,12 +92,11 @@ Public headers:
 - Build: [docs/build.md](docs/build.md)
 - Research notes: [docs/research.md](docs/research.md)
 - Works cited: [docs/works_cited.md](docs/works_cited.md)
-- Reference fixture: [docs/reference_fixture.md](docs/reference_fixture.md)
 
 ## Status
 
 - Stable surface: tokenizer, hashing, projection heads, normalization, SIMD dispatch, matryoshka, PQ, retrieval core.
-- Research or opt-in surface: BM25F, SDM/WSDM, RM3, concept mining, GloVe loader, ArguAna adapters (gated behind `enable_research` build flag).
+- Opt-in surface: BM25F, SDM/WSDM, RM3 pseudo-relevance feedback, concept mining, fragment-geometry rerank.
 
 ## Citation
 

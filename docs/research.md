@@ -1,44 +1,33 @@
 # Research notes
 
-This file summarizes what the research benchmark infrastructure (`bench_vs_reference`
-and `bench_vs_reference_research`) probes, what each sweep found, and which
-components were promoted to the production surface.
+This file records what the retrieval experiments found and which components were
+promoted to the shipped surface. The experiment driver (`bench_vs_reference`) and
+the research-only components it exercised have been retired now that the
+experiments are concluded; the findings below are the durable record.
 
-Build with `-Denable_research=true` to enable research-only components (GloVe loader,
-ArguAna adapters, SelfAssessRouter, Rm3DiverseStrategy) and the reference-comparison
-benchmark binaries.
+## Production surface (shipped retrieval recipes)
 
-## Research benchmark sweeps
-
-All sweeps run against an external fixture (corpus + queries + qrels + reference
-embeddings). The fixture format is documented in [reference_fixture.md](reference_fixture.md).
-Both the production bench (`bench_vs_reference`) and the research bench
-(`bench_vs_reference_research`) consume the same fixture layout.
-
-### Production surface (shipped router recipes)
-
-The default `bench_vs_reference` binary keeps the stable comparison surface:
 - **BM25 variants** (Atire, AtireLTD, SAB-smooth, BM25+, BM25L, DPH, PL2, DCM, Layered, LayeredW)
 - **BM25 ↔ simeon RRF fusion** at pool sizes 100/300/500 and α ∈ {0.65, 0.75, 0.85, 0.95}
 - **Fragment-geometry rerank** (richcov, PHSS approx, MaxSim SPLATE)
 - **Query router** (pre-retrieval predictors → Atire vs SAB vs CascadeLinearAlpha)
 - **Quality router** (short vs medium vs long semantic query → Bm25Only vs FragmentRichCovPhssApprox vs FragmentRichCovPhssApproxMax)
 - **Step 1g.1 post-retrieval gates** (pool Jaccard, score decay) and **Step 1k B2 pre-retrieval gates** (SCQ, clarity)
-- **BM25-variant RRF** (`score_bm25_variants_rrf`) and entropy-weighted linear-α fusion (`linear_alpha_entropy_fuse`)
+- **BM25-variant RRF** (`score_bm25_variants_rrf`)
 - **RM3 pseudo-relevance feedback** (`score_with_prf`)
 - **Concept mining** (`mine_concepts` + BM25-concept blend)
 - **Corpus-class recipe routing** (AtireLTD for long-doc corpora, Atire for short-doc)
 
-### Research sweeps (opt-in, `bench_vs_reference_research`)
+### Explored and not shipped
 
-| Sweep flag | Description | Outcome |
+| Approach | Description | Outcome |
 |---|---|---|
-| `--aux-from {textrank,ac}` | BM25F with synthetic aux fields (TextRank titles, Aho-Corasick entities) | Marginal; not shipped |
-| `--softmatch-only` | PMI-neighbor query expansion (corpus-derived, training-free) | Neutral-to-negative; not shipped |
-| `--transport-only` | Phrase/concept transport via SDM bigrams + mined concepts + z-scored BM25 pool fusion | Mixed; concept leg occasionally helped, phrase leg did not |
-| `--graph-only` | Personalized-PageRank-style graph reranking over query-phrase-doc graphs | Negative; not shipped |
-| `--cluster-only` | TextRank-fragment cluster rescoring by query-cover and containment mass | Neutral; not shipped |
-| `--fragment-only` | PMI-encoded fragment graphs with semantic edges + lexical bridge edges + geometric query-centered neighborhoods + DocScorer cross-product grid | Fragment geometry (richcov) promoted to production; geometric neighborhoods and hybrid bridge edges were not |
+| Synthetic aux fields | BM25F with TextRank titles / Aho-Corasick entities | Marginal; not shipped |
+| PMI-neighbor expansion | corpus-derived, training-free query expansion | Neutral-to-negative; not shipped |
+| Phrase/concept transport | SDM bigrams + mined concepts + z-scored BM25 pool fusion | Mixed; concept leg occasionally helped, phrase leg did not |
+| Graph reranking | Personalized-PageRank over query-phrase-doc graphs | Negative; not shipped |
+| Cluster rescoring | TextRank-fragment clusters by query-cover and containment mass | Neutral; not shipped |
+| Fragment graphs | semantic + lexical bridge edges, geometric neighborhoods, DocScorer grid | Fragment geometry (richcov) promoted; geometric neighborhoods and bridge edges were not |
 
 ### Key research findings
 
@@ -294,19 +283,35 @@ the learned-dense frontier wherever lexical signal carries relevance; the FiQA
 gap is a structural property of the learning-free constraint, not a tuning
 deficit.
 
-## Components gated behind `enable_research`
+### Engineering: O(corpus) → O(feedback) RM1 build
 
-When `-Denable_research=false` (production default), the following are excluded:
+The fused-feedback RM3 leg (`prf_fused`, promoted via the `CcPrf` rows) calls
+`Bm25Index::build_relevance_model`, which originally scanned **every** posting
+list in the corpus to harvest expansion terms from a ~10-doc feedback set —
+O(total postings) per query regardless of feedback size. A lazily-built forward
+index (`doc_id → [(term_hash, tf)]`, constructed once on first use, paid only on
+the PRF path) turns this into a forward scan over the feedback docs' own term
+lists. Feedback docs are visited in ascending doc-id order so each term's
+contributions accumulate in the same order the posting walk used — the RM term
+set is **bit-identical** (verified at every scale by `simeon_bench_prf`), so all
+BEIR rankings and nDCG are unchanged.
 
-| Component | Files | Reason |
-|---|---|---|
-| GloVe/fastText loader | `glove_embeddings.hpp/cpp` | Only used by research benchmarks |
-| SelfAssessRouter | `retrieval_strategy.hpp/cpp` | Only used by research benchmarks |
-| Rm3DiverseStrategy | `retrieval_strategy.hpp/cpp` | Only used by research benchmarks |
-| ArguanaAdapter | `corpus_adapter.hpp/cpp` | Corpus-specific; never used in production |
-| ArguanaTextPairAdapter | `corpus_adapter.hpp/cpp` | Corpus-specific; never used in production |
-| `bench_vs_reference` | `benchmarks/bench_vs_reference.cpp` | Requires GloVe + SelfAssessRouter |
-| `bench_vs_reference_research` | `benchmarks/bench_vs_reference_research.cpp` | Research-only sweeps |
+Per-call `build_relevance_model` cost (NEON, release, `bench_prf` synthetic
+corpus, k=10 feedback):
+
+| n_docs | inverted µs/call (before) | forward µs/call (after) | speedup |
+|---|---|---|---|
+| 2,000 | 1,991 | 19.5 | 102× |
+| 10,000 | 6,960 | 20.4 | 342× |
+| 50,000 | 35,298 | 23.1 | 1,530× |
+| 250,000 | 167,198 | 17.8 | 9,373× |
+
+The after-curve is flat in corpus size (the win grows with the corpus); the
+one-time forward-index build is ≈ one old call, amortized across all queries.
+The reference inverted scan is retained as `build_relevance_model_inverted` for
+the bit-identity regression gate. The lazy build is thread-safe (double-checked
+locking on an atomic ready flag), so concurrent first-time PRF queries against
+one shared index serialize the build and publish it safely.
 
 ## Negative results and dead ends
 
@@ -321,12 +326,6 @@ These were investigated and did not produce consistent gains:
 - **Double-array Aho-Corasick trie**: slower than dense 256-col goto table despite
   theoretical memory advantages; the dense table is bandwidth-bound, not capacity-bound,
   on the tested dictionary sizes.
-
-For detailed per-sweep results including nDCG tables, run:
-```sh
-./build/benchmarks/simeon_bench_vs_reference fixtures/<dataset> > results.jsonl
-./build/benchmarks/simeon_bench_vs_reference_research fixtures/<dataset> --<flag> > research.jsonl
-```
 
 ## Works cited
 
