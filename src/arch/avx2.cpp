@@ -23,7 +23,7 @@ float l2_normalize_avx2(float* v, std::uint32_t n) noexcept {
     _mm256_store_ps(tmp, acc);
     float sum = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
     for (; i < n; ++i)
-        sum += v[i] * v[i];
+        sum = std::fma(v[i], v[i], sum);
     if (sum <= 0.0f)
         return 0.0f;
 
@@ -55,7 +55,7 @@ float dot_avx2(const float* a, const float* b, std::uint32_t n) noexcept {
     _mm256_store_ps(tmp, acc);
     float s = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
     for (; i < n; ++i)
-        s += a[i] * b[i];
+        s = std::fma(a[i], b[i], s);
     return s;
 }
 

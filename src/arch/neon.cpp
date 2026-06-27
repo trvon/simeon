@@ -20,7 +20,7 @@ float l2_normalize_neon(float* v, std::uint32_t n) noexcept {
     }
     float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
     for (; i < n; ++i)
-        sum += v[i] * v[i];
+        sum = std::fma(v[i], v[i], sum);
     if (sum <= 0.0f)
         return 0.0f;
 
@@ -49,7 +49,7 @@ float dot_neon(const float* a, const float* b, std::uint32_t n) noexcept {
     }
     float s = vaddvq_f32(vaddq_f32(acc0, acc1));
     for (; i < n; ++i)
-        s += a[i] * b[i];
+        s = std::fma(a[i], b[i], s);
     return s;
 }
 
@@ -80,10 +80,10 @@ void dot4_neon(const float* a, const float* b0, const float* b1, const float* b2
     float s2 = vaddvq_f32(vaddq_f32(c20, c21));
     float s3 = vaddvq_f32(vaddq_f32(c30, c31));
     for (; i < n; ++i) {
-        s0 += a[i] * b0[i];
-        s1 += a[i] * b1[i];
-        s2 += a[i] * b2[i];
-        s3 += a[i] * b3[i];
+        s0 = std::fma(a[i], b0[i], s0);
+        s1 = std::fma(a[i], b1[i], s1);
+        s2 = std::fma(a[i], b2[i], s2);
+        s3 = std::fma(a[i], b3[i], s3);
     }
     out4[0] = s0;
     out4[1] = s1;
@@ -145,14 +145,14 @@ void dot2x4_neon(const float* a0, const float* a1, const float* b0, const float*
     float s12 = vaddvq_f32(vaddq_f32(c120, c121));
     float s13 = vaddvq_f32(vaddq_f32(c130, c131));
     for (; i < n; ++i) {
-        s00 += a0[i] * b0[i];
-        s01 += a0[i] * b1[i];
-        s02 += a0[i] * b2[i];
-        s03 += a0[i] * b3[i];
-        s10 += a1[i] * b0[i];
-        s11 += a1[i] * b1[i];
-        s12 += a1[i] * b2[i];
-        s13 += a1[i] * b3[i];
+        s00 = std::fma(a0[i], b0[i], s00);
+        s01 = std::fma(a0[i], b1[i], s01);
+        s02 = std::fma(a0[i], b2[i], s02);
+        s03 = std::fma(a0[i], b3[i], s03);
+        s10 = std::fma(a1[i], b0[i], s10);
+        s11 = std::fma(a1[i], b1[i], s11);
+        s12 = std::fma(a1[i], b2[i], s12);
+        s13 = std::fma(a1[i], b3[i], s13);
     }
     out0[0] = s00;
     out0[1] = s01;
