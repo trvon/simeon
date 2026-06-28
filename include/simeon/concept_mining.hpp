@@ -43,6 +43,12 @@ public:
 
     void score(std::string_view query, std::span<float> out_scores) const;
 
+    // Sparse blend into an existing score vector: out[did] += weight * pmi *
+    // BM25(concept) for every doc containing a matched query-bigram concept.
+    // Avoids the caller allocating/zeroing a full-corpus buffer and running a
+    // dense add; touches only docs with a matched concept. score() == weight 1.
+    void blend_into(std::string_view query, std::span<float> out_scores, float weight) const;
+
     static std::uint64_t hash_bigram(std::uint64_t a, std::uint64_t b) noexcept;
 
     // Calls fn(concept_hash, pmi) for each concept bigram found in doc_text.

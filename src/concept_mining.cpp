@@ -71,6 +71,11 @@ void ConceptIndex::collect_doc_concepts(std::string_view doc_text,
 }
 
 void ConceptIndex::score(std::string_view query, std::span<float> out_scores) const {
+    blend_into(query, out_scores, 1.0f);
+}
+
+void ConceptIndex::blend_into(std::string_view query, std::span<float> out_scores,
+                              float weight) const {
     if (concepts_.empty() || out_scores.size() != doc_count_)
         return;
 
@@ -85,29 +90,26 @@ void ConceptIndex::score(std::string_view query, std::span<float> out_scores) co
     if (qwords.size() < 2)
         return;
 
-    // Collect distinct query bigrams that match a mined concept.
-    std::unordered_map<std::uint64_t, float> query_concept_pmi;
-    query_concept_pmi.reserve(qwords.size());
+    // Distinct matched concepts (keep the entry pointer — no second lookup).
+    std::unordered_map<std::uint64_t, const ConceptEntry*> matched;
+    matched.reserve(qwords.size());
     for (std::size_t i = 1; i < qwords.size(); ++i) {
         const std::uint64_t bh = hash_bigram(qwords[i - 1], qwords[i]);
         auto it = concepts_.find(bh);
         if (it != concepts_.end())
-            query_concept_pmi[bh] = it->second.pmi;
+            matched.emplace(bh, &it->second);
     }
 
-    // For each matched concept, walk its postings and add PMI-weighted
-    // BM25 to the corresponding doc's score entry.
-    for (const auto& [bh, pmi] : query_concept_pmi) {
-        const auto it = concepts_.find(bh);
-        if (it == concepts_.end())
-            continue;
-        const ConceptEntry& e = it->second;
+    // Walk each matched concept's postings and add weight·PMI·BM25 sparsely.
+    for (const auto& [bh, ep] : matched) {
+        const ConceptEntry& e = *ep;
+        const float wpmi = weight * e.pmi;
         for (const auto& [did, tf] : e.docs) {
             if (did >= out_scores.size())
                 continue;
             const float dl = static_cast<float>(bigram_doc_lengths_[did]);
             out_scores[did] +=
-                pmi * score_atire(static_cast<float>(tf), dl, e.idf, k1_, b_, avg_bigram_dl_);
+                wpmi * score_atire(static_cast<float>(tf), dl, e.idf, k1_, b_, avg_bigram_dl_);
         }
     }
 }
