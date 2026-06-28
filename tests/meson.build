@@ -28,6 +28,7 @@ simeon_tests = {
   'test_aho_corasick': 'test_aho_corasick.cpp',
   'test_text_rank': 'test_text_rank.cpp',
   'test_persistent_homology': 'test_persistent_homology.cpp',
+  'test_fragment_geometry': 'test_fragment_geometry.cpp',
 }
 
 foreach name, src : simeon_tests

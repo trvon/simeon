@@ -995,28 +995,35 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
 
     const auto t_white0 = profile ? Clock::now() : Clock::time_point{};
     std::vector<float> fvecs_raw(frags.size() * dim, 0.0f);
-    std::vector<float> mean(dim, 0.0f), m2(dim, 0.0f), var(dim, 0.0f);
-    std::size_t seen = 0;
+    // mean=0 / var=1 makes the transform below the identity, i.e. plain
+    // L2-normalized cosine (cfg.whiten=false). Per-query whitening overwrites them
+    // with the pool-fragment statistics; see FragmentGeometryConfig::whiten.
+    std::vector<float> mean(dim, 0.0f), var(dim, 1.0f);
     for (std::size_t i = 0; i < frags.size(); ++i) {
         const auto did = pool[frags[i].pool_index].first;
         const auto& src_frag = doc_frags[did][frags[i].frag_index];
         float* dst = fvecs_raw.data() + i * dim;
         read_frag_vec_impl(src_frag, dim, dst);
         frags[i].vec = dst;
-
-        ++seen;
-        const float inv_seen = 1.0f / static_cast<float>(seen);
-        for (std::uint32_t d = 0; d < dim; ++d) {
-            const float x = dst[d];
-            const float delta = x - mean[d];
-            mean[d] += delta * inv_seen;
-            const float delta2 = x - mean[d];
-            m2[d] += delta * delta2;
-        }
     }
-    const float inv_n = 1.0f / static_cast<float>(frags.size());
-    for (std::uint32_t d = 0; d < dim; ++d)
-        var[d] = std::sqrt(m2[d] * inv_n + 1e-6f);
+    if (cfg.whiten) {
+        std::vector<float> m2(dim, 0.0f);
+        std::size_t seen = 0;
+        for (std::size_t i = 0; i < frags.size(); ++i) {
+            const float* x = fvecs_raw.data() + i * dim;
+            ++seen;
+            const float inv_seen = 1.0f / static_cast<float>(seen);
+            for (std::uint32_t d = 0; d < dim; ++d) {
+                const float delta = x[d] - mean[d];
+                mean[d] += delta * inv_seen;
+                const float delta2 = x[d] - mean[d];
+                m2[d] += delta * delta2;
+            }
+        }
+        const float inv_n = 1.0f / static_cast<float>(frags.size());
+        for (std::uint32_t d = 0; d < dim; ++d)
+            var[d] = std::sqrt(m2[d] * inv_n + 1e-6f);
+    }
 
     std::vector<float> wq = qvec;
     for (std::uint32_t d = 0; d < dim; ++d)

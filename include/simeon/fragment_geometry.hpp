@@ -101,6 +101,15 @@ struct FragmentGeometryConfig {
     // layer (before the alpha blend), not inside the diffusion stack.
     bool outer_maxsim = false;
 
+    // Per-query fragment "whitening": center+scale query and fragment vectors by
+    // the mean/variance of the gathered pool fragments before cosine. Audited as
+    // a suspected signal inversion (the query-clustered pool centroid ≈ the query
+    // direction, so subtracting it could remove the shared relevance axis), but
+    // the per-arm retrieval bench showed it neutral-to-slightly-positive vs plain
+    // L2-normalized cosine (0.224 vs 0.206 nDCG@10 on the code corpus). Kept on by
+    // default; set false for plain cosine. Worth a prose-corpus re-check.
+    bool whiten = true;
+
     // Per-doc aggregation over fragment qsims when outer_maxsim is enabled.
     enum class DocScorerKind : std::uint8_t {
         MaxSim = 0,     // max qsim per doc
