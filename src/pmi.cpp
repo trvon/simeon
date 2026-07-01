@@ -566,6 +566,37 @@ PmiEmbeddings PmiEmbeddings::from_bytes(std::string_view bytes) {
     return out;
 }
 
+void PmiEmbeddings::temper_spectrum(float alpha) {
+    if (alpha == 0.0f || dim_ == 0 || vocab_.empty())
+        return;
+    const std::size_t n = vocab_.size();
+    std::vector<double> mean(dim_, 0.0), m2(dim_, 0.0);
+    for (std::size_t r = 0; r < n; ++r) {
+        const float* row = rows_.data() + r * dim_;
+        for (std::uint32_t d = 0; d < dim_; ++d)
+            mean[d] += row[d];
+    }
+    for (std::uint32_t d = 0; d < dim_; ++d)
+        mean[d] /= static_cast<double>(n);
+    for (std::size_t r = 0; r < n; ++r) {
+        const float* row = rows_.data() + r * dim_;
+        for (std::uint32_t d = 0; d < dim_; ++d) {
+            const double delta = row[d] - mean[d];
+            m2[d] += delta * delta;
+        }
+    }
+    std::vector<float> scale(dim_);
+    for (std::uint32_t d = 0; d < dim_; ++d) {
+        const double sd = std::sqrt(m2[d] / static_cast<double>(n)) + 1e-12;
+        scale[d] = static_cast<float>(std::pow(sd, static_cast<double>(-alpha)));
+    }
+    for (std::size_t r = 0; r < n; ++r) {
+        float* row = rows_.data() + r * dim_;
+        for (std::uint32_t d = 0; d < dim_; ++d)
+            row[d] *= scale[d];
+    }
+}
+
 PmiEmbeddings PmiEmbeddings::from_external(std::uint32_t dim, std::vector<std::string> vocab,
                                            std::vector<float> rows) {
     if (rows.size() != static_cast<std::size_t>(vocab.size()) * dim)

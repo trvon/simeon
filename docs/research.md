@@ -273,6 +273,27 @@ pair the contribution stays within the dev noise gate (SciFact test showed
 fusion config unchanged). Numbers: benchmarks.md "Geometry-leg hubness
 correction".
 
+### Screened negatives from the same pass (dev, scifact + nfcorpus)
+
+- **Spectral tempering cannot replace pool whitening.** Corpus-level
+  `PmiEmbeddings::temper_spectrum(alpha)` (per-dim sd^-α scaling of the PMI
+  coordinates) with per-query whitening off collapses the geometry leg:
+  scifact dev 0.093–0.130 across α∈[0,1] vs 0.238 whiten-on; nfcorpus
+  0.136–0.145 vs 0.170. Monotone toward α=1 but never close — the
+  load-bearing mechanism in whitening is the *pool-local mean centering*,
+  which no corpus-level scaling reproduces; tempering + whitening-on is a
+  no-op by construction (whitening divides out per-dim constant scales).
+  `temper_spectrum` stays as a research primitive (`recipe_accuracy_bench
+  ... spectral` mode).
+- **Min-max vs z-score fusion normalization is a wash** on the promoted WSDM
+  pair (the untested half of Bruch-Gai 2022): scifact dev −0.0017, nfcorpus
+  dev +0.0019 — z stays.
+- **Query-independent doc-topology priors are inert as fusion legs.** Per-doc
+  0-D persistence gap and mean pairwise coherence over each doc's own
+  fragments, z-fused into the promoted pair at w=0.1/0.2: scifact dev −0.003
+  to −0.011, nfcorpus within noise. Per-query survivor-component topology
+  (features of the PHSS graph at the selected scale) remains unexplored.
+
 ### The learning-free ceiling: beating MiniLM except on FiQA
 
 The pool-oracle gap (≈0.2–0.3) is a recall ceiling, not an achievable ranking

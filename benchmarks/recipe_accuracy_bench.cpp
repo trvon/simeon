@@ -277,13 +277,16 @@ void print_row(const char* name, const char* split, const Metrics& m, double que
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: recipe_accuracy_bench <fixture_dir> [split=test|dev] "
-                             "[pool_per_leg=100]\n");
+                             "[pool_per_leg=100] [mode=default|spectral]\n");
         return 2;
     }
     const std::string dir = argv[1];
     const std::string split = argc > 2 ? argv[2] : "test";
     const std::uint32_t pool_per_leg =
         argc > 3 ? static_cast<std::uint32_t>(std::atoi(argv[3])) : 100u;
+    // spectral mode swaps the csls/fusion geometry variants for a
+    // temper_spectrum(alpha) sweep with per-query whitening off.
+    const bool spectral_mode = argc > 4 && std::string_view(argv[4]) == "spectral";
 
     const Fixture fx = load_fixture(dir, split);
     const std::uint32_t nd = static_cast<std::uint32_t>(fx.doc_ids.size());
@@ -336,13 +339,76 @@ int main(int argc, char** argv) {
     ecfg.l2_normalize = true;
     ecfg.pmi_rows = &pmi;
     const simeon::Encoder enc(ecfg);
+
+    // Spectral-mode variants: tempered copies of the PMI rows, whiten off at
+    // scoring time. alpha=0 isolates whiten-off vs the whiten-on geom_pure row.
+    static constexpr float kTemperAlphas[] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f};
+    constexpr std::size_t kNumTemper = std::size(kTemperAlphas);
+    std::vector<simeon::PmiEmbeddings> temper_pmi;
+    std::vector<simeon::Encoder> temper_enc;
+    std::vector<std::vector<std::vector<simeon::SemanticFragment>>> temper_frags;
+    if (spectral_mode) {
+        temper_pmi.reserve(kNumTemper);
+        temper_enc.reserve(kNumTemper);
+        temper_frags.assign(kNumTemper, std::vector<std::vector<simeon::SemanticFragment>>(nd));
+        for (std::size_t v = 0; v < kNumTemper; ++v) {
+            temper_pmi.push_back(pmi);
+            temper_pmi[v].temper_spectrum(kTemperAlphas[v]);
+        }
+        for (std::size_t v = 0; v < kNumTemper; ++v) {
+            simeon::EncoderConfig vecfg = ecfg;
+            vecfg.pmi_rows = &temper_pmi[v];
+            temper_enc.emplace_back(vecfg);
+        }
+    }
+
     std::vector<std::vector<simeon::SemanticFragment>> frags(nd);
     for (std::size_t i = 0; i < nd; ++i) {
         const auto prep = simeon::prepare_doc(fx.doc_texts[i], atire, 6, 8, 0.0f);
         frags[i] = simeon::build_doc_semantic_fragments_rich_covered_from_prep(enc, fx.doc_texts[i],
                                                                                prep, 0.60f, 0.80f);
+        for (std::size_t v = 0; v < temper_enc.size(); ++v) {
+            temper_frags[v][i] = simeon::build_doc_semantic_fragments_rich_covered_from_prep(
+                temper_enc[v], fx.doc_texts[i], prep, 0.60f, 0.80f);
+        }
     }
     simeon::compress_fragments_to_bf16(frags, enc.output_dim());
+    for (std::size_t v = 0; v < temper_enc.size(); ++v)
+        simeon::compress_fragments_to_bf16(temper_frags[v], temper_enc[v].output_dim());
+
+    // Query-independent per-doc fragment-topology features: over each doc's
+    // own fragments (first 8, richcov ranking order), the largest adjacent
+    // gap in the sorted pairwise-cosine list (0-D persistence, the PHSS
+    // statistic applied per doc) and the mean pairwise cosine (coherence).
+    std::vector<float> doc_topo_gap(nd, 0.0f), doc_topo_coh(nd, 0.0f);
+    {
+        const std::uint32_t fdim = enc.output_dim();
+        std::vector<float> fv;
+        std::vector<float> sims;
+        for (std::size_t i = 0; i < nd; ++i) {
+            const auto& df = frags[i];
+            const std::size_t k = std::min<std::size_t>(df.size(), 8);
+            if (k < 2)
+                continue;
+            fv.resize(k * fdim);
+            for (std::size_t f = 0; f < k; ++f)
+                simeon::read_frag_vec(df[f], fdim, fv.data() + f * fdim);
+            sims.clear();
+            for (std::size_t a = 0; a + 1 < k; ++a)
+                for (std::size_t b = a + 1; b < k; ++b)
+                    sims.push_back(
+                        simeon::simd::dot(fv.data() + a * fdim, fv.data() + b * fdim, fdim));
+            float sum = 0.0f;
+            for (float s : sims)
+                sum += s;
+            doc_topo_coh[i] = sum / static_cast<float>(sims.size());
+            std::sort(sims.begin(), sims.end());
+            float gap = 0.0f;
+            for (std::size_t s = 0; s + 1 < sims.size(); ++s)
+                gap = std::max(gap, sims[s + 1] - sims[s]);
+            doc_topo_gap[i] = gap;
+        }
+    }
     simeon::FragmentGeometryConfig gcfg;
     gcfg.pool_size = 100;
     gcfg.alpha = 0.0f;
@@ -373,6 +439,17 @@ int main(int argc, char** argv) {
         R_CCG10, // promoted ⊕ g·z(geom_csls_k8_b1.0), g = 0.10/0.20/0.30
         R_CCG20,
         R_CCG30,
+        R_GEOM_T000, // spectral mode: temper_spectrum(alpha), whiten off
+        R_GEOM_T025,
+        R_GEOM_T050,
+        R_GEOM_T075,
+        R_GEOM_T100,
+        R_CC_MINMAX,    // promoted weights, observed min-max normalization per leg
+        R_CCTOPO_GAP10, // promoted ⊕ w·z(doc fragment-topology feature)
+        R_CCTOPO_GAP20,
+        R_CCTOPO_COH10,
+        R_CCTOPO_COH20,
+
         R_MINILM,
         R_POOL_ORACLE,
         N_ROWS
@@ -390,8 +467,19 @@ int main(int argc, char** argv) {
                                                      "fusion_ccgeomcsls_g0.10",
                                                      "fusion_ccgeomcsls_g0.20",
                                                      "fusion_ccgeomcsls_g0.30",
+                                                     "geom_temper_a0.00_nowhiten",
+                                                     "geom_temper_a0.25_nowhiten",
+                                                     "geom_temper_a0.50_nowhiten",
+                                                     "geom_temper_a0.75_nowhiten",
+                                                     "geom_temper_a1.00_nowhiten",
+                                                     "fusion_ccminmax_wsdmsab0.60_wsdmat0.40",
+                                                     "fusion_cctopo_gap_w0.10",
+                                                     "fusion_cctopo_gap_w0.20",
+                                                     "fusion_cctopo_coh_w0.10",
+                                                     "fusion_cctopo_coh_w0.20",
                                                      "reference_dense",
                                                      "pool_oracle"};
+    static_assert(R_GEOM_T100 - R_GEOM_T000 + 1 == kNumTemper);
 
     struct CslsVariant {
         RowId row;
@@ -568,15 +656,9 @@ int main(int argc, char** argv) {
         };
         pool_row(R_GEOM, pooled[L_GEOM]);
 
-        // Hubness-corrected geometry variants: same recipe, csls knobs on.
-        // Pool membership stays fixed (variants are rerank rows, not pool
-        // contributors); -inf handling matches the geom leg.
-        std::vector<float> geom_csls_k8; // kept for the fusion rows below
-        for (const auto& v : kCslsVariants) {
-            simeon::FragmentGeometryConfig vcfg = gcfg;
-            vcfg.csls_k = v.k;
-            vcfg.csls_beta = v.beta;
-            const auto vs = simeon::score_fragment_geometry(query, atire, enc, frags, vcfg);
+        // Pool-restrict a full-corpus geometry score vector, flooring -inf
+        // (outside the leg's internal BM25 pool) at the pool minimum.
+        const auto pool_restrict_geom = [&](const std::vector<float>& vs) {
             std::vector<float> vp(np);
             float mn = std::numeric_limits<float>::infinity();
             for (std::size_t p = 0; p < np; ++p) {
@@ -589,13 +671,26 @@ int main(int argc, char** argv) {
             for (float& x : vp)
                 if (!std::isfinite(x))
                     x = mn;
-            pool_row(v.row, vp);
-            if (v.row == R_GEOM_CSLS8_B10)
-                geom_csls_k8 = std::move(vp);
-        }
+            return vp;
+        };
 
-        // Promoted WSDM pair ⊕ hubness-corrected geometry leg.
-        {
+        // Hubness-corrected geometry variants: same recipe, csls knobs on.
+        // Pool membership stays fixed (variants are rerank rows, not pool
+        // contributors); -inf handling matches the geom leg.
+        if (!spectral_mode) {
+            std::vector<float> geom_csls_k8; // kept for the fusion rows below
+            for (const auto& v : kCslsVariants) {
+                simeon::FragmentGeometryConfig vcfg = gcfg;
+                vcfg.csls_k = v.k;
+                vcfg.csls_beta = v.beta;
+                auto vp = pool_restrict_geom(
+                    simeon::score_fragment_geometry(query, atire, enc, frags, vcfg));
+                pool_row(v.row, vp);
+                if (v.row == R_GEOM_CSLS8_B10)
+                    geom_csls_k8 = std::move(vp);
+            }
+
+            // Promoted WSDM pair ⊕ hubness-corrected geometry leg.
             const std::array<RowId, 3> ccg_rows{R_CCG10, R_CCG20, R_CCG30};
             const std::array<float, 3> gws{0.10f, 0.20f, 0.30f};
             for (std::size_t gi = 0; gi < gws.size(); ++gi) {
@@ -608,10 +703,68 @@ int main(int argc, char** argv) {
                                       std::span<const float>(w), fused);
                 pool_row(ccg_rows[gi], fused);
             }
+        } else {
+            // Spectral sweep: tempered PMI coordinates, whiten off.
+            simeon::FragmentGeometryConfig nw_cfg = gcfg;
+            nw_cfg.whiten = false;
+            for (std::size_t v = 0; v < kNumTemper; ++v) {
+                const auto vp = pool_restrict_geom(simeon::score_fragment_geometry(
+                    query, atire, temper_enc[v], temper_frags[v], nw_cfg));
+                pool_row(static_cast<RowId>(R_GEOM_T000 + v), vp);
+            }
         }
 
         pool_row(R_CC, cc);
         pool_row(R_CCPRF, ccprf);
+
+        // Min-max ablation of the promoted fusion (Bruch-Gai 2022 compare
+        // normalization schemes; z was adopted without testing min-max).
+        {
+            std::vector<float> mm(np, 0.0f);
+            const std::array<const std::vector<float>*, 2> legs{&pooled[L_WSDM_SAB],
+                                                                &pooled[L_WSDM_AT]};
+            const std::array<float, 2> w{0.6f, 0.4f};
+            for (std::size_t l = 0; l < legs.size(); ++l) {
+                float mn = std::numeric_limits<float>::infinity();
+                float mx = -std::numeric_limits<float>::infinity();
+                for (float x : *legs[l]) {
+                    mn = std::min(mn, x);
+                    mx = std::max(mx, x);
+                }
+                const float span = mx - mn;
+                if (span <= 0.0f)
+                    continue;
+                for (std::size_t p = 0; p < np; ++p)
+                    mm[p] += w[l] * (((*legs[l])[p] - mn) / span);
+            }
+            pool_row(R_CC_MINMAX, mm);
+        }
+
+        // Promoted fusion ⊕ per-doc fragment-topology feature legs.
+        {
+            std::vector<float> gap_pool(np), coh_pool(np);
+            for (std::size_t p = 0; p < np; ++p) {
+                gap_pool[p] = doc_topo_gap[pool[p]];
+                coh_pool[p] = doc_topo_coh[pool[p]];
+            }
+            const struct {
+                RowId row;
+                const std::vector<float>* feat;
+                float w;
+            } topo_rows[] = {{R_CCTOPO_GAP10, &gap_pool, 0.10f},
+                             {R_CCTOPO_GAP20, &gap_pool, 0.20f},
+                             {R_CCTOPO_COH10, &coh_pool, 0.10f},
+                             {R_CCTOPO_COH20, &coh_pool, 0.20f}};
+            for (const auto& t : topo_rows) {
+                std::vector<float> fused(np, 0.0f);
+                const std::array<std::span<const float>, 3> legs{*t.feat, pooled[L_WSDM_SAB],
+                                                                 pooled[L_WSDM_AT]};
+                const std::array<float, 3> w{t.w, 0.6f * (1.0f - t.w), 0.4f * (1.0f - t.w)};
+                simeon::convex_fuse_z(std::span<const std::span<const float>>(legs),
+                                      std::span<const float>(w), fused);
+                pool_row(t.row, fused);
+            }
+        }
 
         {
             auto& out = row_rankings[R_MINILM][qi];
@@ -646,6 +799,11 @@ int main(int argc, char** argv) {
         std::fclose(wb_fp);
 
     for (int r = 0; r < N_ROWS; ++r) {
+        // Rows not populated in this mode (csls/fusion vs spectral) stay empty.
+        const bool active = std::any_of(row_rankings[r].begin(), row_rankings[r].end(),
+                                        [](const auto& ranking) { return !ranking.empty(); });
+        if (!active)
+            continue;
         const Metrics m = score_rankings(row_rankings[r], fx);
         print_row(kRowName[r], split.c_str(), m, query_us_mean);
     }
