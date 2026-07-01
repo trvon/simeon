@@ -37,6 +37,15 @@ text_rank_exe = executable('simeon_text_rank_bench',
   install: false,
 )
 
+# Recipe-level accuracy bench: evaluates the promoted retrieval recipes
+# (convex WSDM z-fusion, fused-feedback RM3, fragment geometry) end-to-end
+# against a reference fixture. Needs an out-of-tree fixture dir; no CI test.
+recipe_accuracy_exe = executable('simeon_recipe_accuracy_bench',
+  'recipe_accuracy_bench.cpp',
+  dependencies: simeon_dep,
+  install: false,
+)
+
 # RM1-build microbench: forward-index build_relevance_model vs the reference
 # O(corpus) inverted scan, across corpus scales. Doubles as a bit-identity
 # regression gate (exits non-zero on RM mismatch).
