@@ -79,6 +79,22 @@ read once on test.
 | ccprf pf0.30 (promoted ⊕ fused-feedback RM3; opt-in) | — | 0.6990 | — | 0.3261 | 0.2481 | 0.2469 |
 | 6-leg union pool oracle | 0.9368 | 0.9365 | 0.5760 | 0.5918 | 0.5880 | 0.6073 |
 
+## Geometry-leg hubness correction (CSLS)
+
+nDCG@10, `simeon_recipe_accuracy_bench`, standalone pure-geometry leg
+(richcov + PHSS approx, α=0) over the 6-leg union pool. Knobs:
+`FragmentGeometryConfig::csls_k` / `csls_beta`. Dev-tuned, single test read.
+
+| Leg | SciFact dev | SciFact test | NFCorpus dev | NFCorpus test | FiQA dev |
+|---|---|---|---|---|---|
+| geom_pure | 0.2382 | 0.2830 | 0.1697 | 0.1997 | 0.0678 |
+| geom_csls_k8_b1.0 (promoted, opt-in) | 0.2732 | 0.3168 | 0.1761 | 0.2115 | 0.0695 |
+| geom_csls_k16_b1.0 | 0.2678 | 0.3149 | 0.1794 | 0.2105 | 0.0715 |
+| promoted fusion ⊕ g0.10·z(geom_csls_k8) | 0.6951 | 0.6980 | 0.3012 | 0.3208 | — |
+
+Fusion contribution stays within the ±0.005 dev gate — promoted fusion config
+unchanged; csls is an opt-in knob for the standalone geometry rerank path.
+
 ## Research outcomes
 
 See [research.md](research.md) for the full research summary including:

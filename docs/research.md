@@ -252,6 +252,27 @@ workbench feature legs:
   pool with bag/window/proximity heuristics. The feature columns remain in
   the workbench dump as instrumentation.
 
+### Hubness correction on the geometry leg (CSLS): promoted opt-in
+
+First lever from the score-space-geometry axis (distinct from the exhausted
+lexical pool-re-reading axis). High-dimensional similarity spaces grow hubs —
+fragments near everything, query included — whose raw qsim overstates
+relevance (Radovanović et al. 2010). CSLS (Conneau et al. 2018; QB-Norm
+family) subtracts each fragment's mean top-k pairwise similarity — its pool
+centrality, already computed in `sims_tri` for PHSS — from its query
+similarity before attention. Softmax attention is shift-invariant, so exactly
+the per-fragment hub term moves the mass distribution; cost is one O(m·k)
+scan of the existing triangle.
+
+Cross-fold result (`csls_k=8, csls_beta=1.0`): standalone geometry leg
++0.035/+0.034 dev/test SciFact, +0.006/+0.012 NFCorpus, flat FiQA, regression
+nowhere — promoted as an opt-in `FragmentGeometryConfig` knob for the
+standalone rerank path (the FFI rerank surface). Fused into the promoted WSDM
+pair the contribution stays within the dev noise gate (SciFact test showed
++0.012 at g=0.20 but dev was flat — the fold-disagreement rule keeps the
+fusion config unchanged). Numbers: benchmarks.md "Geometry-leg hubness
+correction".
+
 ### The learning-free ceiling: beating MiniLM except on FiQA
 
 The pool-oracle gap (≈0.2–0.3) is a recall ceiling, not an achievable ranking
