@@ -112,28 +112,13 @@ inline void dot2x4(const float* a0, const float* a1, const float* b0, const floa
 
 // BF16 (bfloat16) compression helpers.
 // Truncates the lower 16 bits of a float32 mantissa; preserves exponent exactly.
-inline std::uint16_t float_to_bf16(float f) noexcept {
-    std::uint32_t bits;
-    std::memcpy(&bits, &f, sizeof(bits));
-    return static_cast<std::uint16_t>(bits >> 16);
-}
-
-inline float bf16_to_float(std::uint16_t bf) noexcept {
-    std::uint32_t bits = static_cast<std::uint32_t>(bf) << 16;
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
-}
-
 void store_vec_bf16(const float* src, std::uint32_t dim, std::vector<std::uint16_t>& dst) {
     dst.resize(dim);
-    for (std::uint32_t i = 0; i < dim; ++i)
-        dst[i] = float_to_bf16(src[i]);
+    simd::bf16_pack(src, dst.data(), dim);
 }
 
 void decompress_bf16(const std::uint16_t* src, std::uint32_t dim, float* dst) {
-    for (std::uint32_t i = 0; i < dim; ++i)
-        dst[i] = bf16_to_float(src[i]);
+    simd::bf16_unpack(src, dst, dim);
 }
 
 // Read a fragment's vector, decompressing from BF16 if vec is empty.
@@ -141,8 +126,7 @@ void decompress_bf16(const std::uint16_t* src, std::uint32_t dim, float* dst) {
 // header is defined at the end of this TU and forwards to this one.
 void read_frag_vec_impl(const SemanticFragment& frag, std::uint32_t dim, float* dst) {
     if (!frag.vec.empty()) {
-        for (std::uint32_t i = 0; i < dim; ++i)
-            dst[i] = frag.vec[i];
+        std::memcpy(dst, frag.vec.data(), dim * sizeof(float));
     } else if (!frag.vec_bf16.empty()) {
         decompress_bf16(frag.vec_bf16.data(), dim, dst);
     } else {
@@ -1025,9 +1009,8 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
             var[d] = std::sqrt(m2[d] * inv_n + 1e-6f);
     }
 
-    std::vector<float> wq = qvec;
-    for (std::uint32_t d = 0; d < dim; ++d)
-        wq[d] = (wq[d] - mean[d]) / var[d];
+    std::vector<float> wq(dim);
+    simd::affine_norm(qvec.data(), mean.data(), var.data(), wq.data(), dim);
     const float wq_inv = simd::l2_normalize(wq.data(), dim);
     if (wq_inv <= 0.0f) {
         if (profile) {
@@ -1039,10 +1022,8 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
 
     std::vector<float> fvecs(frags.size() * dim, 0.0f);
     for (std::size_t i = 0; i < frags.size(); ++i) {
-        const float* raw = fvecs_raw.data() + i * dim;
         float* dst = fvecs.data() + i * dim;
-        for (std::uint32_t d = 0; d < dim; ++d)
-            dst[d] = (raw[d] - mean[d]) / var[d];
+        simd::affine_norm(fvecs_raw.data() + i * dim, mean.data(), var.data(), dst, dim);
         simd::l2_normalize(dst, dim);
     }
     if (profile)

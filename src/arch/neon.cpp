@@ -5,6 +5,7 @@
 #include <arm_neon.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace simeon::simd {
 
@@ -261,6 +262,50 @@ void saxpy_neon(float* dst, const float* src, float alpha, std::uint32_t n) noex
     }
     for (; i < n; ++i)
         dst[i] += alpha * src[i];
+}
+
+void affine_norm_neon(const float* src, const float* mean, const float* std_dev, float* dst,
+                      std::uint32_t n) noexcept {
+    std::uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        vst1q_f32(dst + i, vdivq_f32(vsubq_f32(vld1q_f32(src + i), vld1q_f32(mean + i)),
+                                     vld1q_f32(std_dev + i)));
+        vst1q_f32(dst + i + 4, vdivq_f32(vsubq_f32(vld1q_f32(src + i + 4), vld1q_f32(mean + i + 4)),
+                                         vld1q_f32(std_dev + i + 4)));
+    }
+    for (; i + 4 <= n; i += 4) {
+        vst1q_f32(dst + i, vdivq_f32(vsubq_f32(vld1q_f32(src + i), vld1q_f32(mean + i)),
+                                     vld1q_f32(std_dev + i)));
+    }
+    for (; i < n; ++i)
+        dst[i] = (src[i] - mean[i]) / std_dev[i];
+}
+
+void bf16_pack_neon(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept {
+    std::uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const uint32x4_t lo = vreinterpretq_u32_f32(vld1q_f32(src + i));
+        const uint32x4_t hi = vreinterpretq_u32_f32(vld1q_f32(src + i + 4));
+        vst1q_u16(dst + i, vcombine_u16(vshrn_n_u32(lo, 16), vshrn_n_u32(hi, 16)));
+    }
+    for (; i < n; ++i) {
+        std::uint32_t bits;
+        std::memcpy(&bits, src + i, sizeof(bits));
+        dst[i] = static_cast<std::uint16_t>(bits >> 16);
+    }
+}
+
+void bf16_unpack_neon(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept {
+    std::uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const uint16x8_t v = vld1q_u16(src + i);
+        vst1q_f32(dst + i, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v), 16)));
+        vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(v), 16)));
+    }
+    for (; i < n; ++i) {
+        const std::uint32_t bits = static_cast<std::uint32_t>(src[i]) << 16;
+        std::memcpy(dst + i, &bits, sizeof(bits));
+    }
 }
 
 } // namespace simeon::simd
