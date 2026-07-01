@@ -44,6 +44,12 @@ understanding the library's design or citing its evaluation context.
 - **Lavrenko and Croft (2001), _Relevance based language models_.** DOI: [10.1145/383952.383972](https://doi.org/10.1145/383952.383972)
   Foundation for relevance models and pseudo-relevance feedback. Used by the RM3
   generator-slice experiments as a training-free candidate-pool intervention.
+- **Radovanović, Nanopoulos, and Ivanović (2010), _Hubs in space: Popular nearest neighbors in high-dimensional data_.** [JMLR 11:2487–2531](https://jmlr.org/papers/v11/radovanovic10a.html)
+  Hubness as an intrinsic property of high-dimensional similarity spaces;
+  motivates correcting fragment qsims by pool centrality.
+- **Conneau, Lample, Ranzato, Denoyer, and Jégou (2018), _Word translation without parallel data_.** [arXiv:1710.04087](https://arxiv.org/abs/1710.04087)
+  CSLS: subtract mean top-k neighborhood similarity from raw cosine to demote
+  hubs. Basis for the geometry-leg `csls_k`/`csls_beta` correction.
 
 ## Compression and representation
 

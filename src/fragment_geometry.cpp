@@ -1266,6 +1266,48 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
             profile->query_confidence = query_conf;
     }
 
+    // CSLS-style hubness correction (Conneau et al. 2018; QB-Norm family):
+    // a hub fragment sits close to everything — query included — so its raw
+    // qsim overstates relevance. Subtract each fragment's mean top-k pairwise
+    // similarity (its pool centrality, already computed in sims_tri) from its
+    // query similarity. Softmax attention is shift-invariant, so only this
+    // per-fragment term changes the mass distribution, not any constant shift.
+    if (cfg.csls_k > 0 && nf > 1) {
+        const std::uint32_t k = std::min(cfg.csls_k, nf - 1);
+        std::vector<float> topk(static_cast<std::size_t>(nf) * k,
+                                -std::numeric_limits<float>::infinity());
+        const auto offer = [&](std::uint32_t f, float s) {
+            float* t = topk.data() + static_cast<std::size_t>(f) * k;
+            if (s <= t[k - 1])
+                return;
+            std::uint32_t p = k - 1;
+            while (p > 0 && t[p - 1] < s) {
+                t[p] = t[p - 1];
+                --p;
+            }
+            t[p] = s;
+        };
+        for (std::uint32_t i = 0; i + 1 < nf; ++i) {
+            const float* row = sims_tri.data() + static_cast<std::size_t>(i) * (2 * nf - i - 1) / 2;
+            const std::uint32_t len = nf - i - 1;
+            for (std::uint32_t jj = 0; jj < len; ++jj) {
+                offer(i, row[jj]);
+                offer(i + 1 + jj, row[jj]);
+            }
+        }
+        for (std::uint32_t f = 0; f < nf; ++f) {
+            const float* t = topk.data() + static_cast<std::size_t>(f) * k;
+            float sum = 0.0f;
+            std::uint32_t cnt = 0;
+            for (std::uint32_t p = 0; p < k && std::isfinite(t[p]); ++p) {
+                sum += t[p];
+                ++cnt;
+            }
+            if (cnt > 0)
+                qsim[f] -= cfg.csls_beta * (sum / static_cast<float>(cnt));
+        }
+    }
+
     float max_logit = -std::numeric_limits<float>::infinity();
     for (std::size_t i = 0; i < frags.size(); ++i)
         max_logit = std::max(max_logit, query_scale * qsim[i]);

@@ -132,6 +132,12 @@ struct FragmentGeometryConfig {
     std::uint32_t dense_pool_size = 0;
     const std::vector<std::vector<float>>* doc_dense_vecs = nullptr;
 
+    // CSLS-style hubness correction (Conneau et al. 2018; QB-Norm family):
+    // subtract csls_beta * mean(top-csls_k pairwise sims) from each fragment's
+    // query similarity before attention. 0 = off (default). Research knob.
+    std::uint32_t csls_k = 0;
+    float csls_beta = 1.0f;
+
     // Prefix dimensionality for the fragment-graph pairwise similarities
     // (PHSS scale selection + adjacency edges). 0 = full encoder dim
     // (default). When set, pairwise cosines use the leading dims of the

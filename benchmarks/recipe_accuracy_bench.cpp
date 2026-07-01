@@ -365,8 +365,14 @@ int main(int argc, char** argv) {
         R_WSDM_AT,
         R_WSDM_SAB,
         R_GEOM,
+        R_GEOM_CSLS8_B10, // hubness-corrected geometry variants (research)
+        R_GEOM_CSLS8_B05,
+        R_GEOM_CSLS16_B10,
         R_CC,    // promoted: 0.6·z(wsdm_sab) + 0.4·z(wsdm_at)
         R_CCPRF, // promoted ⊕ 0.3·z(prf_fused)
+        R_CCG10, // promoted ⊕ g·z(geom_csls_k8_b1.0), g = 0.10/0.20/0.30
+        R_CCG20,
+        R_CCG30,
         R_MINILM,
         R_POOL_ORACLE,
         N_ROWS
@@ -376,10 +382,24 @@ int main(int argc, char** argv) {
                                                      "wsdm_at",
                                                      "wsdm_sab",
                                                      "geom_pure",
+                                                     "geom_csls_k8_b1.0",
+                                                     "geom_csls_k8_b0.5",
+                                                     "geom_csls_k16_b1.0",
                                                      "fusion_cc_wsdmsab0.60_wsdmat0.40",
                                                      "fusion_ccprf_wsdmsab0.60_wsdmat0.40_pf0.30",
+                                                     "fusion_ccgeomcsls_g0.10",
+                                                     "fusion_ccgeomcsls_g0.20",
+                                                     "fusion_ccgeomcsls_g0.30",
                                                      "reference_dense",
                                                      "pool_oracle"};
+
+    struct CslsVariant {
+        RowId row;
+        std::uint32_t k;
+        float beta;
+    };
+    static constexpr CslsVariant kCslsVariants[] = {
+        {R_GEOM_CSLS8_B10, 8, 1.0f}, {R_GEOM_CSLS8_B05, 8, 0.5f}, {R_GEOM_CSLS16_B10, 16, 1.0f}};
 
     std::unordered_map<std::uint32_t, std::unordered_map<std::uint32_t, std::uint32_t>> rel;
     for (const auto& q : fx.qrels)
@@ -547,6 +567,49 @@ int main(int argc, char** argv) {
                 out.emplace_back(s[p], pool[p]);
         };
         pool_row(R_GEOM, pooled[L_GEOM]);
+
+        // Hubness-corrected geometry variants: same recipe, csls knobs on.
+        // Pool membership stays fixed (variants are rerank rows, not pool
+        // contributors); -inf handling matches the geom leg.
+        std::vector<float> geom_csls_k8; // kept for the fusion rows below
+        for (const auto& v : kCslsVariants) {
+            simeon::FragmentGeometryConfig vcfg = gcfg;
+            vcfg.csls_k = v.k;
+            vcfg.csls_beta = v.beta;
+            const auto vs = simeon::score_fragment_geometry(query, atire, enc, frags, vcfg);
+            std::vector<float> vp(np);
+            float mn = std::numeric_limits<float>::infinity();
+            for (std::size_t p = 0; p < np; ++p) {
+                vp[p] = vs[pool[p]];
+                if (std::isfinite(vp[p]))
+                    mn = std::min(mn, vp[p]);
+            }
+            if (!std::isfinite(mn))
+                mn = 0.0f;
+            for (float& x : vp)
+                if (!std::isfinite(x))
+                    x = mn;
+            pool_row(v.row, vp);
+            if (v.row == R_GEOM_CSLS8_B10)
+                geom_csls_k8 = std::move(vp);
+        }
+
+        // Promoted WSDM pair ⊕ hubness-corrected geometry leg.
+        {
+            const std::array<RowId, 3> ccg_rows{R_CCG10, R_CCG20, R_CCG30};
+            const std::array<float, 3> gws{0.10f, 0.20f, 0.30f};
+            for (std::size_t gi = 0; gi < gws.size(); ++gi) {
+                const float g = gws[gi];
+                std::vector<float> fused(np, 0.0f);
+                const std::array<std::span<const float>, 3> legs{geom_csls_k8, pooled[L_WSDM_SAB],
+                                                                 pooled[L_WSDM_AT]};
+                const std::array<float, 3> w{g, 0.6f * (1.0f - g), 0.4f * (1.0f - g)};
+                simeon::convex_fuse_z(std::span<const std::span<const float>>(legs),
+                                      std::span<const float>(w), fused);
+                pool_row(ccg_rows[gi], fused);
+            }
+        }
+
         pool_row(R_CC, cc);
         pool_row(R_CCPRF, ccprf);
 
