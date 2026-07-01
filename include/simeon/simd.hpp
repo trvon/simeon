@@ -224,7 +224,10 @@ inline void dot2x4(const float* a0, const float* a1, const float* b0, const floa
 #if defined(SIMEON_HAS_AVX2)
         case SimdTier::Avx2:
             // 16 ymm registers can't hold the 16 accumulators a true 2x4 tile
-            // needs; two dot4 passes are bit-identical and spill-free.
+            // needs; two dot4 passes are bit-identical and spill-free. A 1x8
+            // tile (16 accs + a + b = 18 regs) spills too — under the
+            // 2-accumulators-per-output parity contract, 1x4 is the widest
+            // shared-b tile that fits this register file.
             dot4_avx2(a0, b0, b1, b2, b3, out0, n);
             dot4_avx2(a1, b0, b1, b2, b3, out1, n);
             return;

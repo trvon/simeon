@@ -89,8 +89,10 @@ void dot4_avx2(const float* a, const float* b0, const float* b1, const float* b2
         alignas(32) float tmp[8];
         _mm256_store_ps(tmp, accs[k]);
         float s = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+        // std::fma, not a * b + s: dot_avx2's tail fuses explicitly, and the
+        // bit-identical contract must not depend on -ffp-contract.
         for (std::uint32_t t = i; t < n; ++t)
-            s += a[t] * bs[k][t];
+            s = std::fma(a[t], bs[k][t], s);
         out4[k] = s;
     }
 }

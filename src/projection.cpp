@@ -424,6 +424,22 @@ void Projection::apply(const std::int32_t* sketch, float* out) const {
         out[row + 2] = s2 * inv_scale_;
         out[row + 3] = s3 * inv_scale_;
     }
+#else
+    // Same 1xK * Kx4 blocking via the shipped dot4 kernel: the sketch loads
+    // amortize over 4 rows and each output stays bit-identical to the
+    // per-row simd::dot it replaces (dot4's contract).
+    for (; row + 4 <= output_dim_; row += 4) {
+        const float* r0p = dense_.data() + static_cast<std::size_t>(row + 0) * sd;
+        const float* r1p = dense_.data() + static_cast<std::size_t>(row + 1) * sd;
+        const float* r2p = dense_.data() + static_cast<std::size_t>(row + 2) * sd;
+        const float* r3p = dense_.data() + static_cast<std::size_t>(row + 3) * sd;
+        float o4[4];
+        simd::dot4(sf, r0p, r1p, r2p, r3p, o4, sd);
+        out[row + 0] = o4[0] * inv_scale_;
+        out[row + 1] = o4[1] * inv_scale_;
+        out[row + 2] = o4[2] * inv_scale_;
+        out[row + 3] = o4[3] * inv_scale_;
+    }
 #endif
     for (; row < output_dim_; ++row) {
         const float* row_ptr = dense_.data() + static_cast<std::size_t>(row) * sd;
