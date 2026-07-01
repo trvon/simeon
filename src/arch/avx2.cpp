@@ -5,6 +5,7 @@
 #include <immintrin.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace simeon::simd {
 
@@ -200,6 +201,63 @@ void saxpy_avx2(float* dst, const float* src, float alpha, std::uint32_t n) noex
     }
     for (; i < n; ++i)
         dst[i] += alpha * src[i];
+}
+
+void affine_norm_avx2(const float* src, const float* mean, const float* std_dev, float* dst,
+                      std::uint32_t n) noexcept {
+    std::uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        _mm256_storeu_ps(dst + i, _mm256_div_ps(_mm256_sub_ps(_mm256_loadu_ps(src + i),
+                                                              _mm256_loadu_ps(mean + i)),
+                                                _mm256_loadu_ps(std_dev + i)));
+        _mm256_storeu_ps(dst + i + 8, _mm256_div_ps(_mm256_sub_ps(_mm256_loadu_ps(src + i + 8),
+                                                                  _mm256_loadu_ps(mean + i + 8)),
+                                                    _mm256_loadu_ps(std_dev + i + 8)));
+    }
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(dst + i, _mm256_div_ps(_mm256_sub_ps(_mm256_loadu_ps(src + i),
+                                                              _mm256_loadu_ps(mean + i)),
+                                                _mm256_loadu_ps(std_dev + i)));
+    }
+    for (; i < n; ++i)
+        dst[i] = (src[i] - mean[i]) / std_dev[i];
+}
+
+void bf16_pack_avx2(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept {
+    std::uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        // >>16 leaves each lane <= 0xFFFF, so the unsigned 32->16 pack never
+        // saturates; permute undoes packus's per-128-bit-lane interleave.
+        const __m256i lo = _mm256_srli_epi32(_mm256_castps_si256(_mm256_loadu_ps(src + i)), 16);
+        const __m256i hi = _mm256_srli_epi32(_mm256_castps_si256(_mm256_loadu_ps(src + i + 8)), 16);
+        const __m256i packed =
+            _mm256_permute4x64_epi64(_mm256_packus_epi32(lo, hi), _MM_SHUFFLE(3, 1, 2, 0));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), packed);
+    }
+    for (; i + 8 <= n; i += 8) {
+        const __m256i v = _mm256_srli_epi32(_mm256_castps_si256(_mm256_loadu_ps(src + i)), 16);
+        const __m128i packed =
+            _mm_packus_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), packed);
+    }
+    for (; i < n; ++i) {
+        std::uint32_t bits;
+        std::memcpy(&bits, src + i, sizeof(bits));
+        dst[i] = static_cast<std::uint16_t>(bits >> 16);
+    }
+}
+
+void bf16_unpack_avx2(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept {
+    std::uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+        const __m256i widened = _mm256_slli_epi32(_mm256_cvtepu16_epi32(v), 16);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(widened));
+    }
+    for (; i < n; ++i) {
+        const std::uint32_t bits = static_cast<std::uint32_t>(src[i]) << 16;
+        std::memcpy(dst + i, &bits, sizeof(bits));
+    }
 }
 
 } // namespace simeon::simd

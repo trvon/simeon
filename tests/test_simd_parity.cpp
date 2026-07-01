@@ -2,6 +2,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <random>
 #include <string_view>
 #include <vector>
@@ -451,6 +453,81 @@ void test_range_parity() {
     }
 }
 
+// affine_norm contract: (src - mean) / std is one subtract and one IEEE divide
+// per element on every tier — bit-identical to the scalar reference.
+void test_affine_norm_parity_dim(std::uint32_t n) {
+    auto src = make_random(n, 0xAFF1AAAAu ^ n);
+    auto mean = make_random(n, 0xAFF1BBBBu ^ n);
+    std::vector<float> std_dev(n);
+    std::mt19937 rng(0xAFF1CCCCu ^ n);
+    std::uniform_real_distribution<float> dist(0.05f, 2.0f);
+    for (auto& s : std_dev)
+        s = dist(rng);
+
+    std::vector<float> ref(n), got(n);
+    simeon::simd::affine_norm_scalar(src.data(), mean.data(), std_dev.data(), ref.data(), n);
+    simeon::simd::affine_norm(src.data(), mean.data(), std_dev.data(), got.data(), n);
+    for (std::uint32_t i = 0; i < n; ++i)
+        assert(ref[i] == got[i]);
+}
+
+void test_affine_norm_dimensions() {
+    for (std::uint32_t n : {1u,  2u,  3u,  4u,  5u,  7u,   8u,   9u,   15u,  16u,
+                            17u, 23u, 31u, 32u, 63u, 127u, 128u, 257u, 384u, 1024u}) {
+        test_affine_norm_parity_dim(n);
+    }
+}
+
+// bf16 pack/unpack contract: pure bit moves, so every tier is bit-identical to
+// the scalar reference, and unpack(pack(x)) is exact for values already
+// representable in bf16 (low 16 mantissa bits zero). Special values (±0, ±inf,
+// NaN, denormals) must survive the truncation semantics unchanged.
+void test_bf16_parity_dim(std::uint32_t n) {
+    auto src = make_random(n, 0xBF16BF16u ^ n);
+    // Salt with special values at fixed offsets.
+    if (n > 2)
+        src[2] = 0.0f;
+    if (n > 5)
+        src[5] = -0.0f;
+    if (n > 7)
+        src[7] = std::numeric_limits<float>::infinity();
+    if (n > 11)
+        src[11] = -std::numeric_limits<float>::infinity();
+    if (n > 13)
+        src[13] = std::numeric_limits<float>::quiet_NaN();
+    if (n > 17)
+        src[17] = 1e-40f; // denormal
+
+    std::vector<std::uint16_t> ref(n), got(n);
+    simeon::simd::bf16_pack_scalar(src.data(), ref.data(), n);
+    simeon::simd::bf16_pack(src.data(), got.data(), n);
+    for (std::uint32_t i = 0; i < n; ++i)
+        assert(ref[i] == got[i]);
+
+    std::vector<float> ref_f(n), got_f(n);
+    simeon::simd::bf16_unpack_scalar(ref.data(), ref_f.data(), n);
+    simeon::simd::bf16_unpack(ref.data(), got_f.data(), n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        std::uint32_t rb, gb;
+        std::memcpy(&rb, &ref_f[i], sizeof(rb));
+        std::memcpy(&gb, &got_f[i], sizeof(gb));
+        assert(rb == gb);
+    }
+
+    // Round-trip: re-packing the unpacked floats must reproduce the u16s.
+    std::vector<std::uint16_t> again(n);
+    simeon::simd::bf16_pack(got_f.data(), again.data(), n);
+    for (std::uint32_t i = 0; i < n; ++i)
+        assert(again[i] == ref[i]);
+}
+
+void test_bf16_dimensions() {
+    for (std::uint32_t n : {1u,  2u,  3u,  4u,  5u,  7u,   8u,   9u,   15u,  16u,
+                            17u, 23u, 31u, 32u, 63u, 127u, 128u, 257u, 384u, 1024u}) {
+        test_bf16_parity_dim(n);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -470,5 +547,7 @@ int main() {
     test_dot2x4_dimensions();
     test_scan_ge_parity();
     test_range_parity();
+    test_bf16_dimensions();
+    test_affine_norm_dimensions();
     return 0;
 }

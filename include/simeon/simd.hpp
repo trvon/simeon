@@ -127,6 +127,37 @@ void saxpy_neon(float* dst, const float* src, float alpha, std::uint32_t n) noex
 void saxpy_avx2(float* dst, const float* src, float alpha, std::uint32_t n) noexcept;
 #endif
 
+// dst[i] = (src[i] - mean[i]) / std[i]. Whitening apply step. Subtraction and
+// IEEE division round identically lane-wise and scalar, so tiers are
+// bit-identical.
+void affine_norm_scalar(const float* src, const float* mean, const float* std_dev, float* dst,
+                        std::uint32_t n) noexcept;
+
+#if defined(SIMEON_HAS_NEON)
+void affine_norm_neon(const float* src, const float* mean, const float* std_dev, float* dst,
+                      std::uint32_t n) noexcept;
+#endif
+
+#if defined(SIMEON_HAS_AVX2)
+void affine_norm_avx2(const float* src, const float* mean, const float* std_dev, float* dst,
+                      std::uint32_t n) noexcept;
+#endif
+
+// BF16 pack/unpack: truncating float32 -> bfloat16 (drop low 16 mantissa bits)
+// and the exact inverse widening. Pure bit moves — every tier is bit-identical.
+void bf16_pack_scalar(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept;
+void bf16_unpack_scalar(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept;
+
+#if defined(SIMEON_HAS_NEON)
+void bf16_pack_neon(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept;
+void bf16_unpack_neon(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept;
+#endif
+
+#if defined(SIMEON_HAS_AVX2)
+void bf16_pack_avx2(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept;
+void bf16_unpack_avx2(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept;
+#endif
+
 // Runtime-selected dispatcher.
 inline float l2_normalize(float* v, std::uint32_t n) noexcept {
     SimdTier tier = active_simd_tier();
@@ -293,6 +324,64 @@ inline void saxpy(float* dst, const float* src, float alpha, std::uint32_t n) no
 #endif
         default:
             saxpy_scalar(dst, src, alpha, n);
+            return;
+    }
+}
+
+inline void affine_norm(const float* src, const float* mean, const float* std_dev, float* dst,
+                        std::uint32_t n) noexcept {
+    SimdTier tier = active_simd_tier();
+    switch (tier) {
+#if defined(SIMEON_HAS_NEON)
+        case SimdTier::Neon:
+            affine_norm_neon(src, mean, std_dev, dst, n);
+            return;
+#endif
+#if defined(SIMEON_HAS_AVX2)
+        case SimdTier::Avx2:
+            affine_norm_avx2(src, mean, std_dev, dst, n);
+            return;
+#endif
+        default:
+            affine_norm_scalar(src, mean, std_dev, dst, n);
+            return;
+    }
+}
+
+inline void bf16_pack(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept {
+    SimdTier tier = active_simd_tier();
+    switch (tier) {
+#if defined(SIMEON_HAS_NEON)
+        case SimdTier::Neon:
+            bf16_pack_neon(src, dst, n);
+            return;
+#endif
+#if defined(SIMEON_HAS_AVX2)
+        case SimdTier::Avx2:
+            bf16_pack_avx2(src, dst, n);
+            return;
+#endif
+        default:
+            bf16_pack_scalar(src, dst, n);
+            return;
+    }
+}
+
+inline void bf16_unpack(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept {
+    SimdTier tier = active_simd_tier();
+    switch (tier) {
+#if defined(SIMEON_HAS_NEON)
+        case SimdTier::Neon:
+            bf16_unpack_neon(src, dst, n);
+            return;
+#endif
+#if defined(SIMEON_HAS_AVX2)
+        case SimdTier::Avx2:
+            bf16_unpack_avx2(src, dst, n);
+            return;
+#endif
+        default:
+            bf16_unpack_scalar(src, dst, n);
             return;
     }
 }

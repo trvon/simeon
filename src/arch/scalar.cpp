@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace simeon::simd {
 
@@ -99,6 +100,27 @@ void scale_vec_scalar(float* dst, const float* w, std::uint32_t n) noexcept {
 void saxpy_scalar(float* dst, const float* src, float alpha, std::uint32_t n) noexcept {
     for (std::uint32_t i = 0; i < n; ++i)
         dst[i] += alpha * src[i];
+}
+
+void affine_norm_scalar(const float* src, const float* mean, const float* std_dev, float* dst,
+                        std::uint32_t n) noexcept {
+    for (std::uint32_t i = 0; i < n; ++i)
+        dst[i] = (src[i] - mean[i]) / std_dev[i];
+}
+
+void bf16_pack_scalar(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept {
+    for (std::uint32_t i = 0; i < n; ++i) {
+        std::uint32_t bits;
+        std::memcpy(&bits, src + i, sizeof(bits));
+        dst[i] = static_cast<std::uint16_t>(bits >> 16);
+    }
+}
+
+void bf16_unpack_scalar(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept {
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const std::uint32_t bits = static_cast<std::uint32_t>(src[i]) << 16;
+        std::memcpy(dst + i, &bits, sizeof(bits));
+    }
 }
 
 } // namespace simeon::simd
