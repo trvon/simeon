@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -200,7 +201,8 @@ void test_prefix_ranking_aligns_with_full() {
                           [](auto& a, auto& b) { return a.first > b.first; });
 
         std::vector<std::size_t> full_ids;
-        for (std::size_t i = 0; i < topk; ++i) full_ids.push_back(full[i].second);
+        for (std::size_t i = 0; i < topk; ++i)
+            full_ids.push_back(full[i].second);
         for (std::size_t i = 0; i < topk; ++i) {
             for (auto id : full_ids) {
                 if (pre[i].second == id) {
@@ -211,13 +213,11 @@ void test_prefix_ranking_aligns_with_full() {
         }
     }
 
-    const double overlap_ratio =
-        static_cast<double>(overlap_total) / (queries.size() * topk);
+    const double overlap_ratio = static_cast<double>(overlap_total) / (queries.size() * topk);
     // 4 queries * 4 hits = 16 possible overlaps. With matryoshka we expect
     // strong agreement; demand at least 50% to leave headroom for FP variance.
     if (overlap_ratio < 0.50) {
-        std::fprintf(stderr, "matryoshka prefix top-K overlap ratio %.3f < 0.50\n",
-                     overlap_ratio);
+        std::fprintf(stderr, "matryoshka prefix top-K overlap ratio %.3f < 0.50\n", overlap_ratio);
     }
     assert(overlap_ratio >= 0.50);
 }
@@ -241,7 +241,7 @@ void test_prefix_normalize_no_op_on_zero() {
     assert(v[0] == 1.0f && v[1] == 2.0f && v[2] == 3.0f);
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     test_validation();

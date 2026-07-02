@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdint>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 #include "simeon/projection.hpp"

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 #include "simeon/projection.hpp"
@@ -19,7 +20,8 @@ std::vector<std::int32_t> make_sketch(std::uint32_t n, std::uint32_t seed) {
     std::mt19937 rng(seed);
     std::uniform_int_distribution<std::int32_t> dist(-32, 32);
     std::vector<std::int32_t> v(n);
-    for (auto& x : v) x = dist(rng);
+    for (auto& x : v)
+        x = dist(rng);
     return v;
 }
 
@@ -56,7 +58,8 @@ void test_dense_gaussian_zero_input() {
     std::vector<std::int32_t> sketch(64, 0);
     std::vector<float> out(16, 7.0f);
     p.apply(sketch.data(), out.data());
-    for (float v : out) assert(v == 0.0f);
+    for (float v : out)
+        assert(v == 0.0f);
 }
 
 void test_dense_gaussian_determinism_apply() {
@@ -66,7 +69,8 @@ void test_dense_gaussian_determinism_apply() {
     std::vector<float> oa(32, 0.0f), ob(32, 0.0f);
     a.apply(sketch.data(), oa.data());
     b.apply(sketch.data(), ob.data());
-    for (std::size_t i = 0; i < 32; ++i) assert(oa[i] == ob[i]);
+    for (std::size_t i = 0; i < 32; ++i)
+        assert(oa[i] == ob[i]);
 }
 
 void test_dense_gaussian_seed_changes_output() {
@@ -89,8 +93,8 @@ void test_dense_gaussian_seed_changes_output() {
 // reference. Uses sketch_dim that is *not* a multiple of 8 to also exercise
 // the trailing scalar tail.
 void test_dense_gaussian_apply_matches_reference_small() {
-    const std::uint32_t sketch_dim = 67;  // not a multiple of 8 → tail loop runs
-    const std::uint32_t output_dim = 12;  // < 4 → ensure single-row path covered
+    const std::uint32_t sketch_dim = 67; // not a multiple of 8 → tail loop runs
+    const std::uint32_t output_dim = 12; // < 4 → ensure single-row path covered
     Projection p(sketch_dim, output_dim, ProjectionMode::DenseGaussian, 0xC0DE);
     auto sketch = make_sketch(sketch_dim, 99);
     std::vector<float> got(output_dim, 0.0f);
@@ -118,7 +122,8 @@ void test_very_sparse_zero_input() {
     std::vector<std::int32_t> sketch(256, 0);
     std::vector<float> out(32, 99.0f);
     p.apply(sketch.data(), out.data());
-    for (float v : out) assert(v == 0.0f);
+    for (float v : out)
+        assert(v == 0.0f);
 }
 
 void test_very_sparse_determinism() {
@@ -152,7 +157,8 @@ void test_very_sparse_density() {
     std::size_t nonzero = 0;
     for (std::uint32_t r = 0; r < output_dim; ++r) {
         for (std::uint32_t c = 0; c < sketch_dim; ++c) {
-            if (p.entry(r, c) != 0.0f) ++nonzero;
+            if (p.entry(r, c) != 0.0f)
+                ++nonzero;
         }
     }
     const double total = static_cast<double>(output_dim) * sketch_dim;
@@ -213,7 +219,7 @@ void test_none_entry_is_identity() {
     }
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     test_dense_gaussian_zero_input();

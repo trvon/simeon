@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <numeric>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -35,7 +36,8 @@ EncoderConfig base_cfg() {
 std::vector<std::string_view> make_seed(const std::vector<std::string>& docs) {
     std::vector<std::string_view> out;
     out.reserve(docs.size());
-    for (const auto& d : docs) out.emplace_back(d);
+    for (const auto& d : docs)
+        out.emplace_back(d);
     return out;
 }
 
@@ -111,7 +113,8 @@ void test_caller_supplied_weights_round_trip() {
 
     // Encoded result is L2-normalized.
     double mass = 0.0;
-    for (float x : out) mass += static_cast<double>(x) * x;
+    for (float x : out)
+        mass += static_cast<double>(x) * x;
     assert(std::fabs(mass - 1.0) < 1e-5);
 }
 
@@ -225,7 +228,7 @@ void test_data_aware_concentrates_more_than_uniform() {
     assert(avg_nest > avg_flat + 0.05);
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     test_empty_seed_throws();

@@ -6,8 +6,26 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
 
 namespace simeon::simd {
+
+namespace {
+
+// Count trailing zeros of a nonzero mask; MSVC has no __builtin_ctz.
+inline int ctz_nonzero(unsigned mask) noexcept {
+#if defined(_MSC_VER) && !defined(__clang__)
+    unsigned long lane;
+    _BitScanForward(&lane, mask);
+    return static_cast<int>(lane);
+#else
+    return __builtin_ctz(mask);
+#endif
+}
+
+} // namespace
 
 float l2_normalize_avx2(float* v, std::uint32_t n) noexcept {
     __m256 acc0 = _mm256_setzero_ps();
@@ -146,7 +164,7 @@ std::uint32_t scan_ge_avx2(const float* v, std::uint32_t n, float threshold,
         const __m256 x = _mm256_loadu_ps(v + i);
         int mask = _mm256_movemask_ps(_mm256_cmp_ps(x, vt, _CMP_GE_OQ));
         while (mask != 0) {
-            const int lane = __builtin_ctz(static_cast<unsigned>(mask));
+            const int lane = ctz_nonzero(static_cast<unsigned>(mask));
             out[cnt++] = i + static_cast<std::uint32_t>(lane);
             mask &= mask - 1;
         }

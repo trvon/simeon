@@ -55,6 +55,9 @@ if host_cpu == 'aarch64' and get_option('enable_simd_neon')
 elif host_cpu in ['x86', 'x86_64'] and get_option('enable_simd_avx2')
   avx2_probe = '''
   #include <immintrin.h>
+  #if !defined(__AVX2__)
+  #error avx2 macro not set
+  #endif
   int main() {
       __m256 v = _mm256_set1_ps(1.0f);
       __m256 r = _mm256_fmadd_ps(v, v, v);
@@ -62,9 +65,17 @@ elif host_cpu in ['x86', 'x86_64'] and get_option('enable_simd_avx2')
       return 0;
   }
   '''
-  if cpp.compiles(avx2_probe, args: ['-mavx2', '-mfma'], name: 'AVX2+FMA')
+  # MSVC ignores unknown -m flags with a warning (the probe would false-pass
+  # while avx2.cpp's __AVX2__ guard stays off -> link errors); it needs
+  # /arch:AVX2, which defines __AVX2__ and implies FMA.
+  if cpp.get_argument_syntax() == 'msvc'
+    avx2_args = ['/arch:AVX2']
+  else
+    avx2_args = ['-mavx2', '-mfma']
+  endif
+  if cpp.compiles(avx2_probe, args: avx2_args, name: 'AVX2+FMA')
     has_avx2 = true
-    simd_flags_avx2 += ['-mavx2', '-mfma']
+    simd_flags_avx2 += avx2_args
     simd_defines += '-DSIMEON_HAS_AVX2=1'
     message('simeon: AVX2+FMA enabled')
   endif

@@ -1,6 +1,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "simeon/projection.hpp"
@@ -60,7 +61,8 @@ void test_apply_nonzero() {
     p.apply(sketch.data(), out.data());
     // Not all outputs should be exactly zero.
     float max_abs = 0.0f;
-    for (float v : out) max_abs = std::max(max_abs, std::fabs(v));
+    for (float v : out)
+        max_abs = std::max(max_abs, std::fabs(v));
     assert(max_abs > 0.0f);
 }
 
@@ -74,7 +76,7 @@ void test_output_dim_validation() {
     assert(threw);
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     test_none_identity();
