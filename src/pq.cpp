@@ -47,6 +47,15 @@ float dot(const float* a, const float* b, std::uint32_t n) noexcept {
     return acc;
 }
 
+float inner_product_from_lut(std::span<const float> lut, std::uint32_t m, std::uint32_t k,
+                             const std::uint8_t* code) noexcept {
+    float acc = 0.0f;
+    for (std::uint32_t mi = 0; mi < m; ++mi) {
+        acc += lut[static_cast<std::size_t>(mi) * k + code[mi]];
+    }
+    return acc;
+}
+
 } // namespace
 
 class ProductQuantizer::Impl {
@@ -343,11 +352,7 @@ public:
     }
 
     float inner_product(const std::uint8_t* code) const noexcept {
-        float acc = 0.0f;
-        for (std::uint32_t mi = 0; mi < m_; ++mi) {
-            acc += lut_ip_[static_cast<std::size_t>(mi) * k_ + code[mi]];
-        }
-        return acc;
+        return inner_product_from_lut(lut_ip_, m_, k_, code);
     }
 
     std::span<const float> lut_l2_sq() const noexcept { return {lut_l2_.data(), lut_l2_.size()}; }
@@ -380,6 +385,49 @@ std::span<const float> PQQuery::lut_l2_sq() const noexcept {
     return impl_->lut_l2_sq();
 }
 std::span<const float> PQQuery::lut_ip() const noexcept {
+    return impl_->lut_ip();
+}
+
+class PQInnerProductQuery::Impl {
+public:
+    Impl(const ProductQuantizer& pq, const float* query) : m_(pq.m()), k_(pq.k()) {
+        const std::uint32_t dsub = pq.dsub();
+        lut_ip_.resize(static_cast<std::size_t>(m_) * k_);
+        for (std::uint32_t mi = 0; mi < m_; ++mi) {
+            const float* q = query + mi * dsub;
+            for (std::uint32_t ki = 0; ki < k_; ++ki) {
+                const float* c = pq.centroid(mi, ki);
+                lut_ip_[static_cast<std::size_t>(mi) * k_ + ki] = dot(q, c, dsub);
+            }
+        }
+    }
+
+    float inner_product(const std::uint8_t* code) const noexcept {
+        return inner_product_from_lut(lut_ip_, m_, k_, code);
+    }
+
+    std::span<const float> lut_ip() const noexcept { return {lut_ip_.data(), lut_ip_.size()}; }
+
+private:
+    std::uint32_t m_;
+    std::uint32_t k_;
+    std::vector<float> lut_ip_;
+};
+
+PQInnerProductQuery::PQInnerProductQuery(const ProductQuantizer& pq, const float* query) {
+    if (query == nullptr) {
+        throw std::invalid_argument("simeon::PQInnerProductQuery: query must not be null");
+    }
+    impl_ = std::make_unique<Impl>(pq, query);
+}
+PQInnerProductQuery::~PQInnerProductQuery() = default;
+PQInnerProductQuery::PQInnerProductQuery(PQInnerProductQuery&&) noexcept = default;
+PQInnerProductQuery& PQInnerProductQuery::operator=(PQInnerProductQuery&&) noexcept = default;
+
+float PQInnerProductQuery::inner_product(const std::uint8_t* code) const noexcept {
+    return impl_->inner_product(code);
+}
+std::span<const float> PQInnerProductQuery::lut_ip() const noexcept {
     return impl_->lut_ip();
 }
 

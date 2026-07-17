@@ -114,4 +114,25 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Inner-product-only ADC query. Use when the caller never needs squared L2:
+// it avoids building and storing the second m*k lookup table while preserving
+// PQQuery::inner_product's score semantics.
+class PQInnerProductQuery {
+public:
+    PQInnerProductQuery(const ProductQuantizer& pq, const float* query);
+    ~PQInnerProductQuery();
+
+    PQInnerProductQuery(const PQInnerProductQuery&) = delete;
+    PQInnerProductQuery& operator=(const PQInnerProductQuery&) = delete;
+    PQInnerProductQuery(PQInnerProductQuery&&) noexcept;
+    PQInnerProductQuery& operator=(PQInnerProductQuery&&) noexcept;
+
+    float inner_product(const std::uint8_t* code) const noexcept;
+    std::span<const float> lut_ip() const noexcept;
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 } // namespace simeon

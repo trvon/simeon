@@ -25,6 +25,7 @@
 #include "simeon/pq.hpp"
 
 using simeon::PQConfig;
+using simeon::PQInnerProductQuery;
 using simeon::PQQuery;
 using simeon::ProductQuantizer;
 
@@ -275,6 +276,26 @@ void test_adc_parity_l2_and_ip() {
     assert(q.lut_ip().size() == static_cast<std::size_t>(cfg.m) * cfg.k);
 }
 
+void test_inner_product_only_query_parity() {
+    PQConfig cfg{.dim = 64, .m = 8, .k = 64, .seed = 0x5151};
+    auto train_data = make_random_vectors(1024, cfg.dim, 41);
+    ProductQuantizer pq(cfg);
+    pq.train(train_data.data(), 1024, 25);
+
+    auto query = make_random_vectors(1, cfg.dim, 42);
+    auto db = make_random_vectors(64, cfg.dim, 43);
+    std::vector<std::uint8_t> codes(64 * cfg.m);
+    pq.encode_batch(db.data(), 64, codes.data());
+
+    PQQuery full(pq, query.data());
+    PQInnerProductQuery innerProductOnly(pq, query.data());
+    assert(innerProductOnly.lut_ip().size() == static_cast<std::size_t>(cfg.m) * cfg.k);
+    for (std::uint32_t i = 0; i < 64; ++i) {
+        const auto* code = codes.data() + i * cfg.m;
+        assert(innerProductOnly.inner_product(code) == full.inner_product(code));
+    }
+}
+
 // Recall@10 on data that has cluster structure (which is what PQ is designed
 // for — SIFT descriptors, learned embeddings, etc. all cluster naturally).
 // Pure Gaussian noise in 64 dims would give recall ~0.3 because top-10 is
@@ -354,6 +375,7 @@ int main() {
     test_train_deterministic_and_lower_distortion();
     test_encode_decode_roundtrip_uses_full_codebook();
     test_adc_parity_l2_and_ip();
+    test_inner_product_only_query_parity();
     test_recall_at_10();
     std::printf("test_pq: all passed\n");
     return 0;
