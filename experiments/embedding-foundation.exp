@@ -1,0 +1,99 @@
+# First reusable representation study. This manifest is intentionally locked
+# to dev: the runner rejects --split test while phase=exploration.
+schema = 1
+name = embedding-foundation-v1
+description = "Separate token units from projection/compression effects"
+metric_profile = trec-v1
+training_regime = artifact-free
+phase = exploration
+selection_split = dev
+holdout_split = test
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "ASCII case folding improves lexical alignment; word identity and 384d projection expose quality/cost tradeoffs"
+
+[variant.char-32k]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+sketch_dim = 32768
+output_dim = 0
+projection = none
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.word-32k]
+kind = encoder
+ngram_mode = word
+ngram_min = 1
+ngram_max = 1
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+sketch_dim = 32768
+output_dim = 0
+projection = none
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.char-word-32k]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+sketch_dim = 32768
+output_dim = 0
+projection = none
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.char-32k-ascii-lower]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 32768
+output_dim = 0
+projection = none
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.char-word-32k-ascii-lower]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 32768
+output_dim = 0
+projection = none
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.char-4k-achlioptas-384]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+sketch_dim = 4096
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false

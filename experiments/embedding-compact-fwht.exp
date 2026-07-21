@@ -1,0 +1,104 @@
+# Follow-up on the fast-JL compact Pareto candidate.
+schema = 1
+name = embedding-compact-fwht-v1
+description = "Test sketch collision budget and token support for a fixed-width FWHT projection"
+metric_profile = trec-v1
+training_regime = artifact-free
+phase = exploration
+selection_split = dev
+holdout_split = test
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "A wider pre-sketch reduces collisions while FWHT retains compact quality and fast encoding"
+evidence_refs = "doi:10.1137/060673096;doi:10.1145/1553374.1553516"
+formal_contract = "lean:formal/ExperimentContract.lean"
+
+[variant.fwht-char-4k]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.fwht-char-word-4k]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.fwht-char-8k]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.fwht-char-word-8k]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.fwht-char-16k]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 16384
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.achlioptas-char-8k]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 8192
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false

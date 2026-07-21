@@ -1,0 +1,48 @@
+# Interaction check after freezing the compact FWHT geometry.
+schema = 1
+name = embedding-feature-sqrt-fwht-v1
+description = "Recheck feature-level sqrt-TF on the selected 8k FWHT compact geometry"
+metric_profile = trec-v1
+training_regime = artifact-free
+phase = exploration
+selection_split = dev
+holdout_split = test
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "The wider pre-sketch and structured projection may make pre-hash sqrt-TF useful"
+evidence_refs = "paperbridge:17bef2198888;doi:10.2172/5698;doi:10.1137/060673096"
+formal_contract = "lean:formal/ExperimentContract.lean"
+
+[variant.raw]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.feature-sqrt]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = sqrt_tf
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false

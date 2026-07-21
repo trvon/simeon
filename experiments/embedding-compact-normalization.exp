@@ -1,0 +1,42 @@
+# Controlled follow-up: does ASCII case folding survive the 384d projection?
+schema = 1
+name = embedding-compact-normalization-v1
+description = "Isolate ASCII case folding in the compact projected encoder"
+metric_profile = trec-v1
+training_regime = artifact-free
+phase = exploration
+selection_split = dev
+holdout_split = test
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "ASCII case folding improves lexical alignment after fixed random projection"
+
+[variant.char-4k-achlioptas-384]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = none
+sketch_dim = 4096
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.char-4k-achlioptas-384-ascii-lower]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false

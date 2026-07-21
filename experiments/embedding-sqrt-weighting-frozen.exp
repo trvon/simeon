@@ -1,0 +1,32 @@
+# Selected from embedding-sqrt-weighting.exp using dev only. The compact mode
+# was rejected because the nonlinear post-sketch transform amplified collisions.
+schema = 1
+name = embedding-sqrt-weighting-frozen-v1
+description = "Frozen wide encoder with deterministic signed-square-root weighting"
+metric_profile = trec-v1
+training_regime = artifact-free
+phase = frozen
+selection_split = dev
+holdout_split = test
+selection_manifest = fnv1a64:698fecd345d5f936
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "Sublinear sketch counts reduce repetition bias in a low-collision wide sketch"
+evidence_refs = "paperbridge:17bef2198888;doi:10.2172/5698"
+formal_contract = "lean:formal/ExperimentContract.lean"
+
+[variant.wide-char-word-signed-sqrt]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_weighting = signed_sqrt
+sketch_dim = 32768
+output_dim = 0
+projection = none
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false

@@ -1,0 +1,29 @@
+# Selected from embedding-compact-normalization.exp using dev only. This file is
+# ready for a single holdout evaluation; no holdout was read during selection.
+schema = 1
+name = embedding-compact-normalization-frozen-v1
+description = "Frozen compact encoder selected on three development fixtures"
+metric_profile = trec-v1
+training_regime = artifact-free
+phase = frozen
+selection_split = dev
+holdout_split = test
+selection_manifest = fnv1a64:0b3dc4e9c483bf2d
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "ASCII case folding improves lexical alignment after fixed random projection"
+
+[variant.char-4k-achlioptas-384-ascii-lower]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false

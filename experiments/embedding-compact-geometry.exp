@@ -1,0 +1,181 @@
+# One-factor compact ablations around the selected lowercase 4k-to-384 encoder.
+schema = 1
+name = embedding-compact-geometry-v1
+description = "Compare fixed projection families and character n-gram support at 384 dimensions"
+metric_profile = trec-v1
+training_regime = artifact-free
+phase = exploration
+selection_split = dev
+holdout_split = test
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "A fixed projection or n-gram support change reduces compact distortion without fitted state"
+evidence_refs = "doi:10.1145/1553374.1553516;doi:10.1016/S0304-3975(03)00400-6"
+formal_contract = "lean:formal/ExperimentContract.lean"
+
+[variant.baseline]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.projection-very-sparse]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = very_sparse
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.projection-sparse-jl-005]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = sparse_jl
+projection_seed = 0xDEADBEEFCAFEBABE
+sparse_jl_eps = 0.05
+l2_normalize = true
+matryoshka = false
+
+[variant.projection-sparse-jl-010]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = sparse_jl
+projection_seed = 0xDEADBEEFCAFEBABE
+sparse_jl_eps = 0.1
+l2_normalize = true
+matryoshka = false
+
+[variant.projection-fwht]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.projection-gaussian]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = dense_gaussian
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.ngram-3]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 3
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.ngram-3-4]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 4
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.ngram-3-6]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 6
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.ngram-3-7]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 7
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.ngram-4-6]
+kind = encoder
+ngram_mode = char
+ngram_min = 4
+ngram_max = 6
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_dim = 4096
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false

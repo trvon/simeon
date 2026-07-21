@@ -1,0 +1,76 @@
+# Controlled follow-up: sublinear weighting on the normalized encoder frontier.
+schema = 1
+name = embedding-sqrt-weighting-v1
+description = "Isolate deterministic signed-square-root sketch weighting"
+metric_profile = trec-v1
+training_regime = artifact-free
+phase = exploration
+selection_split = dev
+holdout_split = test
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "Sublinear sketch counts reduce repetition bias without fitted state"
+
+[variant.compact-raw]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_weighting = raw
+sketch_dim = 4096
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.compact-signed-sqrt]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_weighting = signed_sqrt
+sketch_dim = 4096
+output_dim = 384
+projection = achlioptas
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.wide-char-word-raw]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_weighting = raw
+sketch_dim = 32768
+output_dim = 0
+projection = none
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.wide-char-word-signed-sqrt]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+sketch_weighting = signed_sqrt
+sketch_dim = 32768
+output_dim = 0
+projection = none
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false

@@ -1,0 +1,104 @@
+# Controlled word-boundary ablation around the frozen 8k-to-384 FWHT preset.
+schema = 1
+name = embedding-word-boundaries-v1
+description = "Compare whole-text character n-grams with marker-aware per-word n-grams"
+metric_profile = trec-v1
+training_regime = artifact-free
+phase = exploration
+selection_split = dev
+holdout_split = test
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "Word boundary markers remove cross-token noise and preserve prefix/suffix identity"
+evidence_refs = "paperbridge:d21c204f070c;doi:10.1162/tacl_a_00051;doi:10.1023/B:INRT.0000009441.78971.BE"
+formal_contract = "lean:formal/ExperimentContract.lean"
+
+[variant.baseline-text-char-word-3-5]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+char_ngram_scope = text
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.bounded-char-word-3-5]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+char_ngram_scope = word_bounded
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.bounded-char-word-3-6]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 6
+char_ngram_scope = word_bounded
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.bounded-char-3-5]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+char_ngram_scope = word_bounded
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.bounded-char-3-6]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 6
+char_ngram_scope = word_bounded
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false

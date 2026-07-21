@@ -1,0 +1,32 @@
+# Frozen after selection on dev manifest fnv1a64:07c2df7e37a8ac82.
+schema = 1
+name = embedding-compact-fwht-frozen-v1
+description = "Frozen compact 8k char+word FWHT encoder selected on three dev fixtures"
+metric_profile = trec-v1
+training_regime = artifact-free
+phase = frozen
+selection_split = dev
+holdout_split = test
+selection_manifest = fnv1a64:07c2df7e37a8ac82
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "A wider pre-sketch reduces collisions while FWHT retains compact quality and fast encoding"
+evidence_refs = "doi:10.1137/060673096;doi:10.1145/1553374.1553516"
+formal_contract = "lean:formal/ExperimentContract.lean"
+
+[variant.fwht-char-word-8k]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
