@@ -2,9 +2,14 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include "simeon/hashed_idf.hpp"
 #include "simeon/hasher.hpp"
 #include "simeon/pmi.hpp"
 #include "simeon/projection.hpp"
@@ -12,6 +17,38 @@
 #include "simeon/tokenizer.hpp"
 
 namespace simeon {
+
+namespace {
+
+std::uint64_t integer_sqrt(std::uint64_t value) noexcept {
+    if (value == 0)
+        return 0;
+    std::uint64_t root = static_cast<std::uint64_t>(std::sqrt(static_cast<double>(value)));
+    while (root + 1 <= value / (root + 1))
+        ++root;
+    while (root > value / root)
+        --root;
+    return root;
+}
+
+std::int32_t signed_sqrt_fixed(std::int32_t value) noexcept {
+    if (value == 0)
+        return 0;
+    const auto wide = static_cast<std::int64_t>(value);
+    const std::uint64_t magnitude =
+        wide < 0 ? static_cast<std::uint64_t>(-wide) : static_cast<std::uint64_t>(wide);
+    // Q10 fixed point: floor(1024 * sqrt(magnitude)). The common factor is
+    // removed by L2 normalization while retaining precision for projection.
+    const auto weighted = static_cast<std::int32_t>(integer_sqrt(magnitude << 20));
+    return value < 0 ? -weighted : weighted;
+}
+
+std::uint32_t sketch_bucket(std::uint64_t hash, std::uint32_t dimension) noexcept {
+    const auto low = static_cast<std::uint32_t>(hash);
+    return (dimension & (dimension - 1)) == 0 ? low & (dimension - 1) : low % dimension;
+}
+
+} // namespace
 
 SimdTier active_simd_tier() noexcept {
 #if defined(SIMEON_HAS_NEON)
@@ -35,9 +72,44 @@ const char* simd_tier_name(SimdTier tier) noexcept {
     return "unknown";
 }
 
+EncoderConfig compact_retrieval_config() {
+    EncoderConfig cfg;
+    cfg.ngram_mode = NGramMode::CharAndWord;
+    cfg.ngram_min = 3;
+    cfg.ngram_max = 5;
+    cfg.hash = HashFamily::SplitMix64;
+    cfg.hash_seed = 0xA5A5A5A5A5A5A5A5ULL;
+    cfg.text_normalization = TextNormalization::AsciiLower;
+    cfg.char_ngram_scope = CharNGramScope::WordBounded;
+    cfg.feature_weighting = FeatureWeighting::Raw;
+    cfg.sketch_weighting = SketchWeighting::Raw;
+    cfg.sketch_dim = 8192;
+    cfg.output_dim = 384;
+    cfg.projection = ProjectionMode::Fwht;
+    cfg.projection_seed = 0xDEADBEEFCAFEBABEULL;
+    cfg.l2_normalize = true;
+    cfg.matryoshka = false;
+    return cfg;
+}
+
+EncoderConfig compact_hashed_idf_retrieval_config(const HashedIdf& idf) {
+    EncoderConfig config = compact_retrieval_config();
+    if (idf.hash_dim() != 65'536 || idf.scope() != HashedIdfScope::All || !idf.compatible(config))
+        throw std::invalid_argument(
+            "simeon::compact_hashed_idf_retrieval_config: incompatible IDF artifact");
+    config.hashed_idf = &idf;
+    return config;
+}
+
+EncoderConfig quality_hashed_idf_retrieval_config(const HashedIdf& idf) {
+    EncoderConfig config = compact_hashed_idf_retrieval_config(idf);
+    config.output_dim = 768;
+    return config;
+}
+
 class Encoder::Impl {
 public:
-    explicit Impl(EncoderConfig cfg) : cfg_(cfg) {
+    explicit Impl(EncoderConfig cfg) : cfg_(std::move(cfg)) {
         validate();
 
         has_pmi_ = (cfg_.pmi_rows != nullptr);
@@ -54,6 +126,7 @@ public:
             .ngram_max = cfg_.ngram_max,
             .emit_char = emit_char,
             .emit_word = emit_word,
+            .char_ngram_scope = cfg_.char_ngram_scope,
             .bpe = emit_subword ? cfg_.bpe : nullptr,
         };
 
@@ -94,6 +167,16 @@ public:
     const EncoderConfig& config() const noexcept { return cfg_; }
 
     void encode_one(std::string_view text, float* out) const {
+        thread_local std::string normalized_text;
+        if (cfg_.text_normalization == TextNormalization::AsciiLower) {
+            normalized_text.assign(text);
+            for (char& byte : normalized_text) {
+                if (byte >= 'A' && byte <= 'Z')
+                    byte = static_cast<char>(byte + ('a' - 'A'));
+            }
+            text = normalized_text;
+        }
+
         if (has_pmi_) {
             encode_one_pmi(text, out);
             return;
@@ -101,8 +184,41 @@ public:
         thread_local std::vector<std::int32_t> sketch;
         sketch.assign(cfg_.sketch_dim, 0);
 
-        SketchSink sink(sketch.data(), cfg_.sketch_dim, cfg_.hash_seed, cfg_.hash);
-        tokenize(text, tok_cfg_, sink);
+        if (cfg_.feature_weighting == FeatureWeighting::SqrtTf) {
+            thread_local FeatureCountMap feature_counts;
+            thread_local std::vector<std::int64_t> weighted_sketch;
+            feature_counts.clear();
+            if (text.size() <= std::numeric_limits<std::size_t>::max() / 4) {
+                const std::size_t reserve_hint = text.size() * 4;
+                if (feature_counts.bucket_count() < reserve_hint)
+                    feature_counts.reserve(reserve_hint);
+            }
+            SqrtTfSink sink(feature_counts, cfg_.hash_seed, cfg_.hash);
+            tokenize(text, tok_cfg_, sink);
+
+            weighted_sketch.assign(cfg_.sketch_dim, 0);
+            sink.materialize(weighted_sketch.data(), cfg_.sketch_dim);
+            for (std::uint32_t i = 0; i < cfg_.sketch_dim; ++i) {
+                const auto value = weighted_sketch[i];
+                if (value < std::numeric_limits<std::int32_t>::min() ||
+                    value > std::numeric_limits<std::int32_t>::max()) {
+                    throw std::overflow_error("simeon::Encoder: sqrt-TF sketch overflow");
+                }
+                sketch[i] = static_cast<std::int32_t>(value);
+            }
+        } else if (cfg_.hashed_idf != nullptr) {
+            HashedIdfSink sink(sketch.data(), cfg_.sketch_dim, cfg_.hash_seed, cfg_.hash,
+                               *cfg_.hashed_idf);
+            tokenize(text, tok_cfg_, sink);
+        } else {
+            SketchSink sink(sketch.data(), cfg_.sketch_dim, cfg_.hash_seed, cfg_.hash);
+            tokenize(text, tok_cfg_, sink);
+        }
+
+        if (cfg_.sketch_weighting == SketchWeighting::SignedSqrt) {
+            for (std::int32_t& value : sketch)
+                value = signed_sqrt_fixed(value);
+        }
 
         if (has_projection_) {
             projection_->apply(sketch.data(), out);
@@ -128,6 +244,55 @@ public:
     }
 
 private:
+    struct FeatureCounts {
+        std::uint32_t half_weight = 0;
+        std::uint32_t full_weight = 0;
+    };
+    using FeatureCountMap = std::unordered_map<std::uint64_t, FeatureCounts>;
+
+    struct SqrtTfSink final : public NGramEmitter {
+        FeatureCountMap& counts;
+        std::uint64_t seed;
+        HashFamily family;
+
+        SqrtTfSink(FeatureCountMap& c, std::uint64_t s, HashFamily f)
+            : counts(c), seed(s), family(f) {}
+
+        void on_token(std::string_view token, float weight) override {
+            const std::uint64_t h = hash64(token, seed, family);
+            auto& count = counts[h];
+            const auto magnitude = static_cast<std::int32_t>(weight * 2.0f + 0.5f);
+            if (magnitude == 1) {
+                if (count.half_weight == std::numeric_limits<std::uint32_t>::max())
+                    throw std::overflow_error("simeon::Encoder: feature TF overflow");
+                ++count.half_weight;
+            } else if (magnitude == 2) {
+                if (count.full_weight == std::numeric_limits<std::uint32_t>::max())
+                    throw std::overflow_error("simeon::Encoder: feature TF overflow");
+                ++count.full_weight;
+            } else {
+                throw std::invalid_argument("simeon::Encoder: unsupported token weight");
+            }
+        }
+
+        void materialize(std::int64_t* sketch, std::uint32_t dim) const {
+            for (const auto& [h, count] : counts) {
+                std::int64_t magnitude = 0;
+                if (count.half_weight != 0) {
+                    magnitude += static_cast<std::int64_t>(
+                        integer_sqrt(static_cast<std::uint64_t>(count.half_weight) << 20));
+                }
+                if (count.full_weight != 0) {
+                    magnitude += 2 * static_cast<std::int64_t>(integer_sqrt(
+                                         static_cast<std::uint64_t>(count.full_weight) << 20));
+                }
+                const std::uint32_t bucket = sketch_bucket(h, dim);
+                const std::int64_t sign = ((h >> 63) & 1ULL) ? -1 : 1;
+                sketch[bucket] += sign * magnitude;
+            }
+        }
+    };
+
     struct PmiSumSink final : public NGramEmitter {
         const PmiEmbeddings* emb;
         float* out;
@@ -179,7 +344,7 @@ private:
 
         void on_token(std::string_view token, float weight) override {
             const std::uint64_t h = hash64(token, seed, family);
-            const std::uint32_t bucket = static_cast<std::uint32_t>(h) % dim;
+            const std::uint32_t bucket = sketch_bucket(h, dim);
             const std::int32_t sign = ((h >> 63) & 1ULL) ? -1 : +1;
             // Integer-weighted count-sketch: char n-grams weight=1.0 → ±2, word tokens
             // weight=0.5 → ±1. Keeps the sketch deterministic int32 across platforms.
@@ -188,9 +353,73 @@ private:
         }
     };
 
+    struct HashedIdfSink final : public NGramEmitter {
+        std::int32_t* data;
+        std::uint32_t dim;
+        std::uint64_t seed;
+        HashFamily family;
+        const HashedIdf& idf;
+
+        HashedIdfSink(std::int32_t* d, std::uint32_t n, std::uint64_t s, HashFamily f,
+                      const HashedIdf& weights)
+            : data(d), dim(n), seed(s), family(f), idf(weights) {}
+
+        void on_token(std::string_view token, float weight) override {
+            const std::uint64_t h = hash64(token, seed, family);
+            const std::uint32_t bucket = sketch_bucket(h, dim);
+            const std::int64_t sign = ((h >> 63) & 1ULL) ? -1 : 1;
+            const std::int64_t base = static_cast<std::int64_t>(weight * 2.0f + 0.5f);
+            const std::int64_t updated =
+                static_cast<std::int64_t>(data[bucket]) + sign * base * idf.weight_q10(h, weight);
+            if (updated < std::numeric_limits<std::int32_t>::min() ||
+                updated > std::numeric_limits<std::int32_t>::max())
+                throw std::overflow_error("simeon::Encoder: hashed-IDF sketch overflow");
+            data[bucket] = static_cast<std::int32_t>(updated);
+        }
+    };
+
     void validate() const {
         const bool has_pmi = cfg_.pmi_rows != nullptr;
+        const bool has_idf = cfg_.hashed_idf != nullptr;
+        if (static_cast<std::uint8_t>(cfg_.ngram_mode) >
+                static_cast<std::uint8_t>(NGramMode::CharSubword) ||
+            static_cast<std::uint8_t>(cfg_.hash) >
+                static_cast<std::uint8_t>(HashFamily::MixedTabulation) ||
+            static_cast<std::uint8_t>(cfg_.projection) >
+                static_cast<std::uint8_t>(ProjectionMode::Fwht) ||
+            static_cast<std::uint8_t>(cfg_.text_normalization) >
+                static_cast<std::uint8_t>(TextNormalization::AsciiLower) ||
+            static_cast<std::uint8_t>(cfg_.char_ngram_scope) >
+                static_cast<std::uint8_t>(CharNGramScope::WordBounded) ||
+            static_cast<std::uint8_t>(cfg_.feature_weighting) >
+                static_cast<std::uint8_t>(FeatureWeighting::SqrtTf) ||
+            static_cast<std::uint8_t>(cfg_.sketch_weighting) >
+                static_cast<std::uint8_t>(SketchWeighting::SignedSqrt)) {
+            throw std::invalid_argument("simeon::Encoder: invalid enum value");
+        }
+        if (cfg_.feature_weighting != FeatureWeighting::Raw &&
+            cfg_.sketch_weighting != SketchWeighting::Raw) {
+            throw std::invalid_argument(
+                "simeon::Encoder: feature_weighting and sketch_weighting cannot both be non-raw");
+        }
+        if (has_idf) {
+            if (has_pmi)
+                throw std::invalid_argument(
+                    "simeon::Encoder: hashed_idf and pmi_rows are mutually exclusive");
+            if (cfg_.feature_weighting != FeatureWeighting::Raw ||
+                cfg_.sketch_weighting != SketchWeighting::Raw)
+                throw std::invalid_argument(
+                    "simeon::Encoder: hashed_idf requires raw feature and sketch weighting");
+            if (!cfg_.hashed_idf->compatible(cfg_))
+                throw std::invalid_argument("simeon::Encoder: hashed_idf does not match encoder "
+                                            "tokenization/hash identity");
+        }
         if (has_pmi) {
+            if (cfg_.feature_weighting != FeatureWeighting::Raw ||
+                cfg_.sketch_weighting != SketchWeighting::Raw) {
+                throw std::invalid_argument(
+                    "simeon::Encoder: non-raw weighting is incompatible with pmi_rows");
+            }
             if (cfg_.projection != ProjectionMode::None) {
                 throw std::invalid_argument(
                     "simeon::Encoder: pmi_rows requires projection == None");
@@ -221,8 +450,9 @@ private:
                     "simeon::Encoder: matryoshka requires projection != None (or pmi_rows)");
             }
         }
-        if (cfg_.matryoshka && cfg_.matryoshka_weights.empty() && !(cfg_.matryoshka_decay > 0.0f)) {
-            throw std::invalid_argument("simeon::Encoder: matryoshka_decay must be > 0");
+        if (cfg_.matryoshka && cfg_.matryoshka_weights.empty() &&
+            (!(cfg_.matryoshka_decay > 0.0f) || !std::isfinite(cfg_.matryoshka_decay))) {
+            throw std::invalid_argument("simeon::Encoder: matryoshka_decay must be finite and > 0");
         }
         if (cfg_.matryoshka && !cfg_.matryoshka_weights.empty()) {
             std::uint32_t expected;
@@ -267,7 +497,7 @@ void matryoshka_prefix_normalize(float* vec, std::uint32_t prefix_dim) noexcept 
     simd::l2_normalize(vec, prefix_dim);
 }
 
-Encoder::Encoder(EncoderConfig cfg) : impl_(std::make_unique<Impl>(cfg)) {}
+Encoder::Encoder(EncoderConfig cfg) : impl_(std::make_unique<Impl>(std::move(cfg))) {}
 Encoder::~Encoder() = default;
 Encoder::Encoder(Encoder&&) noexcept = default;
 Encoder& Encoder::operator=(Encoder&&) noexcept = default;

@@ -22,6 +22,7 @@ simeon_tests = {
   'test_query_router': 'test_query_router.cpp',
   'test_query_router_post_retrieval': 'test_query_router_post_retrieval.cpp',
   'test_pmi': 'test_pmi.cpp',
+  'test_hashed_idf': 'test_hashed_idf.cpp',
   'test_prf': 'test_prf.cpp',
   'test_sdm': 'test_sdm.cpp',
   'test_concept_mining': 'test_concept_mining.cpp',

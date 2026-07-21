@@ -259,6 +259,36 @@ void test_encoder_pmi_projection_conflict_throws() {
     assert(threw);
 }
 
+void test_encoder_pmi_sketch_weighting_conflict_throws() {
+    auto docs = build_synonym_corpus();
+    auto seed = view_of(docs);
+    auto emb = PmiEmbeddings::learn(std::span<const std::string_view>(seed), default_pmi_cfg());
+
+    EncoderConfig cfg;
+    cfg.projection = ProjectionMode::None;
+    cfg.output_dim = emb.dim();
+    cfg.pmi_rows = &emb;
+    cfg.sketch_weighting = simeon::SketchWeighting::SignedSqrt;
+
+    bool threw = false;
+    try {
+        Encoder e(cfg);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    assert(threw);
+
+    cfg.sketch_weighting = simeon::SketchWeighting::Raw;
+    cfg.feature_weighting = simeon::FeatureWeighting::SqrtTf;
+    threw = false;
+    try {
+        Encoder e(cfg);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    assert(threw);
+}
+
 void test_encoder_without_pmi_still_works() {
     // Backward-compat: with pmi_rows == nullptr, Encoder behaves as before.
     EncoderConfig cfg;
@@ -293,6 +323,7 @@ int main() {
     test_encoder_pmi_implicit_output_dim_normalizes_config();
     test_encoder_pmi_all_oov_zero_vector();
     test_encoder_pmi_projection_conflict_throws();
+    test_encoder_pmi_sketch_weighting_conflict_throws();
     test_encoder_without_pmi_still_works();
     return 0;
 }

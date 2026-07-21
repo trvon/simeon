@@ -4,9 +4,10 @@
 
 #include "simeon/tokenizer.hpp"
 
+using simeon::CharNGramScope;
 using simeon::NGramEmitter;
-using simeon::TokenizerConfig;
 using simeon::tokenize;
+using simeon::TokenizerConfig;
 
 namespace {
 
@@ -71,7 +72,36 @@ void test_determinism() {
     assert(a.tokens == b.tokens);
 }
 
-}  // namespace
+void test_word_bounded_char_ngrams_add_markers_and_do_not_cross_words() {
+    Collector c;
+    TokenizerConfig cfg{3, 3, true, false};
+    cfg.char_ngram_scope = CharNGramScope::WordBounded;
+    tokenize("ab cd", cfg, c);
+    const std::vector<std::pair<std::string, float>> expected = {
+        {"<ab", 1.0f}, {"ab>", 1.0f}, {"<cd", 1.0f}, {"cd>", 1.0f}};
+    assert(c.tokens == expected);
+}
+
+void test_word_bounded_char_ngrams_preserve_utf8_bytes() {
+    Collector c;
+    TokenizerConfig cfg{3, 3, true, false};
+    cfg.char_ngram_scope = CharNGramScope::WordBounded;
+    const std::string cafe = "caf\xC3\xA9";
+    tokenize(cafe, cfg, c);
+    assert(c.tokens.size() == 5);
+    assert(c.tokens.front().first == "<ca");
+    assert(c.tokens.back().first == std::string("\xC3\xA9>", 3));
+}
+
+void test_word_bounded_char_ngrams_ignore_punctuation_only_input() {
+    Collector c;
+    TokenizerConfig cfg{3, 5, true, false};
+    cfg.char_ngram_scope = CharNGramScope::WordBounded;
+    tokenize("... --- !!!", cfg, c);
+    assert(c.tokens.empty());
+}
+
+} // namespace
 
 int main() {
     test_empty();
@@ -80,5 +110,8 @@ int main() {
     test_word_mode();
     test_mixed();
     test_determinism();
+    test_word_bounded_char_ngrams_add_markers_and_do_not_cross_words();
+    test_word_bounded_char_ngrams_preserve_utf8_bytes();
+    test_word_bounded_char_ngrams_ignore_punctuation_only_input();
     return 0;
 }

@@ -7,6 +7,8 @@
 #include <string_view>
 #include <vector>
 
+#include "simeon/tokenizer.hpp"
+
 namespace simeon {
 
 enum class NGramMode : std::uint8_t {
@@ -23,6 +25,7 @@ enum class NGramMode : std::uint8_t {
 };
 
 class BpeMerges;     // simeon/tokenizer_bpe.hpp
+class HashedIdf;     // simeon/hashed_idf.hpp
 class PmiEmbeddings; // simeon/pmi.hpp
 
 enum class HashFamily : std::uint8_t {
@@ -55,12 +58,38 @@ enum class ProjectionMode : std::uint8_t {
     Fwht,
 };
 
+enum class TextNormalization : std::uint8_t {
+    None,
+    // Fold ASCII A-Z to a-z before tokenization. Non-ASCII bytes are left
+    // unchanged, so this mode is locale-independent and deterministic.
+    AsciiLower,
+};
+
+enum class FeatureWeighting : std::uint8_t {
+    Raw,
+    // Count each distinct 64-bit feature identity, apply sqrt(tf), then add
+    // it to the signed sketch bucket. This keeps collisions linear.
+    SqrtTf,
+};
+
+enum class SketchWeighting : std::uint8_t {
+    Raw,
+    // Apply sign(x) * sqrt(abs(x)) independently to each accumulated
+    // count-sketch bucket before projection. The implementation uses a fixed
+    // common scale, preserving deterministic integer projection inputs.
+    SignedSqrt,
+};
+
 struct EncoderConfig {
     NGramMode ngram_mode = NGramMode::CharOnly;
     std::uint32_t ngram_min = 3;
     std::uint32_t ngram_max = 5;
     HashFamily hash = HashFamily::SplitMix64;
     std::uint64_t hash_seed = 0xA5A5A5A5A5A5A5A5ULL;
+    TextNormalization text_normalization = TextNormalization::None;
+    CharNGramScope char_ngram_scope = CharNGramScope::Text;
+    FeatureWeighting feature_weighting = FeatureWeighting::Raw;
+    SketchWeighting sketch_weighting = SketchWeighting::Raw;
 
     std::uint32_t sketch_dim = 32768;
     std::uint32_t output_dim = 0;
@@ -97,6 +126,12 @@ struct EncoderConfig {
     // simeon/tokenizer_bpe.hpp for the learner.
     const BpeMerges* bpe = nullptr;
 
+    // Caller-owned corpus-adaptive document-frequency weights. The artifact
+    // must have been built for this encoder's exact tokenization/hash identity
+    // and must outlive the encoder. Weights are applied before sketching using
+    // deterministic Q10 fixed point. See simeon/hashed_idf.hpp.
+    const HashedIdf* hashed_idf = nullptr;
+
     // Caller-owned PMI embeddings (training-free word embeddings via
     // shifted positive PMI + randomized SVD; Levy & Goldberg 2014). When
     // non-null the encoder bypasses the sketch + projection pipeline
@@ -108,6 +143,31 @@ struct EncoderConfig {
     // Achlioptas fallback). See simeon/pmi.hpp for the learner.
     const PmiEmbeddings* pmi_rows = nullptr;
 };
+
+// Frozen artifact-free compact retrieval preset selected with the reusable
+// dev/holdout experiment contract. It emits 384 floats using lowercase
+// word-bounded char 3-5 grams plus word features, an 8,192-bucket count
+// sketch, and a fixed FWHT projection. Legacy EncoderConfig defaults remain
+// unchanged so existing embedding identities do not move implicitly.
+EncoderConfig compact_retrieval_config();
+
+// Corpus-adaptive counterpart to compact_retrieval_config(). The caller must
+// build and retain a compatible 65,536-bucket all-feature HashedIdf artifact
+// from the deployment corpus. The artifact is label-free but is fitted state,
+// so this preset is training-free/corpus-adaptive rather than artifact-free.
+EncoderConfig compact_hashed_idf_retrieval_config(const HashedIdf& idf);
+EncoderConfig compact_hashed_idf_retrieval_config(HashedIdf&& idf) = delete;
+EncoderConfig compact_hashed_idf_retrieval_config(const HashedIdf&& idf) = delete;
+
+// Higher-quality corpus-adaptive preset selected by scaling the compact
+// hashed-IDF recipe on development fixtures and freezing one holdout read. It
+// preserves the same 8,192-bucket sketch and 65,536-bucket IDF artifact but
+// retains 768 FWHT coordinates. Vectors are therefore twice the compact size;
+// callers should prefer the compact preset unless the measured quality gain is
+// worth the additional storage and exact-scoring cost.
+EncoderConfig quality_hashed_idf_retrieval_config(const HashedIdf& idf);
+EncoderConfig quality_hashed_idf_retrieval_config(HashedIdf&& idf) = delete;
+EncoderConfig quality_hashed_idf_retrieval_config(const HashedIdf&& idf) = delete;
 
 // Re-normalize the first `prefix_dim` floats of a matryoshka-encoded vector to
 // unit L2 length, in place. Use when extracting a coarse prefix of a vector
