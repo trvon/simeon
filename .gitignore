@@ -1,6 +1,7 @@
 build/
 build-*/
 benchmarks/results/
+experiments/results/
 fixtures/
 .claude/
 *.jsonl

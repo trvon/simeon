@@ -1,0 +1,16 @@
+schema = 1
+name = ci-smoke
+metric_profile = trec-v1
+training_regime = artifact-free
+phase = exploration
+selection_split = dev
+holdout_split = test
+document_block_size = 1
+
+[variant.hash-256]
+kind = encoder
+ngram_mode = char
+ngram_min = 3
+ngram_max = 5
+sketch_dim = 256
+projection = none

@@ -52,6 +52,25 @@ recipe_accuracy_exe = executable('simeon_recipe_accuracy_bench',
   install: false,
 )
 
+# Reusable, manifest-driven exact retrieval instrument. The support layer is
+# shared with a unit-test target; fixtures and result artifacts stay out of CI.
+embedding_experiment_exe = executable('simeon_embedding_experiment',
+  ['embedding_experiment_bench.cpp', 'experiment_support.cpp',
+   'fusion_experiment_support.cpp', 'coordinate_experiment_support.cpp',
+   'family_atlas_experiment_support.cpp'],
+  dependencies: simeon_dep,
+  install: false,
+)
+
+experiment_smoke_manifest = meson.project_source_root() / 'tests/data/experiment_smoke.exp'
+experiment_smoke_fixture = meson.project_source_root() / 'tests/data/experiment_fixture'
+test('simeon_embedding_experiment_smoke', embedding_experiment_exe,
+  args: [experiment_smoke_manifest, '--fixture', experiment_smoke_fixture,
+         '--split', 'dev', '--code-revision', 'ci'],
+  suite: 'simeon',
+  timeout: 30,
+)
+
 # RM1-build microbench: forward-index build_relevance_model vs the reference
 # O(corpus) inverted scan, across corpus scales. Doubles as a bit-identity
 # regression gate (exits non-zero on RM mismatch).

@@ -39,3 +39,28 @@ foreach name, src : simeon_tests
   )
   test(name, exe, suite: 'simeon')
 endforeach
+
+experiment_support_test = executable('test_experiment_support',
+  ['test_experiment_support.cpp', '../benchmarks/experiment_support.cpp',
+   '../benchmarks/fusion_experiment_support.cpp',
+   '../benchmarks/coordinate_experiment_support.cpp',
+   '../benchmarks/family_atlas_experiment_support.cpp'],
+  dependencies: simeon_dep,
+  include_directories: include_directories('../benchmarks'),
+  cpp_args: simeon_test_args,
+)
+test('test_experiment_support', experiment_support_test, suite: 'simeon')
+
+python = import('python').find_installation()
+test('test_prepare_beir_fixture', python,
+  args: [files('test_prepare_beir_fixture.py')],
+  suite: 'simeon',
+)
+
+lean = find_program('lean', required: false)
+if lean.found()
+  test('check_experiment_contract', lean,
+    args: [meson.project_source_root() / 'formal/ExperimentContract.lean'],
+    suite: 'simeon',
+  )
+endif
