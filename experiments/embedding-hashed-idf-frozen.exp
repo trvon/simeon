@@ -1,0 +1,36 @@
+# Frozen after selection on dev manifest fnv1a64:4b312a3d3b1e49eb.
+schema = 1
+name = embedding-hashed-idf-frozen-v1
+description = "Frozen 64K all-feature hashed-IDF compact encoder selected on three dev fixtures"
+metric_profile = trec-v1
+training_regime = corpus-adaptive
+artifact_source = corpus.tsv
+phase = frozen
+selection_split = dev
+holdout_split = test
+selection_manifest = fnv1a64:4b312a3d3b1e49eb
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "Corpus document frequency suppresses ubiquitous lexical features and strengthens discriminative matches without labels"
+evidence_refs = "doi:10.1016/0306-4573(88)90021-0;doi:10.1561/1500000019;doi:10.2172/5698"
+formal_contract = "lean:formal/ExperimentContract.lean"
+
+[variant.hashed-idf-all-64k]
+kind = hashed_idf_encoder
+idf_hash_dim = 65536
+idf_scope = all
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+char_ngram_scope = word_bounded
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false

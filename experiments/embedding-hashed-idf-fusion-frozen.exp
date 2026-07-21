@@ -1,0 +1,39 @@
+# Frozen after selection on dev manifest fnv1a64:1e0dfa1068456354.
+schema = 1
+name = embedding-hashed-idf-fusion-frozen-v1
+description = "Frozen 0.30 hashed-IDF candidate and score contribution to the six-leg WSDM fusion"
+metric_profile = trec-v1
+training_regime = corpus-adaptive
+artifact_source = corpus.tsv
+phase = frozen
+selection_split = dev
+holdout_split = test
+selection_manifest = fnv1a64:1e0dfa1068456354
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "A fixed 0.30 IDF contribution transfers both discriminative candidates and ranking evidence across held-out queries"
+evidence_refs = "doi:10.1145/1076034.1076115;doi:10.1145/1571941.1572114;doi:10.1016/0306-4573(88)90021-0"
+formal_contract = "lean:formal/ExperimentContract.lean"
+
+[variant.combined-w30]
+kind = wsdm_idf_fusion
+idf_weight = 0.30
+idf_candidates = true
+pool_per_leg = 100
+idf_hash_dim = 65536
+idf_scope = all
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+char_ngram_scope = word_bounded
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 768
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false

@@ -1,0 +1,93 @@
+# Isolate which compact feature families benefit from the 64K hashed-IDF artifact.
+schema = 1
+name = embedding-hashed-idf-scope-v1
+description = "Compare all-feature, character-only, and word-only hashed IDF"
+metric_profile = trec-v1
+training_regime = corpus-adaptive
+artifact_source = corpus.tsv
+phase = exploration
+selection_split = dev
+holdout_split = test
+primary_metric = ndcg_at_10
+document_block_size = 128
+hypothesis = "IDF gains come from suppressing ubiquitous character and word features together"
+evidence_refs = "doi:10.1016/0306-4573(88)90021-0;doi:10.1561/1500000019;doi:10.2172/5698"
+formal_contract = "lean:formal/ExperimentContract.lean"
+
+[variant.baseline-word-bounded]
+kind = encoder
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+char_ngram_scope = word_bounded
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.hashed-idf-all-64k]
+kind = hashed_idf_encoder
+idf_hash_dim = 65536
+idf_scope = all
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+char_ngram_scope = word_bounded
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.hashed-idf-char-64k]
+kind = hashed_idf_encoder
+idf_hash_dim = 65536
+idf_scope = char
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+char_ngram_scope = word_bounded
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
+
+[variant.hashed-idf-word-64k]
+kind = hashed_idf_encoder
+idf_hash_dim = 65536
+idf_scope = word
+ngram_mode = char_word
+ngram_min = 3
+ngram_max = 5
+char_ngram_scope = word_bounded
+hash = splitmix64
+hash_seed = 0xA5A5A5A5A5A5A5A5
+text_normalization = ascii_lower
+feature_weighting = raw
+sketch_weighting = raw
+sketch_dim = 8192
+output_dim = 384
+projection = fwht
+projection_seed = 0xDEADBEEFCAFEBABE
+l2_normalize = true
+matryoshka = false
