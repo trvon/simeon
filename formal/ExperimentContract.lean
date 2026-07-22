@@ -37,6 +37,7 @@ inductive EncoderMechanism where
   | fixedFeatureHash
   | fixedProjection
   | fixedScoreFusion
+  | fixedGraphDiffusion
   | fixedCoordinateGate
   | fixedFeaturePartition
   | hashedDocumentFrequency
@@ -54,6 +55,7 @@ def mechanismSource : EncoderMechanism → EvidenceSource
   | .fixedFeatureHash => .fixedAlgorithm
   | .fixedProjection => .fixedAlgorithm
   | .fixedScoreFusion => .fixedAlgorithm
+  | .fixedGraphDiffusion => .fixedAlgorithm
   | .fixedCoordinateGate => .fixedAlgorithm
   | .fixedFeaturePartition => .fixedAlgorithm
   | .hashedDocumentFrequency => .corpusStatistics
@@ -108,6 +110,20 @@ theorem qualityHashedIdfFusionRecipeIsCorpusAdaptive :
 
 theorem qualityHashedIdfFusionRecipeIsNotArtifactFree :
     recipeAllowed .artifactFree qualityHashedIdfFusionRecipe = false := rfl
+
+-- Fragment geometry itself is a fixed, label-free graph computation, but its
+-- candidate pool and blend consume BM25 corpus term statistics. Even with the
+-- fixed hash encoder used by the FFI, the complete reranker is therefore
+-- training-free/corpus-adaptive rather than artifact-free.
+def fixedFragmentGeometryRerankerRecipe : List EncoderMechanism :=
+  [.fixedFeatureHash, .fixedProjection, .corpusTermStatistics,
+   .fixedGraphDiffusion, .fixedScoreFusion]
+
+theorem fixedFragmentGeometryRerankerIsCorpusAdaptive :
+    recipeAllowed .corpusAdaptive fixedFragmentGeometryRerankerRecipe = true := rfl
+
+theorem fixedFragmentGeometryRerankerIsNotArtifactFree :
+    recipeAllowed .artifactFree fixedFragmentGeometryRerankerRecipe = false := rfl
 
 -- Centering/diagonal calibration consumes document-only coordinate moments.
 -- The runtime gate and its frozen thresholds are fixed algorithms, but the

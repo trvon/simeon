@@ -51,6 +51,15 @@ experiment_support_test = executable('test_experiment_support',
 )
 test('test_experiment_support', experiment_support_test, suite: 'simeon')
 
+reranker_experiment_support_test = executable('test_reranker_experiment_support',
+  ['test_reranker_experiment_support.cpp', '../benchmarks/experiment_support.cpp',
+   '../benchmarks/reranker_experiment_support.cpp'],
+  dependencies: simeon_dep,
+  include_directories: include_directories('../benchmarks'),
+  cpp_args: simeon_test_args,
+)
+test('test_reranker_experiment_support', reranker_experiment_support_test, suite: 'simeon')
+
 python = import('python').find_installation()
 test('test_prepare_beir_fixture', python,
   args: [files('test_prepare_beir_fixture.py')],

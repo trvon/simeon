@@ -490,9 +490,10 @@ void validate_training_regime(const Manifest& manifest) {
         const bool adaptive_fusion = variant.kind == "wsdm_idf_fusion";
         const bool adaptive_coordinates = variant.kind == "coordinate_calibrated_idf";
         const bool adaptive_family_atlas = variant.kind == "feature_family_atlas_idf";
-        if (!fixed &&
-            !(found->second == "corpus-adaptive" &&
-              (adaptive || adaptive_fusion || adaptive_coordinates || adaptive_family_atlas)))
+        const bool adaptive_reranker = variant.kind == "fragment_geometry_reranker";
+        if (!fixed && !(found->second == "corpus-adaptive" &&
+                        (adaptive || adaptive_fusion || adaptive_coordinates ||
+                         adaptive_family_atlas || adaptive_reranker)))
             throw std::runtime_error("training_regime '" + found->second +
                                      "' cannot run variant kind '" + variant.kind + "'");
     }

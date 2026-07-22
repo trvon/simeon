@@ -1,0 +1,61 @@
+schema = 1
+name = fragment-geometry-reranker
+metric_profile = trec-v1
+training_regime = corpus-adaptive
+phase = exploration
+selection_split = dev
+holdout_split = test
+query_repeats = 5
+
+# Exact encoder, builder, and float storage used by simeon_ffi_rerank.
+[variant.ffi-v1-graph]
+kind = fragment_geometry_reranker
+encoder_profile = fixed_hash
+builder = rich
+fragment_storage = f32
+pool_size = 100
+alpha = 0.8
+top_fragments_per_doc = 4
+use_phss = true
+phss_criterion = largest_gap_approx
+
+# Query-cost ablation over the same reusable document workspace.
+[variant.ffi-v1-maxsim]
+kind = fragment_geometry_reranker
+encoder_profile = fixed_hash
+builder = rich
+fragment_storage = f32
+pool_size = 100
+alpha = 0.8
+top_fragments_per_doc = 4
+outer_maxsim = true
+doc_scorer = maxsim
+
+# Storage/quality ablation. This has a distinct workspace and reports its own
+# compression time and stored fragment-vector bytes.
+[variant.ffi-v1-graph-bf16]
+kind = fragment_geometry_reranker
+encoder_profile = fixed_hash
+builder = rich
+fragment_storage = bf16
+pool_size = 100
+alpha = 0.8
+top_fragments_per_doc = 4
+use_phss = true
+phss_criterion = largest_gap_approx
+
+# Label-free corpus-adaptive semantic artifact used by the research recipe.
+[variant.pmi-rich-covered]
+kind = fragment_geometry_reranker
+encoder_profile = pmi_word
+pmi_target_rank = 128
+pmi_min_token_count = 5
+pmi_max_vocab_size = 20000
+builder = rich_covered
+fragment_storage = bf16
+top_sentence_fragments = 6
+top_fragments_per_doc = 8
+pool_size = 100
+alpha = 0.8
+use_phss = true
+phss_criterion = largest_gap_approx

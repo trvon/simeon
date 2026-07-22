@@ -46,8 +46,9 @@ std::string manifest_fingerprint(const Manifest& manifest);
 void validate_run_policy(const Manifest& manifest, std::string_view split);
 
 // Artifact-free manifests may contain only fixed encoders. Corpus-adaptive
-// manifests may additionally contain hashed-IDF encoders; evaluation-only
-// state is never accepted by this training-free runner.
+// manifests may additionally contain hashed-IDF encoders and retrieval recipes
+// whose lexical or semantic artifacts consume corpus statistics; evaluation-
+// only state is never accepted by these training-free runners.
 void validate_training_regime(const Manifest& manifest);
 
 struct Qrel {

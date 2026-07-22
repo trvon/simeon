@@ -62,10 +62,28 @@ embedding_experiment_exe = executable('simeon_embedding_experiment',
   install: false,
 )
 
+# Reusable fragment-geometry workbench. It keeps corpus/fragment construction
+# outside the online query loop, pairs latency distributions with qrel quality,
+# and emits the same provenance-bearing JSONL contract as encoder experiments.
+reranker_experiment_exe = executable('simeon_reranker_experiment',
+  ['reranker_experiment_bench.cpp', 'reranker_experiment_support.cpp',
+   'experiment_support.cpp'],
+  dependencies: simeon_dep,
+  install: false,
+)
+
 experiment_smoke_manifest = meson.project_source_root() / 'tests/data/experiment_smoke.exp'
 experiment_smoke_fixture = meson.project_source_root() / 'tests/data/experiment_fixture'
 test('simeon_embedding_experiment_smoke', embedding_experiment_exe,
   args: [experiment_smoke_manifest, '--fixture', experiment_smoke_fixture,
+         '--split', 'dev', '--code-revision', 'ci'],
+  suite: 'simeon',
+  timeout: 30,
+)
+
+reranker_smoke_manifest = meson.project_source_root() / 'tests/data/reranker_experiment_smoke.exp'
+test('simeon_reranker_experiment_smoke', reranker_experiment_exe,
+  args: [reranker_smoke_manifest, '--fixture', experiment_smoke_fixture,
          '--split', 'dev', '--code-revision', 'ci'],
   suite: 'simeon',
   timeout: 30,

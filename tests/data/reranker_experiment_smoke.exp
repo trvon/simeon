@@ -1,0 +1,26 @@
+schema = 1
+name = reranker-ci-smoke
+metric_profile = trec-v1
+training_regime = corpus-adaptive
+phase = exploration
+selection_split = dev
+holdout_split = test
+query_repeats = 2
+
+[variant.ffi-graph]
+kind = fragment_geometry_reranker
+encoder_profile = fixed_hash
+builder = rich
+fragment_storage = f32
+pool_size = 3
+use_phss = true
+phss_criterion = largest_gap_approx
+
+[variant.ffi-maxsim]
+kind = fragment_geometry_reranker
+encoder_profile = fixed_hash
+builder = rich
+fragment_storage = f32
+pool_size = 3
+outer_maxsim = true
+doc_scorer = maxsim
