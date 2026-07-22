@@ -7,6 +7,7 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -15,7 +16,6 @@
 #include "simeon/hasher.hpp"
 #include "simeon/manifold.hpp"
 #include "simeon/pmi.hpp"
-#include "simeon/query_router.hpp"
 #include "simeon/simd.hpp"
 #include "simeon/simeon.hpp"
 #include "simeon/text_rank.hpp"
@@ -84,8 +84,8 @@ inline float dot(const float* a, const float* b, std::size_t n) {
     return ActiveManifold::similarity(a, b, static_cast<std::uint32_t>(n));
 }
 
-inline void dot4(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
-                 float* out4, std::size_t n) {
+[[maybe_unused]] inline void dot4(const float* a, const float* b0, const float* b1, const float* b2,
+                                  const float* b3, float* out4, std::size_t n) {
     const auto dim = static_cast<std::uint32_t>(n);
     if constexpr (requires { ActiveManifold::similarity4(a, b0, b1, b2, b3, out4, dim); }) {
         ActiveManifold::similarity4(a, b0, b1, b2, b3, out4, dim);
@@ -126,12 +126,99 @@ void decompress_bf16(const std::uint16_t* src, std::uint32_t dim, float* dst) {
 // header is defined at the end of this TU and forwards to this one.
 void read_frag_vec_impl(const SemanticFragment& frag, std::uint32_t dim, float* dst) {
     if (!frag.vec.empty()) {
+        if (frag.vec.size() != dim)
+            throw std::invalid_argument("fragment float vector dimension mismatch");
         std::memcpy(dst, frag.vec.data(), dim * sizeof(float));
     } else if (!frag.vec_bf16.empty()) {
+        if (frag.vec_bf16.size() != dim)
+            throw std::invalid_argument("fragment BF16 vector dimension mismatch");
         decompress_bf16(frag.vec_bf16.data(), dim, dst);
     } else {
         std::memset(dst, 0, dim * sizeof(float));
     }
+}
+
+void validate_geometry_config(const Bm25Index& idx, const Encoder& enc,
+                              std::span<const std::vector<SemanticFragment>> doc_frags,
+                              const FragmentGeometryConfig& cfg) {
+    const std::uint32_t dim = enc.output_dim();
+    if (dim == 0)
+        throw std::invalid_argument("fragment geometry requires a non-zero encoder dimension");
+    if (doc_frags.size() != idx.doc_count())
+        throw std::invalid_argument("fragment document count must match BM25 document count");
+    if (cfg.pool_size == 0 || cfg.top_fragments_per_doc == 0)
+        throw std::invalid_argument(
+            "fragment geometry pool and per-document fragment counts must be positive");
+    if (!std::isfinite(cfg.alpha) || cfg.alpha < 0.0f || cfg.alpha > 1.0f)
+        throw std::invalid_argument("fragment geometry alpha must be finite and within [0, 1]");
+    if (!std::isfinite(cfg.attention_scale) || cfg.attention_scale <= 0.0f)
+        throw std::invalid_argument(
+            "fragment geometry attention_scale must be finite and positive");
+    if (!std::isfinite(cfg.phss_confidence_threshold) || cfg.phss_confidence_threshold < 0.0f ||
+        cfg.phss_confidence_threshold > 1.0f)
+        throw std::invalid_argument(
+            "fragment geometry phss_confidence_threshold must be within [0, 1]");
+    if (!std::isfinite(cfg.phss_config.threshold) || cfg.phss_config.threshold < 0.0f)
+        throw std::invalid_argument(
+            "fragment geometry PHSS threshold must be finite and non-negative");
+    if (cfg.graph_prefix_dim > dim)
+        throw std::invalid_argument("fragment geometry graph_prefix_dim exceeds encoder dimension");
+    if (cfg.outer_maxsim &&
+        cfg.doc_scorer_kind == FragmentGeometryConfig::DocScorerKind::SoftMaxSum &&
+        (!std::isfinite(cfg.doc_scorer_softmax_beta) || cfg.doc_scorer_softmax_beta <= 0.0f))
+        throw std::invalid_argument("fragment geometry softmax beta must be finite and positive");
+    if (cfg.outer_maxsim &&
+        cfg.doc_scorer_kind == FragmentGeometryConfig::DocScorerKind::TopKMean &&
+        cfg.doc_scorer_top_k == 0)
+        throw std::invalid_argument("fragment geometry top-K document scorer requires K > 0");
+    if (cfg.csls_k > 0 && (!std::isfinite(cfg.csls_beta) || cfg.csls_beta < 0.0f))
+        throw std::invalid_argument("fragment geometry CSLS beta must be finite and non-negative");
+
+    using DocScorer = FragmentGeometryConfig::DocScorerKind;
+    switch (cfg.doc_scorer_kind) {
+        case DocScorer::MaxSim:
+        case DocScorer::MeanSim:
+        case DocScorer::TopKMean:
+        case DocScorer::SoftMaxSum:
+        case DocScorer::GeoMean:
+            break;
+        default:
+            throw std::invalid_argument("fragment geometry has an unsupported document scorer");
+    }
+    using Criterion = PhssConfig::Criterion;
+    switch (cfg.phss_config.criterion) {
+        case Criterion::LargestGap:
+        case Criterion::LargestGapApprox:
+        case Criterion::MaxPersistence:
+        case Criterion::Elbow:
+            break;
+        default:
+            throw std::invalid_argument("fragment geometry has an unsupported PHSS criterion");
+    }
+
+    if (cfg.dense_pool_size == 0)
+        return;
+    if (cfg.doc_dense_vecs == nullptr || cfg.doc_dense_vecs->size() != doc_frags.size())
+        throw std::invalid_argument(
+            "fragment geometry dense pool requires one vector slot per document");
+    for (const auto& vector : *cfg.doc_dense_vecs) {
+        if (!vector.empty() && vector.size() != dim)
+            throw std::invalid_argument("fragment geometry dense document dimension mismatch");
+    }
+}
+
+std::size_t checked_product(std::size_t lhs, std::size_t rhs, const char* description) {
+    if (lhs == 0 || rhs == 0)
+        return 0;
+    if (rhs > std::numeric_limits<std::size_t>::max() / lhs)
+        throw std::length_error(description);
+    return lhs * rhs;
+}
+
+std::size_t checked_triangle(std::size_t count) {
+    if (count < 2)
+        return 0;
+    return checked_product(count, count - 1, "fragment geometry triangle is too large") / 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -881,12 +968,13 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     if (profile)
         *profile = FragmentGeometryProfile{};
 
+    validate_geometry_config(idx, enc, doc_frags, cfg);
+
     const std::uint32_t nd = static_cast<std::uint32_t>(doc_frags.size());
     const std::uint32_t dim = enc.output_dim();
     const float neg_inf = -std::numeric_limits<float>::infinity();
     std::vector<float> bm25_scores(nd, 0.0f);
     std::vector<float> qvec(dim, 0.0f);
-    const QueryRouter router(idx);
 
     const auto t_bm250 = profile ? Clock::now() : Clock::time_point{};
     idx.score(query, bm25_scores);
@@ -953,7 +1041,8 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
 
     const auto t_gather0 = profile ? Clock::now() : Clock::time_point{};
     std::vector<FragRef> frags;
-    frags.reserve(pool.size() * cfg.top_fragments_per_doc);
+    frags.reserve(checked_product(pool.size(), cfg.top_fragments_per_doc,
+                                  "fragment geometry gather list is too large"));
     for (std::size_t pi = 0; pi < pool.size(); ++pi) {
         const auto did = pool[pi].first;
         const auto limit = std::min<std::size_t>(cfg.top_fragments_per_doc, doc_frags[did].size());
@@ -978,7 +1067,9 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     }
 
     const auto t_white0 = profile ? Clock::now() : Clock::time_point{};
-    std::vector<float> fvecs_raw(frags.size() * dim, 0.0f);
+    const std::size_t fragment_value_count =
+        checked_product(frags.size(), dim, "fragment geometry vector workspace is too large");
+    std::vector<float> fvecs_raw(fragment_value_count, 0.0f);
     // mean=0 / var=1 makes the transform below the identity, i.e. plain
     // L2-normalized cosine (cfg.whiten=false). Per-query whitening overwrites them
     // with the pool-fragment statistics; see FragmentGeometryConfig::whiten.
@@ -1020,7 +1111,7 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
         return scores;
     }
 
-    std::vector<float> fvecs(frags.size() * dim, 0.0f);
+    std::vector<float> fvecs(fragment_value_count, 0.0f);
     for (std::size_t i = 0; i < frags.size(); ++i) {
         float* dst = fvecs.data() + i * dim;
         simd::affine_norm(fvecs_raw.data() + i * dim, mean.data(), var.data(), dst, dim);
@@ -1033,6 +1124,8 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     std::vector<float> qsim(frags.size(), 0.0f);
     for (std::size_t i = 0; i < frags.size(); ++i)
         qsim[i] = dot(wq.data(), fvecs.data() + i * dim, dim);
+    if (profile && !cfg.outer_maxsim)
+        profile->query_attention_us = elapsed_us(t_qatt0, Clock::now());
 
     // Outer MaxSim path — geometry score = aggregate(qsim) per doc, bypassing
     // PHSS+diffusion. Aggregator selected by cfg.doc_scorer_kind: MaxSim |
@@ -1144,6 +1237,9 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
             }
         }
 
+        const auto t_blend0 = profile ? Clock::now() : Clock::time_point{};
+        if (profile)
+            profile->query_attention_us = elapsed_us(t_qatt0, t_blend0);
         for (float& g : geom_pool)
             if (!std::isfinite(g))
                 g = 0.0f;
@@ -1151,13 +1247,19 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
         zscore_inplace(geom_pool);
         for (std::size_t i = 0; i < pool.size(); ++i)
             scores[pool[i].first] = query_alpha * bm_pool[i] + (1.0f - query_alpha) * geom_pool[i];
-        if (profile)
+        if (profile) {
+            profile->blend_us = elapsed_us(t_blend0, Clock::now());
             profile->total_us = elapsed_us(t_total0, Clock::now());
+        }
         return scores;
     }
 
+    if (frags.size() > std::numeric_limits<std::uint32_t>::max())
+        throw std::length_error("fragment geometry exceeds uint32 fragment capacity");
     const std::uint32_t nf = static_cast<std::uint32_t>(frags.size());
-    const std::uint32_t tri_count = nf * (nf - 1) / 2;
+    const std::size_t tri_count = checked_triangle(frags.size());
+    if (tri_count > std::numeric_limits<std::uint32_t>::max())
+        throw std::length_error("fragment geometry triangle exceeds PHSS edge capacity");
     const auto t_pair0 = profile ? Clock::now() : Clock::time_point{};
 
     // Optional prefix-dim graph vectors: copy the leading dims of each
@@ -1168,7 +1270,7 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     std::vector<float> gvecs;
     const float* gbase = fvecs.data();
     if (use_graph_prefix) {
-        gvecs.resize(static_cast<std::size_t>(nf) * gdim);
+        gvecs.resize(checked_product(nf, gdim, "fragment geometry prefix workspace is too large"));
         for (std::uint32_t i = 0; i < nf; ++i) {
             float* dst = gvecs.data() + static_cast<std::size_t>(i) * gdim;
             std::memcpy(dst, fvecs.data() + static_cast<std::size_t>(i) * dim,
@@ -1180,7 +1282,7 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
 
     std::vector<float> sims_tri(tri_count);
     PhssStats sims_stats;
-    sims_stats.count = tri_count;
+    sims_stats.count = static_cast<std::uint32_t>(tri_count);
     float sims_min = std::numeric_limits<float>::infinity();
     float sims_max = -std::numeric_limits<float>::infinity();
     // Rows are processed in pairs so the 2x4 kernel can share each b-row load
@@ -1199,8 +1301,10 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     for (std::uint32_t i = 0; i + 2 <= nf; i += 2) {
         const float* vi0 = gbase + static_cast<std::size_t>(i) * gdim;
         const float* vi1 = gbase + static_cast<std::size_t>(i + 1) * gdim;
-        float* row0 = sims_tri.data() + static_cast<std::size_t>(i) * (2 * nf - i - 1) / 2;
-        float* row1 = sims_tri.data() + static_cast<std::size_t>(i + 1) * (2 * nf - i - 2) / 2;
+        float* row0 = sims_tri.data() +
+                      static_cast<std::size_t>(i) * (2 * static_cast<std::size_t>(nf) - i - 1) / 2;
+        float* row1 = sims_tri.data() + static_cast<std::size_t>(i + 1) *
+                                            (2 * static_cast<std::size_t>(nf) - i - 2) / 2;
         row0[0] = dot(vi0, vi1, gdim);
         std::uint32_t j = i + 2;
         for (; j + 4 <= nf; j += 4) {
@@ -1227,7 +1331,9 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
             return 1.0f;
         if (a > b)
             std::swap(a, b);
-        const std::uint32_t offset = a * (2 * nf - a - 1) / 2 + (b - a - 1);
+        const std::size_t offset =
+            static_cast<std::size_t>(a) * (2 * static_cast<std::size_t>(nf) - a - 1) / 2 +
+            (b - a - 1);
         return sims_tri[offset];
     };
 
@@ -1266,6 +1372,7 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
             profile->query_confidence = query_conf;
     }
 
+    const auto t_qatt1 = profile ? Clock::now() : Clock::time_point{};
     // CSLS-style hubness correction (Conneau et al. 2018; QB-Norm family):
     // a hub fragment sits close to everything — query included — so its raw
     // qsim overstates relevance. Subtract each fragment's mean top-k pairwise
@@ -1288,7 +1395,8 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
             t[p] = s;
         };
         for (std::uint32_t i = 0; i + 1 < nf; ++i) {
-            const float* row = sims_tri.data() + static_cast<std::size_t>(i) * (2 * nf - i - 1) / 2;
+            const float* row = sims_tri.data() + static_cast<std::size_t>(i) *
+                                                     (2 * static_cast<std::size_t>(nf) - i - 1) / 2;
             const std::uint32_t len = nf - i - 1;
             for (std::uint32_t jj = 0; jj < len; ++jj) {
                 offer(i, row[jj]);
@@ -1319,7 +1427,7 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
         mass_sum += mass[i];
     }
     if (profile) {
-        profile->query_attention_us = elapsed_us(t_qatt0, Clock::now());
+        profile->query_attention_us += elapsed_us(t_qatt1, Clock::now());
         profile->phss_used = use_phss_for_graph;
     }
     if (mass_sum <= 0.0f) {
@@ -1351,8 +1459,9 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
         std::vector<std::uint32_t> hits(frags.size());
         const std::uint32_t nfr = static_cast<std::uint32_t>(frags.size());
         for (std::uint32_t i = 0; i < nfr; ++i) {
-            const float* row =
-                sims_tri.data() + static_cast<std::size_t>(i) * (2 * nfr - i - 1) / 2;
+            const float* row = sims_tri.data() + static_cast<std::size_t>(i) *
+                                                     (2 * static_cast<std::size_t>(nfr) - i - 1) /
+                                                     2;
             const std::uint32_t len = nfr - i - 1;
             const std::uint32_t cnt = simd::scan_ge(row, len, phss_selected_scale, hits.data());
             for (std::uint32_t k = 0; k < cnt; ++k)
@@ -1466,7 +1575,14 @@ void compress_fragments_to_bf16(std::span<std::vector<SemanticFragment>> doc_fra
                                 std::uint32_t dim) {
     for (auto& doc : doc_frags) {
         for (auto& frag : doc) {
-            if (frag.vec.empty() || !frag.vec_bf16.empty())
+            if (frag.vec.empty()) {
+                if (!frag.vec_bf16.empty() && frag.vec_bf16.size() != dim)
+                    throw std::invalid_argument("fragment BF16 vector dimension mismatch");
+                continue;
+            }
+            if (frag.vec.size() != dim)
+                throw std::invalid_argument("fragment float vector dimension mismatch");
+            if (!frag.vec_bf16.empty())
                 continue;
             store_vec_bf16(frag.vec.data(), dim, frag.vec_bf16);
             frag.vec.clear();
@@ -1476,6 +1592,8 @@ void compress_fragments_to_bf16(std::span<std::vector<SemanticFragment>> doc_fra
 }
 
 void read_frag_vec(const SemanticFragment& frag, std::uint32_t dim, float* dst) {
+    if (dst == nullptr)
+        throw std::invalid_argument("fragment vector destination must not be null");
     read_frag_vec_impl(frag, dim, dst);
 }
 

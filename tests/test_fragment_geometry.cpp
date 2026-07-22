@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,16 @@ void expect(bool cond, const char* msg) {
     if (!cond) {
         std::fprintf(stderr, "FAIL: %s\n", msg);
         ++g_failures;
+    }
+}
+
+template <class Function> void expect_invalid_argument(Function&& function, const char* msg) {
+    try {
+        function();
+        expect(false, msg);
+    } catch (const std::invalid_argument&) {
+    } catch (...) {
+        expect(false, msg);
     }
 }
 
@@ -133,12 +144,47 @@ void check(bool whiten) {
                 whiten ? 1 : 0, static_cast<double>(scores[kTarget]), best_doc, nd - n_inf, n_inf);
 }
 
+void check_invalid_inputs_fail_closed() {
+    simeon::SemanticFragment malformed;
+    malformed.vec = {1.0f};
+    float destination[2]{};
+    expect_invalid_argument([&] { simeon::read_frag_vec(malformed, 2, destination); },
+                            "short fragment vector is rejected");
+
+    std::vector<std::vector<simeon::SemanticFragment>> malformed_docs(1);
+    malformed_docs[0].push_back(malformed);
+    expect_invalid_argument([&] { simeon::compress_fragments_to_bf16(malformed_docs, 2); },
+                            "short fragment vector cannot be compressed");
+
+    simeon::Bm25Index index;
+    index.add_doc("small validation document");
+    index.finalize();
+    simeon::EncoderConfig encoder_config;
+    encoder_config.sketch_dim = 16;
+    encoder_config.output_dim = 8;
+    encoder_config.projection = simeon::ProjectionMode::AchlioptasSparse;
+    simeon::Encoder encoder(encoder_config);
+    std::vector<std::vector<simeon::SemanticFragment>> valid_docs(1);
+    valid_docs[0].resize(1);
+    valid_docs[0][0].vec.resize(encoder.output_dim());
+    encoder.encode("small validation document", valid_docs[0][0].vec.data());
+    simeon::FragmentGeometryConfig geometry_config;
+    geometry_config.alpha = std::numeric_limits<float>::quiet_NaN();
+    expect_invalid_argument(
+        [&] {
+            (void)simeon::score_fragment_geometry("validation", index, encoder, valid_docs,
+                                                  geometry_config);
+        },
+        "non-finite blend weight is rejected");
+}
+
 } // namespace
 
 int main() {
     std::printf("test_fragment_geometry: planted-relevant doc ranks #1 after rerank\n");
     check(/*whiten=*/true);
     check(/*whiten=*/false);
+    check_invalid_inputs_fail_closed();
     if (g_failures > 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

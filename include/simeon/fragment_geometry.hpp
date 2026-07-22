@@ -286,7 +286,8 @@ std::vector<SemanticFragment> build_doc_semantic_fragments_richcov_bsif_from_pre
 // are set to `-inf`; callers that need candidate-subset fallback should project
 // these scores onto their candidate set and backfill from a lexical baseline.
 // The geometry leg is z-scored and blended with z-scored BM25 pool scores
-// using cfg.alpha.
+// using cfg.alpha. Throws std::invalid_argument when configuration, document
+// counts, or a gathered fragment's stored vector dimension is inconsistent.
 std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Index& idx,
                                            const Encoder& enc,
                                            std::span<const std::vector<SemanticFragment>> doc_frags,
@@ -302,12 +303,14 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
 // After calling, vec_bf16 holds the compressed data and vec is cleared.
 // The geometry scorer decompresses on the fly via read_frag_vec().
 // Halves peak memory for fragment vectors (2× per fragment dim).
+// Every initialized vector must contain exactly `dim` elements.
 void compress_fragments_to_bf16(std::span<std::vector<SemanticFragment>> doc_frags,
                                 std::uint32_t dim);
 
 // Read a fragment's vector into `dst`, decompressing from BF16 if `frag.vec`
 // is empty and `frag.vec_bf16` is populated. `dst` must have space for `dim`
-// floats. If the fragment is uninitialized, `dst` is zero-filled.
+// floats. If the fragment is uninitialized, `dst` is zero-filled. Initialized
+// vectors must contain exactly `dim` elements.
 void read_frag_vec(const SemanticFragment& frag, std::uint32_t dim, float* dst);
 
 } // namespace simeon
