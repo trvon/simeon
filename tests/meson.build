@@ -60,6 +60,14 @@ reranker_experiment_support_test = executable('test_reranker_experiment_support'
 )
 test('test_reranker_experiment_support', reranker_experiment_support_test, suite: 'simeon')
 
+ffi_rerank_test = executable('test_ffi_rerank',
+  ['test_ffi_rerank.cpp', '../ffi/simeon_ffi.cpp'],
+  dependencies: simeon_dep,
+  include_directories: include_directories('../ffi'),
+  cpp_args: simeon_test_args,
+)
+test('test_ffi_rerank', ffi_rerank_test, suite: 'simeon')
+
 python = import('python').find_installation()
 test('test_prepare_beir_fixture', python,
   args: [files('test_prepare_beir_fixture.py')],

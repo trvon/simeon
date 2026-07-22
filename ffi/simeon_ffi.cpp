@@ -59,6 +59,7 @@ SIMEON_FFI_EXPORT int32_t simeon_ffi_rerank(const char* query, int32_t query_len
         std::vector<std::string_view> views;
         views.reserve(static_cast<size_t>(n_docs));
         simeon::Bm25Index idx;
+        idx.reserve_docs(static_cast<size_t>(n_docs));
         for (int32_t i = 0; i < n_docs; ++i) {
             if (docs[i] == nullptr || doc_lens[i] < 0)
                 return 1;
