@@ -263,6 +263,19 @@ void test_compact_retrieval_config_is_frozen_and_deterministic() {
     assert(first == second);
 }
 
+void test_simeon_v1_384_config_is_frozen() {
+    const EncoderConfig cfg = simeon::simeon_v1_384_config();
+    assert(cfg.ngram_mode == NGramMode::CharOnly);
+    assert(cfg.ngram_min == 3);
+    assert(cfg.ngram_max == 5);
+    assert(cfg.sketch_dim == 4096);
+    assert(cfg.output_dim == 384);
+    assert(cfg.projection == ProjectionMode::AchlioptasSparse);
+    assert(cfg.hash_seed == 0xA5A5A5A5A5A5A5A5ULL);
+    assert(cfg.projection_seed == 0xDEADBEEFCAFEBABEULL);
+    assert(cfg.l2_normalize);
+}
+
 void test_word_bounded_char_ngrams_are_opt_in_and_reach_encoder() {
     EncoderConfig legacy = highdim_cfg();
     legacy.ngram_min = 3;
@@ -325,6 +338,7 @@ int main() {
     test_signed_sqrt_sketch_weighting_is_exact_and_projectable();
     test_sqrt_tf_is_applied_before_sketch_collisions();
     test_compact_retrieval_config_is_frozen_and_deterministic();
+    test_simeon_v1_384_config_is_frozen();
     test_word_bounded_char_ngrams_are_opt_in_and_reach_encoder();
     test_invalid_enum_values_are_rejected();
     return 0;

@@ -248,9 +248,7 @@ FragmentRerankerConfig resolve_fragment_reranker_config(const VariantSpec& varia
                                  "'; expected 'fragment_geometry_reranker'");
 
     FragmentRerankerConfig result;
-    result.fixed_encoder.sketch_dim = 4096;
-    result.fixed_encoder.output_dim = 384;
-    result.fixed_encoder.projection = ProjectionMode::AchlioptasSparse;
+    result.fixed_encoder = simeon_v1_384_config();
     VariantSpec encoder_variant = variant;
     encoder_variant.kind = "encoder";
     const bool pmi_parameters_supplied =

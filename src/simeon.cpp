@@ -72,6 +72,26 @@ const char* simd_tier_name(SimdTier tier) noexcept {
     return "unknown";
 }
 
+EncoderConfig simeon_v1_384_config() {
+    EncoderConfig config;
+    config.ngram_mode = NGramMode::CharOnly;
+    config.ngram_min = 3;
+    config.ngram_max = 5;
+    config.hash = HashFamily::SplitMix64;
+    config.hash_seed = 0xA5A5A5A5A5A5A5A5ULL;
+    config.text_normalization = TextNormalization::None;
+    config.char_ngram_scope = CharNGramScope::Text;
+    config.feature_weighting = FeatureWeighting::Raw;
+    config.sketch_weighting = SketchWeighting::Raw;
+    config.sketch_dim = 4096;
+    config.output_dim = 384;
+    config.projection = ProjectionMode::AchlioptasSparse;
+    config.projection_seed = 0xDEADBEEFCAFEBABEULL;
+    config.l2_normalize = true;
+    config.matryoshka = false;
+    return config;
+}
+
 EncoderConfig compact_retrieval_config() {
     EncoderConfig cfg;
     cfg.ngram_mode = NGramMode::CharAndWord;

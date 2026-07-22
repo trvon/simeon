@@ -144,6 +144,12 @@ struct EncoderConfig {
     const PmiEmbeddings* pmi_rows = nullptr;
 };
 
+// Frozen encoder identity exported by the C FFI as `simeon-v1-384`.
+// Every coordinate-defining field is explicit so changes to EncoderConfig
+// defaults cannot silently move persisted vectors into a different space.
+EncoderConfig simeon_v1_384_config();
+inline constexpr std::string_view simeon_v1_384_identity = "simeon-v1-384";
+
 // Frozen artifact-free compact retrieval preset selected with the reusable
 // dev/holdout experiment contract. It emits 384 floats using lowercase
 // word-bounded char 3-5 grams plus word features, an 8,192-bucket count

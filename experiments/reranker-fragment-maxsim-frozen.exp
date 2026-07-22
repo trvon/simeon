@@ -1,0 +1,22 @@
+schema = 1
+name = fragment-maxsim-reranker-frozen
+metric_profile = trec-v1
+training_regime = corpus-adaptive
+phase = frozen
+selection_split = dev
+holdout_split = test
+selection_manifest = fnv1a64:bc96efb80fff9f5b
+query_repeats = 5
+
+# Frozen after fixed-hash MaxSim beat the PHSS graph arm on the SciFact,
+# NFCorpus, and FiQA selection splits under the exploration manifest above.
+[variant.ffi-v1-maxsim]
+kind = fragment_geometry_reranker
+encoder_profile = fixed_hash
+builder = rich
+fragment_storage = f32
+pool_size = 100
+alpha = 0.8
+top_fragments_per_doc = 4
+outer_maxsim = true
+doc_scorer = maxsim

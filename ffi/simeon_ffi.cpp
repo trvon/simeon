@@ -15,14 +15,7 @@ constexpr uint32_t kOutputDim = 384;
 // "simeon-v1-384": pinned configuration. Changing ANY field here changes the
 // vector space — bump the version tag and re-embed the index if you do.
 const simeon::Encoder& encoder() {
-    static const simeon::Encoder enc = [] {
-        simeon::EncoderConfig cfg;
-        cfg.sketch_dim = 4096;
-        cfg.output_dim = kOutputDim;
-        cfg.projection = simeon::ProjectionMode::AchlioptasSparse;
-        // ngram/hash/seed/l2_normalize stay at simeon defaults (deterministic).
-        return simeon::Encoder(cfg);
-    }();
+    static const simeon::Encoder enc(simeon::simeon_v1_384_config());
     return enc;
 }
 
