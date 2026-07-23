@@ -2,6 +2,47 @@
 
 This documents the stable benchmarks shipped with simeon and how to interpret their output.
 
+## Manifest-driven embedding retrieval (`simeon_embedding_experiment`)
+
+Runs exact retrieval for every encoder variant in a versioned `.exp` manifest.
+Unlike the synthetic accuracy smoke, it consumes qrels, fingerprints the fixture
+and manifest, enforces declared dev/holdout policy, and emits one self-describing
+JSONL record per variant.
+
+```sh
+./build/benchmarks/simeon_embedding_experiment \
+  experiments/embedding-foundation.exp \
+  --fixture /path/to/fixture --split dev
+```
+
+See [experimentation.md](experimentation.md) for the fixture schema, metric
+semantics, manifest parameters, result contract, and frozen-holdout workflow.
+The same executable also owns the `wsdm_idf_fusion` provider, which constructs
+the established six-leg union once and replays IDF candidate/score variants.
+It reports candidate recall separately from ranked Recall@100 so a new leg's
+retrieval and ordering effects cannot be conflated.
+
+`coordinate_calibrated_idf` builds one maximum-width hashed-IDF/FWHT workspace,
+measures coordinate utilization, and compares nested prefix charts. It supports
+corpus centering/standardization plus fixed, blended, score-admitted, and
+query-energy-admitted routing. Exact prefix/reference scores are cached so a
+manifest threshold sweep replays policy decisions rather than recomputing the
+corpus matrix.
+
+`feature_family_atlas_idf` gives character and word evidence separate
+hashed-IDF/FWHT charts, enforces an exact combined vector-storage budget, and
+replays fixed block weights. Independent, joint, and corpus-RMS-calibrated
+normalization reveal whether collision-free feature partitions transfer. It
+reports standalone family quality, chart overlap/distortion, family energy,
+and evaluation-only union recall without feeding qrels into the policy.
+
+The provider also supports safe-base residual experiments. `base_only` retains
+the combined hashed-IDF chart; `residual_blend` and `selective` add a separately
+priced family chart using raw cosine, query-wise z-score, or rank RRF. Results
+report the exact deployable dimension total, three IDF artifacts, complete
+research score-cache bytes, base/family metrics, route counts, and policy
+replay time. A rejected selective route returns the base ranking exactly.
+
 ## Microbenchmark (`simeon_microbench`)
 
 Measures encoding throughput. Runs N iterations of the encode pipeline at sketch dims

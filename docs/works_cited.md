@@ -53,6 +53,34 @@ understanding the library's design or citing its evaluation context.
 
 ## Compression and representation
 
+- **McNamee and Mayfield (2004), _Character N-Gram Tokenization for European Language Text Retrieval_.** DOI: [10.1023/B:INRT.0000009441.78971.BE](https://doi.org/10.1023/B:INRT.0000009441.78971.BE)
+  Retrieval evidence for character n-gram tokenization across word forms and
+  languages. Simeon's boundary-marker variant is independently selected and
+  evaluated by its manifest-driven benchmark.
+- **Bojanowski, Grave, Joulin, and Mikolov (2017), _Enriching Word Vectors with Subword Information_.** DOI: [10.1162/tacl_a_00051](https://doi.org/10.1162/tacl_a_00051)
+  Prior use of explicit word-boundary symbols with character n-grams. Simeon
+  reuses the deterministic preprocessing idea only; it does not train the
+  paper's word-vector model.
+- **Salton and Buckley (1988), _Term-weighting approaches in automatic text retrieval_.** DOI: [10.1016/0306-4573(88)90021-0](https://doi.org/10.1016/0306-4573(88)90021-0)
+  Classical evidence for document-frequency-aware vector-space weighting.
+  Simeon's bounded hashed-IDF artifact approximates this signal without a
+  learned vocabulary or relevance labels.
+
+- **Weinberger, Dasgupta, Langford, Smola, and Attenberg (2009), _Feature Hashing for Large Scale Multitask Learning_.** DOI: [10.1145/1553374.1553516](https://doi.org/10.1145/1553374.1553516)
+  Basis for signed feature hashing as a fixed, compact inner-product
+  approximation. Simeon's retrieval behavior is measured independently.
+- **Charikar, Chen, and Farach-Colton (2004), _Finding frequent items in data streams_.** DOI: [10.1016/S0304-3975(03)00400-6](https://doi.org/10.1016/S0304-3975(03)00400-6)
+  Original CountSketch context for signed bucket aggregation.
+- **Ailon and Chazelle (2009), _The Fast Johnson–Lindenstrauss Transform and Approximate Nearest Neighbors_.** DOI: [10.1137/060673096](https://doi.org/10.1137/060673096)
+  Structured fast-projection basis for Simeon's fixed FWHT projection and the
+  promoted compact retrieval preset.
+- **Chisholm and Kolda (1999), _New Term Weighting Formulas for the Vector Space Method in Information Retrieval_.** DOI: [10.2172/5698](https://doi.org/10.2172/5698)
+  Classical vector-space term-weighting context for separating raw occurrence
+  counts from sublinear feature-weighting choices.
+- **Sánchez, Perronnin, Mensink, and Verbeek (2013), _Image Classification with the Fisher Vector: Theory and Practice_.** DOI: [10.1007/s11263-013-0636-x](https://doi.org/10.1007/s11263-013-0636-x)
+  Neighboring evidence for coordinate-wise signed power normalization and its
+  use against repeated-feature burstiness in pooled high-dimensional vectors.
+  Simeon's retrieval effect is independently measured and collision-sensitive.
 - **Jégou, Douze, and Schmid (2011), _Product Quantization for Nearest Neighbor Search_.** DOI: [10.1109/TPAMI.2010.57](https://doi.org/10.1109/TPAMI.2010.57)
   Basis for the PQ/ADC compression path.
 - **Li, Hastie, and Church (2006), _Very sparse random projections_.** DOI: [10.1145/1150402.1150436](https://doi.org/10.1145/1150402.1150436)

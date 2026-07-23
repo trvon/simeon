@@ -1,9 +1,151 @@
 # Research notes
 
-This file records what the retrieval experiments found and which components were
-promoted to the shipped surface. The experiment driver (`bench_vs_reference`) and
-the research-only components it exercised have been retired now that the
-experiments are concluded; the findings below are the durable record.
+This file records what the historical retrieval experiments found and which
+components were promoted to the shipped surface. The old driver
+(`bench_vs_reference`) is retired, but experimentation is not concluded. New
+work uses the versioned, manifest-driven contract in
+[experimentation.md](experimentation.md); findings below remain a historical
+ledger and are not automatically comparable to new `trec-v1` results.
+
+## Reusable experiment foundation
+
+`simeon_embedding_experiment` now provides the first shared experiment provider:
+strict manifests, model-independent fixtures, semantic data/config fingerprints,
+exact retrieval, standard metric semantics, source/SIMD provenance, JSONL
+results, and enforced dev/holdout state. The initial study lives in
+`experiments/embedding-foundation.exp` and separates token-unit changes from
+projection/compression changes.
+
+The intended expansion is provider-based: PMI and other corpus-adaptive
+representations, lexical candidate legs, fragment geometry, fusion, and routing
+should reuse the same fixture, metric, provenance, and holdout contract. See
+[experimentation.md](experimentation.md) for the training-regime taxonomy and
+model-space outline.
+
+The first instrument-driven optimization is opt-in, deterministic ASCII case
+folding before hashing. It improves development nDCG@10 on SciFact, NFCorpus,
+and FiQA in both the 32,768-dimensional and projected 384-dimensional spaces,
+without fitted state. The compact relative gains are 4.75%, 16.96%, and 14.46%
+respectively. The selected compact variant is frozen but has not consumed any
+holdout during that selection; it was later read as the frozen baseline for the
+compact FWHT validation. See the [controlled report](../experiments/reports/2026-07-20-ascii-lower.md)
+for fingerprints, absolute scores, complexity changes, and residual risks.
+
+The next controlled iteration added deterministic signed-square-root weighting
+over accumulated sketch counts. In the 32,768-dimensional lowercase char+word
+space it improves development nDCG@10 by 14.93% on SciFact, 17.06% on NFCorpus,
+and 24.08% on FiQA. It consistently regresses the 4,096-to-384 compact path,
+where the nonlinear transform magnifies bucket collisions, so it remains a
+wide-only opt-in rather than a default. See the
+[weighting report](../experiments/reports/2026-07-20-signed-sqrt.md).
+
+A collision-safe follow-up applied `sqrt(tf)` to distinct feature identities
+before sketch aggregation. That corrected the ordering problem but regressed
+compact nDCG@10 by 12.30–29.29% and was roughly equivalent to the cheaper
+post-sketch transform in the wide space. It remains a replayable experimental
+axis, not a promoted recipe. A later interaction check on the selected 8k FWHT
+geometry also regressed all three dev fixtures, so the old projection was not
+the sole cause. See the
+[negative-result report](../experiments/reports/2026-07-20-feature-sqrt.md).
+
+The first promoted compact geometry recipe is
+`compact_retrieval_config()`: lowercase char 3–5 grams plus word tokens, an
+8,192-bucket signed sketch, and fixed FWHT projection to 384 dimensions. Against
+the previous 4,096-to-384 Achlioptas compact baseline, it improved frozen
+holdout nDCG@10 by 9.40% on SciFact, 4.16% on NFCorpus, and 1.92% on FiQA while
+encoding 3.8–5.0x faster. Legacy defaults stay unchanged so stored embedding
+identities do not move implicitly. See the
+[compact projection report](../experiments/reports/2026-07-20-compact-fwht.md).
+
+The next promoted iteration makes those character grams word-bounded: split on
+ASCII punctuation and whitespace, preserve non-ASCII UTF-8 bytes, wrap each
+word with fixed `<` and `>` markers, and never emit a character gram across a
+word boundary. Relative dev nDCG@10 improved by 11.52% on SciFact, 9.77% on
+NFCorpus, and 22.12% on FiQA. The single frozen holdout read improved by 10.02%,
+8.41%, and 0.04%, respectively; FiQA is effectively flat on the primary metric,
+while recall@100 improved on all three holdouts. Median dev encoding time also
+fell by 0.9–2.7%. The mode is now part of `compact_retrieval_config()`, while
+the generic configuration default remains whole-text to preserve existing
+embedding identities. See the
+[word-boundary report](../experiments/reports/2026-07-20-word-boundaries.md).
+
+The first promoted corpus-adaptive embedding recipe adds a bounded hashed-IDF
+artifact learned from deployment documents only. A 65,536-bucket table occupies
+128 KiB and uses no qrels, pretrained vectors, or gradient fitting. Against the
+word-bounded artifact-free preset, frozen holdout nDCG@10 improves by 25.77% on
+SciFact, 33.06% on NFCorpus, and 57.57% on FiQA; recall@100 also improves on all
+three. Exact scoring and 384-float vector storage are unchanged, while encoding
+cost rises by 12–13% after removing an unnecessary second sketch pass. This is
+exposed separately as `compact_hashed_idf_retrieval_config()` so the artifact-
+free identity remains intact. See the
+[hashed-IDF report](../experiments/reports/2026-07-20-hashed-idf.md).
+
+Scaling only the output geometry shows that the 384-coordinate projection was
+still discarding useful weighted-sketch information. Development nDCG@10 rises
+consistently through 768 dimensions; 1,024 adds small SciFact/NFCorpus gains but
+slightly regresses FiQA and carries materially higher scoring/storage cost. The
+frozen 768-dimensional choice improves test nDCG@10 over the 384-dimensional
+hashed-IDF encoder by 5.13% on SciFact, 4.59% on NFCorpus, and 8.97% on FiQA,
+with recall@100 gains on all three. It is exposed as
+`quality_hashed_idf_retrieval_config()` while the compact identity remains 384
+dimensions. See the
+[dimension-scaling report](../experiments/reports/2026-07-20-hashed-idf-dimensions.md).
+
+The follow-up fusion experiment tested that 768-dimensional encoder as both a
+candidate leg and a z-normalized score leg inside the exact frozen six-leg WSDM
+workbench. Development selected a fixed 0.30 contribution: it was the only
+choice that cleared +0.005 nDCG@10 on all three corpora while increasing
+Recall@100 everywhere. Frozen holdout gains were only +0.0032 SciFact, +0.0016
+NFCorpus, and +0.0029 FiQA, however—all below the repository's promotion gate
+and below the corpus-specific PRF path on SciFact/NFCorpus. The recipe is not
+promoted. The reusable `wsdm_idf_fusion` provider remains because it cleanly
+separates candidate recall from score-fusion quality and amortizes expensive
+corpus evidence across a manifest sweep. See the
+[fusion report](../experiments/reports/2026-07-20-hashed-idf-fusion.md).
+
+The next iteration imported the admission structure from YAMS'
+`RetrievalCoordinates.lean` and asked how the 1,024-dimensional FWHT space is
+actually used. Across the three development corpora, diagonal variance has
+1,021.7–1,022.9 effective coordinates out of 1,024 (99.77–99.89%); individual
+axes are not collapsing. Corpus mean-centering and diagonal standardization
+regress every corpus. Treating 768 as a local chart and 1,024 as its reference
+produces useful uncertainty observations—67.3–83.1% top-100 overlap and
+0.0150–0.0181 mean similarity distortion—but the best routing thresholds are
+corpus-specific and below the promotion gate. A pre-scoring query-energy gate
+also fails to improve either fixed endpoint. Holdout was not opened. The
+reusable `coordinate_calibrated_idf` provider and its cached evidence replay are
+retained; no transform or route is shipped. See the
+[coordinate-space report](../experiments/reports/2026-07-20-coordinate-space.md).
+
+The follow-up treated character and word evidence as the semantically distinct
+charts suggested by that result. The new `feature_family_atlas_idf` provider
+builds separate IDF/FWHT spaces, enforces one 768-float concatenated storage
+budget, and replays fixed weights with independent, joint, or corpus-RMS joint
+normalization. The charts are genuinely complementary—their top-100 overlap is
+only 6–26%, and their union adds up to 0.021 Recall@100 on FiQA. Independent
+normalization improves the per-corpus dev maximum by +0.00509 SciFact and
++0.00386 FiQA, but every split regresses NFCorpus; the winners also select
+different allocations. RMS calibration reaches +0.00493 on FiQA but still
+regresses NFCorpus by at least 0.00489. No fixed recipe transfers, so holdout
+was not opened and the combined 768-dimensional preset remains unchanged. The
+atlas is retained because it makes family complementarity, raw energy (about
+98% character at 512/256), exact storage, and evaluation-only union headroom
+observable. See the [feature-family report](../experiments/reports/2026-07-20-feature-family-atlas.md).
+
+The next iteration kept that combined 768-dimensional chart as a safe base and
+priced a 256-dimensional family chart as a residual, for exactly 1,024 floats
+per document. Raw cosine, query-wise score normalization, rank fusion, and
+label-free admission gates are all replayable from cached evidence. The most
+balanced dev result, a 192-character/64-word residual with 0.15 query-z-score
+weight, improves both nDCG@10 and Recall@100 on all three corpora, but its
+nDCG@10 gains are only +0.00484 SciFact, +0.00094 NFCorpus, and +0.00079 FiQA.
+No policy clears the +0.005 cross-corpus promotion gate; routing thresholds do
+not predict benefit portably, and RRF regresses NFCorpus. The 768-dimensional
+preset therefore remains unchanged and holdout stays unopened. The instrument
+is retained because raw cosine supplies an exact 1,024-dimensional deployment
+geometry, while score-normalized modes explicitly expose their full-corpus
+scoring/cache cost. See the
+[feature-residual report](../experiments/reports/2026-07-20-feature-residual.md).
 
 ## Production surface (shipped retrieval recipes)
 
@@ -308,9 +450,9 @@ two lexical-signal-rich corpora and trails only on the paraphrase-heavy one:
 | FiQA | 0.2512 | 0.3687 | −0.117 |
 
 FiQA (financial QA, short colloquial questions, paraphrase-heavy) is the one
-corpus where a learned model demonstrably achieves what lexical fusion cannot —
-the vocabulary-mismatch regime. The only in-bounds (training-free) semantic
-lever is in-corpus PMI; a whole-doc **PMI-256 dense cosine** leg was screened
+corpus where a learned model demonstrably achieves what the promoted lexical
+fusion stack does not. The semantic lever screened in that pass was in-corpus
+PMI; a whole-doc **PMI-256 dense cosine** leg was screened
 as the strongest variant of the fragment-pooled geometry leg. Result: it is the
 weakest signal in the entire workbench on FiQA (single-feature nDCG@10 **0.0805**
 vs MiniLM 0.3687) and adds nothing in fusion on any corpus (best blend gain
@@ -321,9 +463,21 @@ co-occurrence statistics — they require the broad-world pretraining a learned
 encoder carries and a learning-free system structurally cannot. Higher PMI rank
 cannot recover information the corpus does not contain, so no rank-512 follow-up
 was run. **Conclusion of the precision arc**: learning-free fusion is at or above
-the learned-dense frontier wherever lexical signal carries relevance; the FiQA
-gap is a structural property of the learning-free constraint, not a tuning
-deficit.
+the learned-dense frontier wherever lexical signal carries relevance; PMI does
+not close the vocabulary-mismatch gap.
+
+The later hashed-IDF experiment does not create paraphrase information, but it
+shows that the earlier standalone hashed encoder left substantial lexical
+discrimination unused: FiQA test nDCG@10 rises from 0.0899 to 0.1416 and
+recall@100 from 0.2706 to 0.4043. This closes 18.6% of that encoder's gap to the
+frozen MiniLM reference while remaining below the existing full learning-free
+fusion score of 0.2512. Retaining 768 FWHT coordinates subsequently raises the
+standalone FiQA score to 0.1543 and recall@100 to 0.4330, closing another 5.6%
+of the remaining MiniLM gap. Adding that signal to the full fusion stack later
+produced 0.2541 FiQA nDCG@10, only +0.0029 over the frozen WSDM pair and below
+the promotion gate. The extra candidate recall is real, but the fixed blend
+does not convert enough of it into top-ten precision; a learned-style semantic
+bridge still does not emerge from corpus statistics alone.
 
 ### Engineering: O(corpus) → O(feedback) RM1 build
 
