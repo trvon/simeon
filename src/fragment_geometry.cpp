@@ -80,13 +80,12 @@ float vector_l2_norm(const float* v, std::uint32_t dim) {
 // experiment with hyperbolic / RBF / spherical variants without touching call sites.
 using ActiveManifold = EuclideanCosineManifold;
 
-inline float dot(const float* a, const float* b, std::size_t n) {
-    return ActiveManifold::similarity(a, b, static_cast<std::uint32_t>(n));
+inline float dot(const float* a, const float* b, std::uint32_t dim) {
+    return ActiveManifold::similarity(a, b, dim);
 }
 
 [[maybe_unused]] inline void dot4(const float* a, const float* b0, const float* b1, const float* b2,
-                                  const float* b3, float* out4, std::size_t n) {
-    const auto dim = static_cast<std::uint32_t>(n);
+                                  const float* b3, float* out4, std::uint32_t dim) {
     if constexpr (requires { ActiveManifold::similarity4(a, b0, b1, b2, b3, out4, dim); }) {
         ActiveManifold::similarity4(a, b0, b1, b2, b3, out4, dim);
     } else {
@@ -98,15 +97,14 @@ inline float dot(const float* a, const float* b, std::size_t n) {
 }
 
 inline void dot2x4(const float* a0, const float* a1, const float* b0, const float* b1,
-                   const float* b2, const float* b3, float* out0, float* out1, std::size_t n) {
-    const auto dim = static_cast<std::uint32_t>(n);
+                   const float* b2, const float* b3, float* out0, float* out1, std::uint32_t dim) {
     if constexpr (requires {
                       ActiveManifold::similarity2x4(a0, a1, b0, b1, b2, b3, out0, out1, dim);
                   }) {
         ActiveManifold::similarity2x4(a0, a1, b0, b1, b2, b3, out0, out1, dim);
     } else {
-        dot4(a0, b0, b1, b2, b3, out0, n);
-        dot4(a1, b0, b1, b2, b3, out1, n);
+        dot4(a0, b0, b1, b2, b3, out0, dim);
+        dot4(a1, b0, b1, b2, b3, out1, dim);
     }
 }
 
