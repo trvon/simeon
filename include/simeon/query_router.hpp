@@ -10,18 +10,18 @@
 namespace simeon {
 
 // Router config. Defaults are scifact-tuned; override per corpus by sweeping
-// on a held-out fold (see docs/research.md).
+// on a held-out fold.
 struct RouterConfig {
     // (>) → Bm25SabSmooth. Even one OOV term in the query justifies the
     // SAB n-gram backoff path.
     float oov_threshold = 0.0f;
     // (>) → Bm25Atire. Rare-term-heavy queries are at the BM25 ceiling;
     // SAB's n-gram blend adds noise without lift. Default 3.0 is the
-    // empirically-tuned scifact value (Pass A grid; see docs/router_design.md).
+    // empirically tuned scifact value.
     float high_idf_threshold = 3.0f;
     // (>=) AND-gate on the Atire route alongside high_idf_threshold. Default
     // 0 keeps Step 1e behavior; raise to discourage Atire on short queries
-    // where avg_idf is misleading. See docs/router_design.md "Step 1f".
+    // where avg_idf is misleading.
     std::uint32_t atire_min_terms = 0u;
     // (>=) AND-gate on the Atire route. Default 0 keeps Step 1e behavior;
     // raise to require every term to clear an IDF floor (filters Atire-route

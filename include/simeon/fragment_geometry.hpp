@@ -144,7 +144,7 @@ struct FragmentGeometryConfig {
     // whitened fragments, renormalized to unit length; PMI rows come from a
     // truncated SVD so leading dims carry most of the energy (matryoshka
     // principle). Query attention always uses full dim. Quality-gate per
-    // corpus before enabling (see docs/research.md).
+    // corpus before enabling.
     std::uint32_t graph_prefix_dim = 0;
 };
 

@@ -38,15 +38,14 @@ std::vector<std::pair<std::uint32_t, float>> top_k(std::span<const float> scores
 // Validated cross-fold on nfcorpus vs the production frontier
 // (phssapprox_k100_t8_richcov_gap): +0.0089/+0.0045 dev/test nDCG@10,
 // +0.0109/+0.0013 R@100. Mixed cross-fold on scifact and fiqa —
-// corpus-specific lever, not a universal default. See
-// docs/research.md.
+// corpus-specific lever, not a universal default.
 void score_bm25_variants_rrf(std::span<const Bm25Index* const> variants, std::string_view query,
                              std::span<float> out_scores, float k_rrf = 60.0f);
 
 // Fixed-weight convex combination of z-normalized score legs (Bruch-Gai 2022).
 // Each leg is z-scored over its full span (callers pass pool-restricted
 // vectors), then out[i] = Σ_l weights[l] · z(legs[l])[i]. Validated dev→test
-// on the WSDM(SAB)+WSDM(Atire) pair; see docs/research.md fusion pass.
+// on the WSDM(SAB)+WSDM(Atire) pair.
 void convex_fuse_z(std::span<const std::span<const float>> legs, std::span<const float> weights,
                    std::span<float> out_scores) noexcept;
 

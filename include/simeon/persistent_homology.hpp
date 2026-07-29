@@ -64,7 +64,7 @@ struct PhssConfig {
         // (sorted deaths vs. rank). Uses the point of maximum curvature.
         Elbow,
     };
-    // Default promoted to LargestGapApprox per research findings (see docs/research.md).
+    // Default promoted to LargestGapApprox by recorded benchmark evidence.
     // Equal-or-better nDCG@10 on richcov across 3/3 corpora at ~2× QPS vs
     // the heavy LargestGap path.
     Criterion criterion = Criterion::LargestGapApprox;

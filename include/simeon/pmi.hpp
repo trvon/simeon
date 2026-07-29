@@ -69,7 +69,7 @@ public:
 
     // Spectral tempering: scale dimension d by sd_d^(-alpha), sd over vocab
     // rows. alpha=0 no-op (energy-concentrated SVD coordinates), alpha=1
-    // equalizes per-dim variance. Research knob; see docs/research.md.
+    // equalizes per-dim variance.
     void temper_spectrum(float alpha);
 
     std::uint32_t dim() const noexcept { return dim_; }

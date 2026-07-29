@@ -383,7 +383,7 @@ void test_subword_aware_smooth_blends_exact_and_ngram() {
 }
 
 // Cross-fold-validated long-doc → AtireLTD α=0.7 recommendation per
-// docs/research/plan1_trec_covid_results.md.
+// TREC-COVID evaluation fixture.
 void test_corpus_class_recommendation_long_doc_picks_ltd() {
     [[maybe_unused]] const auto rec = simeon::recommend_recipe_by_avg_dl(290.0f);
     assert(rec.variant == Bm25Variant::AtireLTD);

@@ -58,7 +58,7 @@ flowchart LR
 
 - Good fit: first-stage recall, lexical+dense fusion, model-free or on-device retrieval.
 - Not good fit: paraphrase or semantic equivalence. Not drop-in replacement for MiniLM-class bi-encoder.
-- Benchmarks, router notes, ablations, and negative results live in [docs/research.md](docs/research.md).
+- Recorded benchmark results live in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Build
 
@@ -105,9 +105,7 @@ Public headers:
 ## Docs
 
 - Build: [docs/build.md](docs/build.md)
-- Reusable experiments: [docs/experimentation.md](docs/experimentation.md)
-- Research notes: [docs/research.md](docs/research.md)
-- Works cited: [docs/works_cited.md](docs/works_cited.md)
+- Benchmarks: [docs/benchmarks.md](docs/benchmarks.md)
 
 ## Status
 
@@ -116,7 +114,7 @@ Public headers:
 
 ## Citation
 
-Cite software via [CITATION.cff](CITATION.cff). Use [docs/research.md](docs/research.md) for claim-to-document mapping.
+Cite software via [CITATION.cff](CITATION.cff).
 
 ## License
 

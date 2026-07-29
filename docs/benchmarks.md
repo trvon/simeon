@@ -15,9 +15,8 @@ JSONL record per variant.
   --fixture /path/to/fixture --split dev
 ```
 
-See [experimentation.md](experimentation.md) for the fixture schema, metric
-semantics, manifest parameters, result contract, and frozen-holdout workflow.
-The same executable also owns the `wsdm_idf_fusion` provider, which constructs
+The executable reports its fixture identity, manifest identity, metrics, and
+split policy in each result row. It also owns the `wsdm_idf_fusion` provider, which constructs
 the established six-leg union once and replays IDF candidate/score variants.
 It reports candidate recall separately from ranked Recall@100 so a new leg's
 retrieval and ordering effects cannot be conflated.
@@ -95,7 +94,7 @@ Throughput benchmark for the TextRank sentence ranker on synthetic documents.
 `simeon_profile_fragment_geometry`, richcov builder, mode=approx, 50 queries ×
 5 iters, Apple Silicon (arm64/NEON), mean µs per query. Differential signals
 (`phss_scale_mean`, `graph_edges_mean`) identical before/after on every
-fixture × mode; see research.md for mechanism.
+fixture × mode.
 
 | Phase | SciFact before | pass 1 | pass 2 | NFCorpus before | pass 1 | pass 2 |
 |---|---|---|---|---|---|---|
@@ -135,9 +134,3 @@ nDCG@10, `simeon_recipe_accuracy_bench`, standalone pure-geometry leg
 
 Fusion contribution stays within the ±0.005 dev gate — promoted fusion config
 unchanged; csls is an opt-in knob for the standalone geometry rerank path.
-
-## Research outcomes
-
-See [research.md](research.md) for the full research summary including:
-- Which sweeps produced gains and were promoted to production
-- Which paths were negative and why
