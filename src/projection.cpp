@@ -294,6 +294,25 @@ float Projection::entry(std::uint32_t row, std::uint32_t col) const {
 }
 
 void Projection::apply(const std::int32_t* sketch, float* out) const {
+    if (sketch == nullptr)
+        throw std::invalid_argument("Projection::apply: input must not be null");
+    if (out == nullptr)
+        throw std::invalid_argument("Projection::apply: output must not be null");
+    applyUnchecked(std::span<const std::int32_t>(sketch, sketch_dim_),
+                   std::span<float>(out, output_dim_));
+}
+
+void Projection::apply(std::span<const std::int32_t> sketch, std::span<float> out) const {
+    if (sketch.size() != sketch_dim_) {
+        throw std::invalid_argument("Projection::apply: sketch span size must equal sketch_dim");
+    }
+    if (out.size() != output_dim_) {
+        throw std::invalid_argument("Projection::apply: output span size must equal output_dim");
+    }
+    applyUnchecked(sketch, out);
+}
+
+void Projection::applyUnchecked(std::span<const std::int32_t> sketch, std::span<float> out) const {
     if (mode_ == ProjectionMode::None) {
         for (std::uint32_t i = 0; i < sketch_dim_; ++i) {
             out[i] = static_cast<float>(sketch[i]);

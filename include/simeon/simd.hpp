@@ -1,10 +1,19 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
+#include <span>
+#include <stdexcept>
 
 #include "simeon/simeon.hpp"
 
 namespace simeon::simd {
+
+// The tier-specific pointer functions below are unchecked hot kernels. For
+// non-zero n, every input and output pointer must address the documented
+// number of elements. Debug builds assert these contracts at kernel entry.
+// Library consumers should prefer the sized dispatcher overloads at the end
+// of this header; they validate once before entering a selected kernel.
 
 // L2-normalize in place. Returns the inverse norm actually applied, or 0 if the input was zero.
 float l2_normalize_scalar(float* v, std::uint32_t n) noexcept;
@@ -387,6 +396,105 @@ inline void bf16_unpack(const std::uint16_t* src, float* dst, std::uint32_t n) n
             bf16_unpack_scalar(src, dst, n);
             return;
     }
+}
+
+namespace detail {
+
+inline std::uint32_t checked_count(std::size_t size) {
+    if (size > std::numeric_limits<std::uint32_t>::max())
+        throw std::invalid_argument("SIMD span size exceeds uint32 capacity");
+    return static_cast<std::uint32_t>(size);
+}
+
+inline void require_size(std::size_t actual, std::size_t expected) {
+    if (actual != expected)
+        throw std::invalid_argument("SIMD span sizes must match");
+}
+
+inline void require_output4(std::span<float> output) {
+    if (output.size() != 4)
+        throw std::invalid_argument("SIMD blocked-dot output span must contain four floats");
+}
+
+} // namespace detail
+
+inline float l2_normalize(std::span<float> values) {
+    return l2_normalize(values.data(), detail::checked_count(values.size()));
+}
+
+inline float dot(std::span<const float> a, std::span<const float> b) {
+    detail::require_size(b.size(), a.size());
+    return dot(a.data(), b.data(), detail::checked_count(a.size()));
+}
+
+inline void dot4(std::span<const float> a, std::span<const float> b0, std::span<const float> b1,
+                 std::span<const float> b2, std::span<const float> b3, std::span<float> output) {
+    detail::require_size(b0.size(), a.size());
+    detail::require_size(b1.size(), a.size());
+    detail::require_size(b2.size(), a.size());
+    detail::require_size(b3.size(), a.size());
+    detail::require_output4(output);
+    dot4(a.data(), b0.data(), b1.data(), b2.data(), b3.data(), output.data(),
+         detail::checked_count(a.size()));
+}
+
+inline void dot2x4(std::span<const float> a0, std::span<const float> a1, std::span<const float> b0,
+                   std::span<const float> b1, std::span<const float> b2, std::span<const float> b3,
+                   std::span<float> out0, std::span<float> out1) {
+    detail::require_size(a1.size(), a0.size());
+    detail::require_size(b0.size(), a0.size());
+    detail::require_size(b1.size(), a0.size());
+    detail::require_size(b2.size(), a0.size());
+    detail::require_size(b3.size(), a0.size());
+    detail::require_output4(out0);
+    detail::require_output4(out1);
+    dot2x4(a0.data(), a1.data(), b0.data(), b1.data(), b2.data(), b3.data(), out0.data(),
+           out1.data(), detail::checked_count(a0.size()));
+}
+
+inline void range(std::span<const float> values, float& out_min, float& out_max) {
+    range(values.data(), detail::checked_count(values.size()), &out_min, &out_max);
+}
+
+inline std::uint32_t scan_ge(std::span<const float> values, float threshold,
+                             std::span<std::uint32_t> output) {
+    if (output.size() < values.size())
+        throw std::invalid_argument("SIMD threshold output span is smaller than input");
+    return scan_ge(values.data(), detail::checked_count(values.size()), threshold, output.data());
+}
+
+inline void add_vec(std::span<float> destination, std::span<const float> source) {
+    detail::require_size(source.size(), destination.size());
+    add_vec(destination.data(), source.data(), detail::checked_count(destination.size()));
+}
+
+inline void scale_vec(std::span<float> destination, std::span<const float> weights) {
+    detail::require_size(weights.size(), destination.size());
+    scale_vec(destination.data(), weights.data(), detail::checked_count(destination.size()));
+}
+
+inline void saxpy(std::span<float> destination, std::span<const float> source, float alpha) {
+    detail::require_size(source.size(), destination.size());
+    saxpy(destination.data(), source.data(), alpha, detail::checked_count(destination.size()));
+}
+
+inline void affine_norm(std::span<const float> source, std::span<const float> mean,
+                        std::span<const float> standard_deviation, std::span<float> destination) {
+    detail::require_size(mean.size(), source.size());
+    detail::require_size(standard_deviation.size(), source.size());
+    detail::require_size(destination.size(), source.size());
+    affine_norm(source.data(), mean.data(), standard_deviation.data(), destination.data(),
+                detail::checked_count(source.size()));
+}
+
+inline void bf16_pack(std::span<const float> source, std::span<std::uint16_t> destination) {
+    detail::require_size(destination.size(), source.size());
+    bf16_pack(source.data(), destination.data(), detail::checked_count(source.size()));
+}
+
+inline void bf16_unpack(std::span<const std::uint16_t> source, std::span<float> destination) {
+    detail::require_size(destination.size(), source.size());
+    bf16_unpack(source.data(), destination.data(), detail::checked_count(source.size()));
 }
 
 } // namespace simeon::simd

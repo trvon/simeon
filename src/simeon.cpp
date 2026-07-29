@@ -186,7 +186,7 @@ public:
     std::uint32_t output_dim() const noexcept { return output_dim_; }
     const EncoderConfig& config() const noexcept { return cfg_; }
 
-    void encode_one(std::string_view text, float* out) const {
+    void encode_one(std::string_view text, std::span<float> out) const {
         thread_local std::string normalized_text;
         if (cfg_.text_normalization == TextNormalization::AsciiLower) {
             normalized_text.assign(text);
@@ -241,7 +241,7 @@ public:
         }
 
         if (has_projection_) {
-            projection_->apply(sketch.data(), out);
+            projection_->apply(sketch, out);
         } else {
             for (std::uint32_t i = 0; i < cfg_.sketch_dim; ++i) {
                 out[i] = static_cast<float>(sketch[i]);
@@ -249,17 +249,17 @@ public:
         }
 
         if (cfg_.matryoshka) {
-            simd::scale_vec(out, matryoshka_weights_.data(), output_dim_);
+            simd::scale_vec(out.data(), matryoshka_weights_.data(), output_dim_);
         }
 
         if (cfg_.l2_normalize) {
-            simd::l2_normalize(out, output_dim_);
+            simd::l2_normalize(out.data(), output_dim_);
         }
     }
 
-    void encode_many(std::span<const std::string_view> texts, float* out) const {
+    void encode_many(std::span<const std::string_view> texts, std::span<float> out) const {
         for (std::size_t i = 0; i < texts.size(); ++i) {
-            encode_one(texts[i], out + i * output_dim_);
+            encode_one(texts[i], out.subspan(i * output_dim_, output_dim_));
         }
     }
 
@@ -328,7 +328,7 @@ private:
         }
     };
 
-    void encode_one_pmi(std::string_view text, float* out) const {
+    void encode_one_pmi(std::string_view text, std::span<float> out) const {
         for (std::uint32_t i = 0; i < output_dim_; ++i)
             out[i] = 0.0f;
 
@@ -342,14 +342,14 @@ private:
             .emit_word = true,
             .bpe = nullptr,
         };
-        PmiSumSink sink(cfg_.pmi_rows, out, output_dim_);
+        PmiSumSink sink(cfg_.pmi_rows, out.data(), output_dim_);
         tokenize(text, pmi_tok, sink);
 
         if (cfg_.matryoshka) {
-            simd::scale_vec(out, matryoshka_weights_.data(), output_dim_);
+            simd::scale_vec(out.data(), matryoshka_weights_.data(), output_dim_);
         }
         if (cfg_.l2_normalize) {
-            simd::l2_normalize(out, output_dim_);
+            simd::l2_normalize(out.data(), output_dim_);
         }
     }
 
@@ -530,10 +530,39 @@ const EncoderConfig& Encoder::config() const noexcept {
 }
 
 void Encoder::encode(std::string_view text, float* out) const {
+    if (out == nullptr) {
+        throw std::invalid_argument("Encoder::encode: output must not be null");
+    }
+    impl_->encode_one(text, std::span<float>(out, output_dim()));
+}
+
+void Encoder::encode(std::string_view text, std::span<float> out) const {
+    if (out.size() != output_dim()) {
+        throw std::invalid_argument("Encoder::encode: output span size must equal output_dim");
+    }
     impl_->encode_one(text, out);
 }
 
 void Encoder::encode_batch(std::span<const std::string_view> texts, float* out) const {
+    if (!texts.empty() && out == nullptr) {
+        throw std::invalid_argument("Encoder::encode_batch: output must not be null");
+    }
+    const std::size_t dim = output_dim();
+    if (dim != 0 && texts.size() > std::numeric_limits<std::size_t>::max() / dim) {
+        throw std::invalid_argument("Encoder::encode_batch: output size overflow");
+    }
+    impl_->encode_many(texts, std::span<float>(out, texts.size() * dim));
+}
+
+void Encoder::encode_batch(std::span<const std::string_view> texts, std::span<float> out) const {
+    const std::size_t dim = output_dim();
+    if (dim != 0 && texts.size() > std::numeric_limits<std::size_t>::max() / dim) {
+        throw std::invalid_argument("Encoder::encode_batch: output size overflow");
+    }
+    if (out.size() != texts.size() * dim) {
+        throw std::invalid_argument(
+            "Encoder::encode_batch: output span size must equal texts.size() * output_dim");
+    }
     impl_->encode_many(texts, out);
 }
 

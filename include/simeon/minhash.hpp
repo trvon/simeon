@@ -37,7 +37,11 @@ class MinHashEncoder {
 public:
     explicit MinHashEncoder(MinHashConfig cfg) noexcept;
 
+    // Throws std::invalid_argument when out is null.
     void encode(std::string_view text, std::uint32_t* out) const;
+
+    // Sized overload. The output span must contain exactly k() slots.
+    void encode(std::string_view text, std::span<std::uint32_t> out) const;
 
     std::uint32_t k() const noexcept { return cfg_.k; }
     const MinHashConfig& config() const noexcept { return cfg_; }
@@ -48,6 +52,10 @@ private:
 
 // Unbiased Jaccard estimator: matching slots / k. Both signatures must have
 // the same length `k`; mismatched k produces undefined results.
-float jaccard_estimate(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t k) noexcept;
+// A zero-length comparison returns 0. Non-null inputs are required when k > 0.
+float jaccard_estimate(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t k);
+
+// Sized overload. Both signatures must have the same length.
+float jaccard_estimate(std::span<const std::uint32_t> a, std::span<const std::uint32_t> b);
 
 } // namespace simeon

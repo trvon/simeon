@@ -205,11 +205,20 @@ public:
     const EncoderConfig& config() const noexcept;
 
     // Encode one document into `out[0..output_dim())`.
+    // Throws std::invalid_argument when out is null.
     void encode(std::string_view text, float* out) const;
+
+    // Sized overload. The output span must contain exactly output_dim() floats.
+    void encode(std::string_view text, std::span<float> out) const;
 
     // Encode `texts.size()` documents into the row-major output buffer
     // `out[0..texts.size() * output_dim())`.
+    // Throws std::invalid_argument when a non-empty batch has a null output.
     void encode_batch(std::span<const std::string_view> texts, float* out) const;
+
+    // Sized overload. The output span must contain exactly
+    // texts.size() * output_dim() floats.
+    void encode_batch(std::span<const std::string_view> texts, std::span<float> out) const;
 
 private:
     class Impl;

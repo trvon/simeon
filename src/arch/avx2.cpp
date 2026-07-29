@@ -10,6 +10,8 @@
 #include <intrin.h>
 #endif
 
+#include "simd_contract.hpp"
+
 namespace simeon::simd {
 
 namespace {
@@ -28,6 +30,7 @@ inline int ctz_nonzero(unsigned mask) noexcept {
 } // namespace
 
 float l2_normalize_avx2(float* v, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(v, n);
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
     std::uint32_t i = 0;
@@ -58,6 +61,8 @@ float l2_normalize_avx2(float* v, std::uint32_t n) noexcept {
 }
 
 float dot_avx2(const float* a, const float* b, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(a, n);
+    detail::debug_assert_buffer(b, n);
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
     std::uint32_t i = 0;
@@ -80,6 +85,12 @@ float dot_avx2(const float* a, const float* b, std::uint32_t n) noexcept {
 
 void dot4_avx2(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
                float* out4, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(a, n);
+    detail::debug_assert_buffer(b0, n);
+    detail::debug_assert_buffer(b1, n);
+    detail::debug_assert_buffer(b2, n);
+    detail::debug_assert_buffer(b3, n);
+    detail::debug_assert_required(out4);
     // Per-output accumulator structure mirrors dot_avx2 exactly (2 accumulators,
     // 16 floats per iteration, 8-lane scalar reduction, scalar tail) so each
     // output is bit-identical to an independent dot_avx2 call.
@@ -116,6 +127,9 @@ void dot4_avx2(const float* a, const float* b0, const float* b1, const float* b2
 }
 
 void range_avx2(const float* v, std::uint32_t n, float* out_min, float* out_max) noexcept {
+    detail::debug_assert_buffer(v, n);
+    detail::debug_assert_buffer(out_min, n);
+    detail::debug_assert_buffer(out_max, n);
     if (n == 0)
         return;
     if (n < 16) {
@@ -157,6 +171,8 @@ void range_avx2(const float* v, std::uint32_t n, float* out_min, float* out_max)
 
 std::uint32_t scan_ge_avx2(const float* v, std::uint32_t n, float threshold,
                            std::uint32_t* out) noexcept {
+    detail::debug_assert_buffer(v, n);
+    detail::debug_assert_buffer(out, n);
     const __m256 vt = _mm256_set1_ps(threshold);
     std::uint32_t cnt = 0;
     std::uint32_t i = 0;
@@ -177,6 +193,8 @@ std::uint32_t scan_ge_avx2(const float* v, std::uint32_t n, float threshold,
 }
 
 void add_vec_avx2(float* dst, const float* src, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(dst, n);
+    detail::debug_assert_buffer(src, n);
     std::uint32_t i = 0;
     for (; i + 16 <= n; i += 16) {
         _mm256_storeu_ps(dst + i,
@@ -193,6 +211,8 @@ void add_vec_avx2(float* dst, const float* src, std::uint32_t n) noexcept {
 }
 
 void scale_vec_avx2(float* dst, const float* w, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(dst, n);
+    detail::debug_assert_buffer(w, n);
     std::uint32_t i = 0;
     for (; i + 16 <= n; i += 16) {
         _mm256_storeu_ps(dst + i, _mm256_mul_ps(_mm256_loadu_ps(dst + i), _mm256_loadu_ps(w + i)));
@@ -207,6 +227,8 @@ void scale_vec_avx2(float* dst, const float* w, std::uint32_t n) noexcept {
 }
 
 void saxpy_avx2(float* dst, const float* src, float alpha, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(dst, n);
+    detail::debug_assert_buffer(src, n);
     const __m256 va = _mm256_set1_ps(alpha);
     std::uint32_t i = 0;
     for (; i + 16 <= n; i += 16) {
@@ -225,6 +247,10 @@ void saxpy_avx2(float* dst, const float* src, float alpha, std::uint32_t n) noex
 
 void affine_norm_avx2(const float* src, const float* mean, const float* std_dev, float* dst,
                       std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(src, n);
+    detail::debug_assert_buffer(mean, n);
+    detail::debug_assert_buffer(std_dev, n);
+    detail::debug_assert_buffer(dst, n);
     std::uint32_t i = 0;
     for (; i + 16 <= n; i += 16) {
         _mm256_storeu_ps(dst + i, _mm256_div_ps(_mm256_sub_ps(_mm256_loadu_ps(src + i),
@@ -244,6 +270,8 @@ void affine_norm_avx2(const float* src, const float* mean, const float* std_dev,
 }
 
 void bf16_pack_avx2(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(src, n);
+    detail::debug_assert_buffer(dst, n);
     std::uint32_t i = 0;
     for (; i + 16 <= n; i += 16) {
         // >>16 leaves each lane <= 0xFFFF, so the unsigned 32->16 pack never
@@ -268,6 +296,8 @@ void bf16_pack_avx2(const float* src, std::uint16_t* dst, std::uint32_t n) noexc
 }
 
 void bf16_unpack_avx2(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(src, n);
+    detail::debug_assert_buffer(dst, n);
     std::uint32_t i = 0;
     for (; i + 8 <= n; i += 8) {
         const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));

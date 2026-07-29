@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "simeon/simeon.hpp"
@@ -24,7 +25,11 @@ public:
 
     // Compute out[0..output_dim_) = P * sketch.
     // sketch has sketch_dim_ int32 entries; out has output_dim_ float entries.
+    // Throws std::invalid_argument when either pointer is null.
     void apply(const std::int32_t* sketch, float* out) const;
+
+    // Sized overload. Both spans must exactly match the configured dimensions.
+    void apply(std::span<const std::int32_t> sketch, std::span<float> out) const;
 
     // Densified view of the projection matrix for testing. Returns the entry at (row, col),
     // where row indexes the output dim and col indexes the sketch dim.
@@ -66,6 +71,8 @@ private:
     std::vector<float> signs_;
     std::vector<std::uint32_t> sample_;
     float fwht_scale_ = 1.0f; // 1/sqrt(output_dim_)
+
+    void applyUnchecked(std::span<const std::int32_t> sketch, std::span<float> out) const;
 };
 
 } // namespace simeon

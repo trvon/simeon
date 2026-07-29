@@ -14,7 +14,7 @@ namespace {
 constexpr std::uint32_t kEmpty = std::numeric_limits<std::uint32_t>::max();
 
 struct MinSink final : NGramEmitter {
-    std::uint32_t* slots;
+    std::span<std::uint32_t> slots;
     std::uint32_t k;
     HashFamily family;
     std::uint64_t seed;
@@ -43,7 +43,8 @@ struct MinSink final : NGramEmitter {
 // the rotation-attempt index r breaks the cycle. To keep the linear-time
 // guarantee we cap attempts at k and fall back to the seed itself, which
 // can only happen on an all-empty signature (text shorter than n_min).
-void densify(std::uint32_t* slots, std::uint32_t k, std::uint64_t seed) noexcept {
+void densify(std::span<std::uint32_t> slots, std::uint64_t seed) noexcept {
+    const auto k = static_cast<std::uint32_t>(slots.size());
     // Stride: any odd value derived from the seed. Hashing keeps it spread
     // out so consecutive seeds don't produce near-identical strides.
     const std::uint32_t step = static_cast<std::uint32_t>(splitmix64_mix(seed) | 1ULL);
@@ -79,7 +80,17 @@ MinHashEncoder::MinHashEncoder(MinHashConfig cfg) noexcept : cfg_(cfg) {}
 void MinHashEncoder::encode(std::string_view text, std::uint32_t* out) const {
     if (cfg_.k == 0)
         throw std::runtime_error("MinHashEncoder: k must be > 0");
-    std::fill_n(out, cfg_.k, kEmpty);
+    if (out == nullptr)
+        throw std::invalid_argument("MinHashEncoder::encode: output must not be null");
+    encode(text, std::span<std::uint32_t>(out, cfg_.k));
+}
+
+void MinHashEncoder::encode(std::string_view text, std::span<std::uint32_t> out) const {
+    if (cfg_.k == 0)
+        throw std::runtime_error("MinHashEncoder: k must be > 0");
+    if (out.size() != cfg_.k)
+        throw std::invalid_argument("MinHashEncoder::encode: output span size must equal k");
+    std::ranges::fill(out, kEmpty);
 
     MinSink sink{};
     sink.slots = out;
@@ -90,18 +101,29 @@ void MinHashEncoder::encode(std::string_view text, std::uint32_t* out) const {
     const TokenizerConfig tcfg{cfg_.ngram_min, cfg_.ngram_max, true, false};
     tokenize(text, tcfg, sink);
 
-    densify(out, cfg_.k, cfg_.hash_seed);
+    densify(out, cfg_.hash_seed);
 }
 
-float jaccard_estimate(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t k) noexcept {
+float jaccard_estimate(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t k) {
     if (k == 0)
         return 0.0f;
+    if (a == nullptr || b == nullptr)
+        throw std::invalid_argument(
+            "jaccard_estimate: signatures must not be null when k is non-zero");
     std::uint32_t matches = 0;
     for (std::uint32_t i = 0; i < k; ++i) {
         if (a[i] == b[i])
             ++matches;
     }
     return static_cast<float>(matches) / static_cast<float>(k);
+}
+
+float jaccard_estimate(std::span<const std::uint32_t> a, std::span<const std::uint32_t> b) {
+    if (a.size() != b.size())
+        throw std::invalid_argument("jaccard_estimate: signature sizes must match");
+    if (a.size() > std::numeric_limits<std::uint32_t>::max())
+        throw std::invalid_argument("jaccard_estimate: signature size exceeds uint32 capacity");
+    return jaccard_estimate(a.data(), b.data(), static_cast<std::uint32_t>(a.size()));
 }
 
 } // namespace simeon

@@ -7,9 +7,12 @@
 #include <cmath>
 #include <cstring>
 
+#include "simd_contract.hpp"
+
 namespace simeon::simd {
 
 float l2_normalize_neon(float* v, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(v, n);
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
     std::uint32_t i = 0;
@@ -37,6 +40,8 @@ float l2_normalize_neon(float* v, std::uint32_t n) noexcept {
 }
 
 float dot_neon(const float* a, const float* b, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(a, n);
+    detail::debug_assert_buffer(b, n);
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
     std::uint32_t i = 0;
@@ -56,6 +61,12 @@ float dot_neon(const float* a, const float* b, std::uint32_t n) noexcept {
 
 void dot4_neon(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
                float* out4, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(a, n);
+    detail::debug_assert_buffer(b0, n);
+    detail::debug_assert_buffer(b1, n);
+    detail::debug_assert_buffer(b2, n);
+    detail::debug_assert_buffer(b3, n);
+    detail::debug_assert_required(out4);
     // Per-output accumulator structure mirrors dot_neon exactly (2 accumulators,
     // 8 floats per iteration, vaddvq reduction, scalar tail) so each lane is
     // bit-identical to an independent dot_neon call.
@@ -95,6 +106,14 @@ void dot4_neon(const float* a, const float* b0, const float* b1, const float* b2
 void dot2x4_neon(const float* a0, const float* a1, const float* b0, const float* b1,
                  const float* b2, const float* b3, float* out0, float* out1,
                  std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(a0, n);
+    detail::debug_assert_buffer(a1, n);
+    detail::debug_assert_buffer(b0, n);
+    detail::debug_assert_buffer(b1, n);
+    detail::debug_assert_buffer(b2, n);
+    detail::debug_assert_buffer(b3, n);
+    detail::debug_assert_required(out0);
+    detail::debug_assert_required(out1);
     // 16 accumulators (2 per output, mirroring dot_neon) + 4 a-row registers;
     // each b load is shared by both a rows. Every output is bit-identical to
     // an independent dot_neon call.
@@ -166,6 +185,9 @@ void dot2x4_neon(const float* a0, const float* a1, const float* b0, const float*
 }
 
 void range_neon(const float* v, std::uint32_t n, float* out_min, float* out_max) noexcept {
+    detail::debug_assert_buffer(v, n);
+    detail::debug_assert_buffer(out_min, n);
+    detail::debug_assert_buffer(out_max, n);
     if (n == 0)
         return;
     if (n < 8) {
@@ -201,6 +223,8 @@ void range_neon(const float* v, std::uint32_t n, float* out_min, float* out_max)
 
 std::uint32_t scan_ge_neon(const float* v, std::uint32_t n, float threshold,
                            std::uint32_t* out) noexcept {
+    detail::debug_assert_buffer(v, n);
+    detail::debug_assert_buffer(out, n);
     const float32x4_t vt = vdupq_n_f32(threshold);
     std::uint32_t cnt = 0;
     std::uint32_t i = 0;
@@ -225,6 +249,8 @@ std::uint32_t scan_ge_neon(const float* v, std::uint32_t n, float threshold,
 }
 
 void add_vec_neon(float* dst, const float* src, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(dst, n);
+    detail::debug_assert_buffer(src, n);
     std::uint32_t i = 0;
     for (; i + 8 <= n; i += 8) {
         vst1q_f32(dst + i, vaddq_f32(vld1q_f32(dst + i), vld1q_f32(src + i)));
@@ -238,6 +264,8 @@ void add_vec_neon(float* dst, const float* src, std::uint32_t n) noexcept {
 }
 
 void scale_vec_neon(float* dst, const float* w, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(dst, n);
+    detail::debug_assert_buffer(w, n);
     std::uint32_t i = 0;
     for (; i + 8 <= n; i += 8) {
         vst1q_f32(dst + i, vmulq_f32(vld1q_f32(dst + i), vld1q_f32(w + i)));
@@ -251,6 +279,8 @@ void scale_vec_neon(float* dst, const float* w, std::uint32_t n) noexcept {
 }
 
 void saxpy_neon(float* dst, const float* src, float alpha, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(dst, n);
+    detail::debug_assert_buffer(src, n);
     const float32x4_t va = vdupq_n_f32(alpha);
     std::uint32_t i = 0;
     for (; i + 8 <= n; i += 8) {
@@ -266,6 +296,10 @@ void saxpy_neon(float* dst, const float* src, float alpha, std::uint32_t n) noex
 
 void affine_norm_neon(const float* src, const float* mean, const float* std_dev, float* dst,
                       std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(src, n);
+    detail::debug_assert_buffer(mean, n);
+    detail::debug_assert_buffer(std_dev, n);
+    detail::debug_assert_buffer(dst, n);
     std::uint32_t i = 0;
     for (; i + 8 <= n; i += 8) {
         vst1q_f32(dst + i, vdivq_f32(vsubq_f32(vld1q_f32(src + i), vld1q_f32(mean + i)),
@@ -282,6 +316,8 @@ void affine_norm_neon(const float* src, const float* mean, const float* std_dev,
 }
 
 void bf16_pack_neon(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(src, n);
+    detail::debug_assert_buffer(dst, n);
     std::uint32_t i = 0;
     for (; i + 8 <= n; i += 8) {
         const uint32x4_t lo = vreinterpretq_u32_f32(vld1q_f32(src + i));
@@ -296,6 +332,8 @@ void bf16_pack_neon(const float* src, std::uint16_t* dst, std::uint32_t n) noexc
 }
 
 void bf16_unpack_neon(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(src, n);
+    detail::debug_assert_buffer(dst, n);
     std::uint32_t i = 0;
     for (; i + 8 <= n; i += 8) {
         const uint16x8_t v = vld1q_u16(src + i);

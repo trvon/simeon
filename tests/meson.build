@@ -10,6 +10,7 @@ simeon_tests = {
   'test_matryoshka': 'test_matryoshka.cpp',
   'test_encoder': 'test_encoder.cpp',
   'test_simd_parity': 'test_simd_parity.cpp',
+  'test_buffer_contracts': 'test_buffer_contracts.cpp',
   'test_coverage': 'test_coverage.cpp',
   'test_bm25': 'test_bm25.cpp',
   'test_fusion': 'test_fusion.cpp',
