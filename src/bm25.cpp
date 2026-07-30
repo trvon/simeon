@@ -1490,7 +1490,7 @@ void Bm25Index::score_wsdm(std::string_view query, std::span<float> out_scores,
         double idf_sum = 0.0;
         std::size_t n_present = 0;
         for (std::size_t i = 1; i < q_hashes.size(); ++i) {
-            std::uint64_t bh;
+            std::uint64_t bh{};
             if (ordered) {
                 bh = hash_bigram(q_hashes[i - 1], q_hashes[i]);
             } else {

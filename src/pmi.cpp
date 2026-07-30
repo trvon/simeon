@@ -481,7 +481,7 @@ namespace {
 constexpr char kMagic[8] = {'S', 'M', 'E', 'P', 'M', 'I', '0', '1'};
 
 void write_u32(std::string& out, std::uint32_t v) {
-    char bytes[4];
+    char bytes[4]{};
     bytes[0] = static_cast<char>(v & 0xFF);
     bytes[1] = static_cast<char>((v >> 8) & 0xFF);
     bytes[2] = static_cast<char>((v >> 16) & 0xFF);
@@ -490,7 +490,7 @@ void write_u32(std::string& out, std::uint32_t v) {
 }
 
 void write_f32(std::string& out, float v) {
-    std::uint32_t u;
+    std::uint32_t u{};
     std::memcpy(&u, &v, sizeof(u));
     write_u32(out, u);
 }
@@ -504,7 +504,7 @@ std::uint32_t read_u32(const char* p) noexcept {
 
 float read_f32(const char* p) noexcept {
     std::uint32_t u = read_u32(p);
-    float v;
+    float v{};
     std::memcpy(&v, &u, sizeof(v));
     return v;
 }

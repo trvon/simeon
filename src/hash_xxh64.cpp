@@ -24,13 +24,13 @@ inline std::uint64_t rotl64(std::uint64_t x, int r) noexcept {
 }
 
 inline std::uint64_t read64(const std::uint8_t* p) noexcept {
-    std::uint64_t v;
+    std::uint64_t v{};
     std::memcpy(&v, p, sizeof(v));
     return v; // host endian — XXH64 is defined little-endian; correct on x86/arm64.
 }
 
 inline std::uint32_t read32(const std::uint8_t* p) noexcept {
-    std::uint32_t v;
+    std::uint32_t v{};
     std::memcpy(&v, p, sizeof(v));
     return v;
 }
