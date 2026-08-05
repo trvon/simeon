@@ -8,6 +8,7 @@
 
 #include "simeon/bm25.hpp"
 #include "simeon/concept_mining.hpp"
+#include "simeon/detail/concept_index_fingerprint.hpp"
 
 using simeon::Bm25Config;
 using simeon::Bm25Index;
@@ -102,6 +103,8 @@ void test_concept_mining_is_deterministic() {
     auto ca = mine_concepts(fa.idx, std::span<const std::string_view>(fa.docs_view), cfg);
     auto cb = mine_concepts(fb.idx, std::span<const std::string_view>(fb.docs_view), cfg);
     assert(ca.size() == cb.size());
+    assert(simeon::detail::ConceptIndexFingerprint::compute(ca) ==
+           simeon::detail::ConceptIndexFingerprint::compute(cb));
 
     // Walk concepts by a fixed key ("time value") and verify PMI matches.
     const std::uint64_t h_time = fa.idx.hash_term("time");
@@ -167,6 +170,27 @@ void test_concept_weight_zero_recovers_base_bm25_exactly() {
         assert(approx(base[i], fused[i]));
 }
 
+void test_repeated_bigram_postings_are_exact() {
+    Fixture f({
+        "alpha beta alpha beta",
+        "alpha beta gamma",
+        "gamma alpha beta",
+    });
+    ConceptConfig cfg;
+    cfg.min_ttf = 2;
+    cfg.pmi_floor = -10.0f;
+
+    auto concepts = mine_concepts(f.idx, std::span<const std::string_view>(f.docs_view), cfg);
+    const auto alpha = f.idx.hash_term("alpha");
+    const auto beta = f.idx.hash_term("beta");
+    [[maybe_unused]] const auto* entry = concepts.find(ConceptIndex::hash_bigram(alpha, beta));
+    assert(entry != nullptr);
+    assert(entry->total_tf == 4u);
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>> expected{
+        {0u, 2u}, {1u, 1u}, {2u, 1u}};
+    assert(entry->docs == expected);
+}
+
 void test_max_concepts_cap_is_respected() {
     // Build a corpus with many repeated bigrams so several pass the PMI
     // floor, then set max_concepts=2 and verify we keep only 2.
@@ -195,6 +219,7 @@ int main() {
     test_concept_mining_is_deterministic();
     test_query_with_no_matched_concept_yields_base_bm25();
     test_concept_weight_zero_recovers_base_bm25_exactly();
+    test_repeated_bigram_postings_are_exact();
     test_max_concepts_cap_is_respected();
     return 0;
 }

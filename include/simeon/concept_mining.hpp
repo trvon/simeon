@@ -13,6 +13,10 @@
 
 namespace simeon {
 
+namespace detail {
+struct ConceptIndexFingerprint;
+}
+
 struct ConceptConfig {
     std::uint32_t min_ttf = 5;
     float pmi_floor = 2.0f;
@@ -56,6 +60,7 @@ public:
                               const std::function<void(std::uint64_t, float)>& fn) const;
 
 private:
+    friend struct detail::ConceptIndexFingerprint;
     friend ConceptIndex mine_concepts(const Bm25Index& idx, std::span<const std::string_view> docs,
                                       const ConceptConfig& cfg);
 

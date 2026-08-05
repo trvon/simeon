@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -34,6 +35,69 @@ inline float score_atire(float tf, float dl, float idf, float k1, float b, float
     const float denom = tf + k1 * (1.0f - b + b * dl / avg_dl);
     return idf * tf * (k1 + 1.0f) / denom;
 }
+
+// Allocation-stable per-document frequency table. Generation stamps make
+// reset O(unique bigrams), while open addressing preserves first-seen
+// detection without allocating one map node per unique bigram in every doc.
+class DocumentBigramCounts {
+public:
+    void reset(std::size_t expected) {
+        std::size_t capacity = 8;
+        const auto wanted =
+            expected > std::numeric_limits<std::size_t>::max() / 2 ? expected : expected * 2;
+        while (capacity < wanted && capacity <= std::numeric_limits<std::size_t>::max() / 2)
+            capacity *= 2;
+        if (slots_.size() < capacity)
+            slots_.resize(capacity);
+        mask_ = slots_.size() - 1;
+        used_.clear();
+        if (used_.capacity() < expected)
+            used_.reserve(expected);
+        if (++generation_ == 0) {
+            for (auto& slot : slots_)
+                slot.generation = 0;
+            generation_ = 1;
+        }
+    }
+
+    bool increment(std::uint64_t hash) {
+        std::size_t slotIndex = static_cast<std::size_t>(hash) & mask_;
+        while (true) {
+            auto& slot = slots_[slotIndex];
+            if (slot.generation != generation_) {
+                slot.generation = generation_;
+                slot.hash = hash;
+                slot.count = 1;
+                used_.push_back(slotIndex);
+                return true;
+            }
+            if (slot.hash == hash) {
+                ++slot.count;
+                return false;
+            }
+            slotIndex = (slotIndex + 1) & mask_;
+        }
+    }
+
+    template <typename Fn> void for_each(Fn&& fn) const {
+        for (const auto slotIndex : used_) {
+            const auto& slot = slots_[slotIndex];
+            fn(slot.hash, slot.count);
+        }
+    }
+
+private:
+    struct Slot {
+        std::uint64_t hash = 0;
+        std::uint32_t count = 0;
+        std::uint32_t generation = 0;
+    };
+
+    std::vector<Slot> slots_;
+    std::vector<std::size_t> used_;
+    std::size_t mask_ = 0;
+    std::uint32_t generation_ = 0;
+};
 
 } // namespace
 
@@ -129,7 +193,7 @@ ConceptIndex mine_concepts(const Bm25Index& idx, std::span<const std::string_vie
 
     // Scratch buffers reused per doc.
     std::vector<std::uint64_t> words;
-    std::unordered_map<std::uint64_t, std::uint32_t> doc_bgm_tf;
+    DocumentBigramCounts doc_bgm_tf;
 
     // Raw accumulator: concept_hash -> (total_tf, postings).
     struct RawEntry {
@@ -160,14 +224,12 @@ ConceptIndex mine_concepts(const Bm25Index& idx, std::span<const std::string_vie
 
         // Pair each bigram hash with its first-seen (a, b) components in
         // this doc, then roll into per-doc tf.
-        doc_bgm_tf.clear();
+        doc_bgm_tf.reset(words.size() - 1);
         for (std::size_t i = 1; i < words.size(); ++i) {
             const std::uint64_t a = words[i - 1];
             const std::uint64_t b = words[i];
             const std::uint64_t bh = ConceptIndex::hash_bigram(a, b);
-            const std::uint32_t was = doc_bgm_tf[bh];
-            doc_bgm_tf[bh] = was + 1u;
-            if (was == 0u) {
+            if (doc_bgm_tf.increment(bh)) {
                 auto& e = raw[bh];
                 if (e.a_hash == 0 && e.b_hash == 0) {
                     e.a_hash = a;
@@ -175,11 +237,11 @@ ConceptIndex mine_concepts(const Bm25Index& idx, std::span<const std::string_vie
                 }
             }
         }
-        for (const auto& [bh, tf] : doc_bgm_tf) {
+        doc_bgm_tf.for_each([&](std::uint64_t bh, std::uint32_t tf) {
             auto& e = raw[bh];
             e.total_tf += tf;
             e.docs.emplace_back(did, tf);
-        }
+        });
     }
 
     const float avg_bigram_dl =

@@ -43,6 +43,30 @@ text_rank_exe = executable('simeon_text_rank_bench',
   install: false,
 )
 
+# Construction-cost benchmark for PMI concept mining. Reports allocations,
+# elapsed time, RSS, concept count, and a deterministic score-output digest.
+concept_mining_bench_exe = executable('simeon_concept_mining_bench',
+  'concept_mining_bench.cpp',
+  dependencies: simeon_dep,
+  install: false,
+)
+
+concept_mining_alloc_bench_exe = executable('simeon_concept_mining_alloc_bench',
+  'concept_mining_bench.cpp',
+  dependencies: simeon_dep,
+  cpp_args: ['-DSIMEON_TRACK_ALLOCATIONS=1'],
+  install: false,
+)
+
+if host_machine.system() in ['darwin', 'linux']
+  concept_mining_rss_bench_exe = executable('simeon_concept_mining_rss_bench',
+    'concept_mining_bench.cpp',
+    dependencies: [simeon_dep, dependency('threads')],
+    cpp_args: ['-DSIMEON_SAMPLE_RSS=1'],
+    install: false,
+  )
+endif
+
 # Recipe-level accuracy bench: evaluates the promoted retrieval recipes
 # (convex WSDM z-fusion, fused-feedback RM3, fragment geometry) end-to-end
 # against a reference fixture. Needs an out-of-tree fixture dir; no CI test.
