@@ -51,12 +51,16 @@ concept_mining_bench_exe = executable('simeon_concept_mining_bench',
   install: false,
 )
 
-concept_mining_alloc_bench_exe = executable('simeon_concept_mining_alloc_bench',
-  'concept_mining_bench.cpp',
-  dependencies: simeon_dep,
-  cpp_args: ['-DSIMEON_TRACK_ALLOCATIONS=1'],
-  install: false,
-)
+# TSAN supplies strong global new/delete interceptors, so the allocation probe's
+# process-local replacements cannot coexist with a thread-sanitized link.
+if not get_option('b_sanitize').contains('thread')
+  concept_mining_alloc_bench_exe = executable('simeon_concept_mining_alloc_bench',
+    'concept_mining_bench.cpp',
+    dependencies: simeon_dep,
+    cpp_args: ['-DSIMEON_TRACK_ALLOCATIONS=1'],
+    install: false,
+  )
+endif
 
 if host_machine.system() in ['darwin', 'linux']
   concept_mining_rss_bench_exe = executable('simeon_concept_mining_rss_bench',
