@@ -40,6 +40,19 @@ float dot_neon(const float* a, const float* b, std::uint32_t n) noexcept;
 float dot_avx2(const float* a, const float* b, std::uint32_t n) noexcept;
 #endif
 
+// Squared L2 distance. PQ training and encoding invoke this kernel millions of
+// times on small subspaces, so the tier implementations include four-float
+// fast paths rather than assuming only large dense vectors benefit from SIMD.
+float l2_squared_scalar(const float* a, const float* b, std::uint32_t n) noexcept;
+
+#if defined(SIMEON_HAS_NEON)
+float l2_squared_neon(const float* a, const float* b, std::uint32_t n) noexcept;
+#endif
+
+#if defined(SIMEON_HAS_AVX2)
+float l2_squared_avx2(const float* a, const float* b, std::uint32_t n) noexcept;
+#endif
+
 // Blocked inner product: one row `a` against four rows `b0..b3`, writing
 // out4[0..3]. Each output keeps the accumulator structure of dot_*, so results
 // are bit-identical to four independent dot() calls; the win is amortizing the
@@ -197,6 +210,22 @@ inline float dot(const float* a, const float* b, std::uint32_t n) noexcept {
 #endif
         default:
             return dot_scalar(a, b, n);
+    }
+}
+
+inline float l2_squared(const float* a, const float* b, std::uint32_t n) noexcept {
+    SimdTier tier = active_simd_tier();
+    switch (tier) {
+#if defined(SIMEON_HAS_NEON)
+        case SimdTier::Neon:
+            return l2_squared_neon(a, b, n);
+#endif
+#if defined(SIMEON_HAS_AVX2)
+        case SimdTier::Avx2:
+            return l2_squared_avx2(a, b, n);
+#endif
+        default:
+            return l2_squared_scalar(a, b, n);
     }
 }
 
@@ -425,6 +454,11 @@ inline float l2_normalize(std::span<float> values) {
 inline float dot(std::span<const float> a, std::span<const float> b) {
     detail::require_size(b.size(), a.size());
     return dot(a.data(), b.data(), detail::checked_count(a.size()));
+}
+
+inline float l2_squared(std::span<const float> a, std::span<const float> b) {
+    detail::require_size(b.size(), a.size());
+    return l2_squared(a.data(), b.data(), detail::checked_count(a.size()));
 }
 
 inline void dot4(std::span<const float> a, std::span<const float> b0, std::span<const float> b1,

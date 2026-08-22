@@ -33,6 +33,17 @@ float dot_scalar(const float* a, const float* b, std::uint32_t n) noexcept {
     return static_cast<float>(s);
 }
 
+float l2_squared_scalar(const float* a, const float* b, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(a, n);
+    detail::debug_assert_buffer(b, n);
+    float sum = 0.0f;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const float difference = a[i] - b[i];
+        sum += difference * difference;
+    }
+    return sum;
+}
+
 void dot4_scalar(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
                  float* out4, std::uint32_t n) noexcept {
     detail::debug_assert_buffer(a, n);

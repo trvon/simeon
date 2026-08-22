@@ -27,15 +27,16 @@ float gaussian_from_key(std::uint64_t key, std::uint64_t seed) noexcept {
     return r * std::cos(theta);
 }
 
-// Squared L2 between two `n`-dim float vectors (scalar; PQ subspaces are tiny —
-// dsub typically 4..32 — so this is not on a hot path that benefits from SIMD).
+// Squared L2 is the dominant PQ training kernel: tiny subspaces still produce
+// millions of calls during assignment and k-means++ initialization.
 float l2_sq(const float* a, const float* b, std::uint32_t n) noexcept {
-    float acc = 0.0f;
-    for (std::uint32_t i = 0; i < n; ++i) {
-        const float d = a[i] - b[i];
-        acc += d * d;
-    }
-    return acc;
+#if defined(SIMEON_HAS_NEON)
+    return simd::l2_squared_neon(a, b, n);
+#elif defined(SIMEON_HAS_AVX2)
+    return simd::l2_squared_avx2(a, b, n);
+#else
+    return simd::l2_squared_scalar(a, b, n);
+#endif
 }
 
 float dot(const float* a, const float* b, std::uint32_t n) noexcept {

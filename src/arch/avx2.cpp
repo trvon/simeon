@@ -83,6 +83,33 @@ float dot_avx2(const float* a, const float* b, std::uint32_t n) noexcept {
     return s;
 }
 
+float l2_squared_avx2(const float* a, const float* b, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(a, n);
+    detail::debug_assert_buffer(b, n);
+    __m256 sum8 = _mm256_setzero_ps();
+    std::uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 difference = _mm256_sub_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
+        sum8 = _mm256_fmadd_ps(difference, difference, sum8);
+    }
+    alignas(32) float lanes8[8];
+    _mm256_store_ps(lanes8, sum8);
+    float result = lanes8[0] + lanes8[1] + lanes8[2] + lanes8[3] + lanes8[4] + lanes8[5] +
+                   lanes8[6] + lanes8[7];
+    if (i + 4 <= n) {
+        const __m128 difference = _mm_sub_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i));
+        alignas(16) float lanes4[4];
+        _mm_store_ps(lanes4, _mm_mul_ps(difference, difference));
+        result += lanes4[0] + lanes4[1] + lanes4[2] + lanes4[3];
+        i += 4;
+    }
+    for (; i < n; ++i) {
+        const float difference = a[i] - b[i];
+        result += difference * difference;
+    }
+    return result;
+}
+
 void dot4_avx2(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
                float* out4, std::uint32_t n) noexcept {
     detail::debug_assert_buffer(a, n);

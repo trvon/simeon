@@ -163,6 +163,9 @@ void test_simd_span_parity() {
     auto unit = a;
     const float inverse = simeon::simd::l2_normalize(std::span<float>(unit));
     assert(inverse > 0.0f);
+    assert(
+        std::fabs(simeon::simd::l2_squared(std::span<const float>(a), std::span<const float>(b)) -
+                  20.0f) < 1e-5f);
 }
 
 void test_simd_span_misuse() {
@@ -176,6 +179,10 @@ void test_simd_span_misuse() {
     expect_invalid_argument([&] {
         (void)simeon::simd::dot(std::span<const float>(values),
                                 std::span<const float>(short_values));
+    });
+    expect_invalid_argument([&] {
+        (void)simeon::simd::l2_squared(std::span<const float>(values),
+                                       std::span<const float>(short_values));
     });
     expect_invalid_argument([&] {
         simeon::simd::dot4(std::span<const float>(values), std::span<const float>(values),
@@ -225,6 +232,7 @@ void test_simd_zero_length_contracts() {
 
     assert(simeon::simd::l2_normalize(mutable_empty) == 0.0f);
     assert(simeon::simd::dot(empty, empty) == 0.0f);
+    assert(simeon::simd::l2_squared(empty, empty) == 0.0f);
 
     float minimum = 7.0f;
     float maximum = 9.0f;

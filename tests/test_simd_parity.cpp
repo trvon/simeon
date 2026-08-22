@@ -174,6 +174,28 @@ void test_dot_dimensions() {
     }
 }
 
+void test_l2_squared_parity_dim(std::uint32_t n) {
+    auto a = make_random(n, 0x12A11CEu ^ n);
+    auto b = make_random(n, 0xD157A11u ^ n);
+    const float ref = simeon::simd::l2_squared_scalar(a.data(), b.data(), n);
+#if defined(SIMEON_HAS_NEON)
+    const float neon = simeon::simd::l2_squared_neon(a.data(), b.data(), n);
+    assert(std::fabs(neon - ref) <= 1e-5f * std::max(1.0f, ref));
+#endif
+#if defined(SIMEON_HAS_AVX2)
+    const float avx2 = simeon::simd::l2_squared_avx2(a.data(), b.data(), n);
+    assert(std::fabs(avx2 - ref) <= 1e-5f * std::max(1.0f, ref));
+#endif
+    const float dispatched = simeon::simd::l2_squared(a.data(), b.data(), n);
+    assert(std::fabs(dispatched - ref) <= 1e-5f * std::max(1.0f, ref));
+}
+
+void test_l2_squared_dimensions() {
+    for (std::uint32_t n : {1u, 2u, 3u, 4u, 5u, 7u, 8u, 9u, 16u, 17u, 32u, 33u, 128u}) {
+        test_l2_squared_parity_dim(n);
+    }
+}
+
 void test_dot_zero() {
     std::vector<float> z(384, 0.0f);
     auto v = make_random(384, 42);
@@ -537,6 +559,7 @@ int main() {
     test_unit_norm_postcondition();
     test_normalize_extreme_magnitudes();
     test_dot_dimensions();
+    test_l2_squared_dimensions();
     test_dot_zero();
     test_dot_self_unit_norm();
     test_elementwise_dimensions();

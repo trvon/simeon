@@ -59,6 +59,23 @@ float dot_neon(const float* a, const float* b, std::uint32_t n) noexcept {
     return s;
 }
 
+float l2_squared_neon(const float* a, const float* b, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(a, n);
+    detail::debug_assert_buffer(b, n);
+    float32x4_t sum = vdupq_n_f32(0.0f);
+    std::uint32_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t difference = vsubq_f32(vld1q_f32(a + i), vld1q_f32(b + i));
+        sum = vfmaq_f32(sum, difference, difference);
+    }
+    float result = vaddvq_f32(sum);
+    for (; i < n; ++i) {
+        const float difference = a[i] - b[i];
+        result += difference * difference;
+    }
+    return result;
+}
+
 void dot4_neon(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
                float* out4, std::uint32_t n) noexcept {
     detail::debug_assert_buffer(a, n);
