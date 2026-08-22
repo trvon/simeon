@@ -39,6 +39,43 @@ float l2_sq(const float* a, const float* b, std::uint32_t n) noexcept {
 #endif
 }
 
+void l2_sq4(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
+            float* out4, std::uint32_t n) noexcept {
+#if defined(SIMEON_HAS_NEON)
+    simd::l2_squared4_neon(a, b0, b1, b2, b3, out4, n);
+#elif defined(SIMEON_HAS_AVX2)
+    simd::l2_squared4_avx2(a, b0, b1, b2, b3, out4, n);
+#else
+    simd::l2_squared4_scalar(a, b0, b1, b2, b3, out4, n);
+#endif
+}
+
+std::uint32_t nearest_centroid(const float* x, const float* centroids, std::uint32_t k,
+                               std::uint32_t dsub) noexcept {
+    std::uint32_t best = 0;
+    float best_distance = std::numeric_limits<float>::infinity();
+    std::uint32_t ki = 0;
+    for (; ki + 4 <= k; ki += 4) {
+        const float* batch = centroids + static_cast<std::size_t>(ki) * dsub;
+        float distances[4];
+        l2_sq4(x, batch, batch + dsub, batch + 2 * dsub, batch + 3 * dsub, distances, dsub);
+        for (std::uint32_t lane = 0; lane < 4; ++lane) {
+            if (distances[lane] < best_distance) {
+                best_distance = distances[lane];
+                best = ki + lane;
+            }
+        }
+    }
+    for (; ki < k; ++ki) {
+        const float distance = l2_sq(x, centroids + static_cast<std::size_t>(ki) * dsub, dsub);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best = ki;
+        }
+    }
+    return best;
+}
+
 float dot(const float* a, const float* b, std::uint32_t n) noexcept {
     if (n >= 16)
         return simd::dot(a, b, n);
@@ -129,11 +166,23 @@ public:
                 // Update d2 with the just-added centroid.
                 const float* last = cb + static_cast<std::size_t>(ki - 1) * dsub_;
                 double total = 0.0;
-                for (std::uint32_t i = 0; i < n_train; ++i) {
-                    const float dist =
+                std::uint32_t i = 0;
+                for (; i + 4 <= n_train; i += 4) {
+                    const float* batch = sub.data() + static_cast<std::size_t>(i) * dsub_;
+                    float distances[4];
+                    l2_sq4(last, batch, batch + dsub_, batch + 2 * dsub_, batch + 3 * dsub_,
+                           distances, dsub_);
+                    for (std::uint32_t lane = 0; lane < 4; ++lane) {
+                        if (distances[lane] < d2[i + lane])
+                            d2[i + lane] = distances[lane];
+                        total += d2[i + lane];
+                    }
+                }
+                for (; i < n_train; ++i) {
+                    const float distance =
                         l2_sq(sub.data() + static_cast<std::size_t>(i) * dsub_, last, dsub_);
-                    if (dist < d2[i])
-                        d2[i] = dist;
+                    if (distance < d2[i])
+                        d2[i] = distance;
                     total += d2[i];
                 }
                 rng_state = splitmix64_mix(rng_state);
@@ -166,15 +215,7 @@ public:
                 std::uint32_t changes = 0;
                 for (std::uint32_t i = 0; i < n_train; ++i) {
                     const float* x = sub.data() + static_cast<std::size_t>(i) * dsub_;
-                    std::uint32_t best = 0;
-                    float best_d = std::numeric_limits<float>::infinity();
-                    for (std::uint32_t ki = 0; ki < k; ++ki) {
-                        const float d = l2_sq(x, cb + static_cast<std::size_t>(ki) * dsub_, dsub_);
-                        if (d < best_d) {
-                            best_d = d;
-                            best = ki;
-                        }
-                    }
+                    const std::uint32_t best = nearest_centroid(x, cb, k, dsub_);
                     if (it == 0 || assign[i] != best)
                         ++changes;
                     assign[i] = best;
@@ -221,16 +262,7 @@ public:
         for (std::uint32_t mi = 0; mi < cfg_.m; ++mi) {
             const float* x = vec + mi * dsub_;
             const float* cb = codebooks_.data() + static_cast<std::size_t>(mi) * cfg_.k * dsub_;
-            std::uint32_t best = 0;
-            float best_d = std::numeric_limits<float>::infinity();
-            for (std::uint32_t ki = 0; ki < cfg_.k; ++ki) {
-                const float d = l2_sq(x, cb + static_cast<std::size_t>(ki) * dsub_, dsub_);
-                if (d < best_d) {
-                    best_d = d;
-                    best = ki;
-                }
-            }
-            code[mi] = static_cast<std::uint8_t>(best);
+            code[mi] = static_cast<std::uint8_t>(nearest_centroid(x, cb, cfg_.k, dsub_));
         }
     }
 

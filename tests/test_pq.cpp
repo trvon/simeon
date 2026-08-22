@@ -11,6 +11,7 @@
 //  - Recall@10: trained PQ on random data recovers majority of the brute-force
 //    nearest neighbors at 8-byte codes (per the Jégou TPAMI ballpark)
 //  - Determinism: same seed + same training → identical codebooks
+//  - Non-multiple-of-four centroid counts exercise blocked-scan tails
 
 #include <algorithm>
 #include <cassert>
@@ -37,17 +38,19 @@ std::vector<float> make_random_vectors(std::uint32_t n, std::uint32_t dim, std::
     std::mt19937 rng(seed);
     std::normal_distribution<float> dist(0.0f, 1.0f);
     std::vector<float> v(static_cast<std::size_t>(n) * dim);
-    for (auto& x : v) x = dist(rng);
+    for (auto& x : v)
+        x = dist(rng);
     return v;
 }
 
 // Sample `n_clusters` centers from N(0, sigma_c^2 I). Deterministic per seed.
-std::vector<float> make_cluster_centers(std::uint32_t n_clusters, std::uint32_t dim,
-                                        float sigma_c, std::uint32_t seed) {
+std::vector<float> make_cluster_centers(std::uint32_t n_clusters, std::uint32_t dim, float sigma_c,
+                                        std::uint32_t seed) {
     std::mt19937 rng(seed);
     std::normal_distribution<float> center_dist(0.0f, sigma_c);
     std::vector<float> centers(static_cast<std::size_t>(n_clusters) * dim);
-    for (auto& c : centers) c = center_dist(rng);
+    for (auto& c : centers)
+        c = center_dist(rng);
     return centers;
 }
 
@@ -84,7 +87,8 @@ float l2_sq(const float* a, const float* b, std::uint32_t n) {
 
 float dot(const float* a, const float* b, std::uint32_t n) {
     float acc = 0.0f;
-    for (std::uint32_t i = 0; i < n; ++i) acc += a[i] * b[i];
+    for (std::uint32_t i = 0; i < n; ++i)
+        acc += a[i] * b[i];
     return acc;
 }
 
@@ -167,7 +171,8 @@ void test_centroids_are_distinct() {
     for (std::uint32_t i = 0; i < cfg.k; ++i) {
         for (std::uint32_t j = i + 1; j < cfg.k; ++j) {
             const float d = l2_sq(pq.centroid(0, i), pq.centroid(0, j), pq.dsub());
-            if (d > 1e-3f) ++distinct_pairs;
+            if (d > 1e-3f)
+                ++distinct_pairs;
         }
     }
     // (k choose 2) = 120 for k=16. Allow a small slack but expect almost all
@@ -237,8 +242,7 @@ void test_encode_decode_roundtrip_uses_full_codebook() {
         for (std::uint32_t i = 0; i < 2048; ++i) {
             seen[codes[i * cfg.m + mi]] = 1;
         }
-        const std::uint32_t used =
-            std::accumulate(seen.begin(), seen.end(), std::uint32_t{0});
+        const std::uint32_t used = std::accumulate(seen.begin(), seen.end(), std::uint32_t{0});
         // Should saturate the codebook on a healthy random distribution.
         assert(used == cfg.k);
     }
@@ -296,6 +300,20 @@ void test_inner_product_only_query_parity() {
     }
 }
 
+void test_non_multiple_of_four_centroids() {
+    ProductQuantizer pq(PQConfig{.dim = 4, .m = 1, .k = 5});
+    std::vector<float> codebooks(5 * 4);
+    for (std::uint32_t centroid = 0; centroid < 5; ++centroid) {
+        std::fill_n(codebooks.data() + centroid * 4, 4, static_cast<float>(centroid));
+    }
+    pq.import_codebooks(codebooks);
+
+    std::vector<float> query(4, 4.0f);
+    std::uint8_t code = 0;
+    pq.encode(query.data(), &code);
+    assert(code == 4);
+}
+
 // Recall@10 on data that has cluster structure (which is what PQ is designed
 // for — SIFT descriptors, learned embeddings, etc. all cluster naturally).
 // Pure Gaussian noise in 64 dims would give recall ~0.3 because top-10 is
@@ -334,7 +352,8 @@ void test_recall_at_10() {
         std::partial_sort(exact.begin(), exact.begin() + kTopK, exact.end(),
                           [](auto& a, auto& b) { return a.first < b.first; });
         std::vector<std::uint32_t> exact_top(kTopK);
-        for (std::uint32_t i = 0; i < kTopK; ++i) exact_top[i] = exact[i].second;
+        for (std::uint32_t i = 0; i < kTopK; ++i)
+            exact_top[i] = exact[i].second;
 
         // ADC top-10.
         PQQuery query(pq, q);
@@ -347,12 +366,13 @@ void test_recall_at_10() {
 
         std::sort(exact_top.begin(), exact_top.end());
         std::vector<std::uint32_t> adc_top(kTopK);
-        for (std::uint32_t i = 0; i < kTopK; ++i) adc_top[i] = adc[i].second;
+        for (std::uint32_t i = 0; i < kTopK; ++i)
+            adc_top[i] = adc[i].second;
         std::sort(adc_top.begin(), adc_top.end());
 
         std::vector<std::uint32_t> hits;
-        std::set_intersection(exact_top.begin(), exact_top.end(), adc_top.begin(),
-                              adc_top.end(), std::back_inserter(hits));
+        std::set_intersection(exact_top.begin(), exact_top.end(), adc_top.begin(), adc_top.end(),
+                              std::back_inserter(hits));
         total_hits += static_cast<std::uint32_t>(hits.size());
     }
 
@@ -366,7 +386,7 @@ void test_recall_at_10() {
     assert(recall >= 0.4);
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     test_construction_validation();
@@ -376,6 +396,7 @@ int main() {
     test_encode_decode_roundtrip_uses_full_codebook();
     test_adc_parity_l2_and_ip();
     test_inner_product_only_query_parity();
+    test_non_multiple_of_four_centroids();
     test_recall_at_10();
     std::printf("test_pq: all passed\n");
     return 0;

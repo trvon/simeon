@@ -44,6 +44,20 @@ float l2_squared_scalar(const float* a, const float* b, std::uint32_t n) noexcep
     return sum;
 }
 
+void l2_squared4_scalar(const float* a, const float* b0, const float* b1, const float* b2,
+                        const float* b3, float* out4, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(a, n);
+    detail::debug_assert_buffer(b0, n);
+    detail::debug_assert_buffer(b1, n);
+    detail::debug_assert_buffer(b2, n);
+    detail::debug_assert_buffer(b3, n);
+    detail::debug_assert_required(out4);
+    out4[0] = l2_squared_scalar(a, b0, n);
+    out4[1] = l2_squared_scalar(a, b1, n);
+    out4[2] = l2_squared_scalar(a, b2, n);
+    out4[3] = l2_squared_scalar(a, b3, n);
+}
+
 void dot4_scalar(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
                  float* out4, std::uint32_t n) noexcept {
     detail::debug_assert_buffer(a, n);

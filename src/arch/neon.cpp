@@ -76,6 +76,47 @@ float l2_squared_neon(const float* a, const float* b, std::uint32_t n) noexcept 
     return result;
 }
 
+void l2_squared4_neon(const float* a, const float* b0, const float* b1, const float* b2,
+                      const float* b3, float* out4, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(a, n);
+    detail::debug_assert_buffer(b0, n);
+    detail::debug_assert_buffer(b1, n);
+    detail::debug_assert_buffer(b2, n);
+    detail::debug_assert_buffer(b3, n);
+    detail::debug_assert_required(out4);
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    float32x4_t sum2 = vdupq_n_f32(0.0f);
+    float32x4_t sum3 = vdupq_n_f32(0.0f);
+    std::uint32_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t av = vld1q_f32(a + i);
+        const float32x4_t difference0 = vsubq_f32(av, vld1q_f32(b0 + i));
+        const float32x4_t difference1 = vsubq_f32(av, vld1q_f32(b1 + i));
+        const float32x4_t difference2 = vsubq_f32(av, vld1q_f32(b2 + i));
+        const float32x4_t difference3 = vsubq_f32(av, vld1q_f32(b3 + i));
+        sum0 = vfmaq_f32(sum0, difference0, difference0);
+        sum1 = vfmaq_f32(sum1, difference1, difference1);
+        sum2 = vfmaq_f32(sum2, difference2, difference2);
+        sum3 = vfmaq_f32(sum3, difference3, difference3);
+    }
+    out4[0] = vaddvq_f32(sum0);
+    out4[1] = vaddvq_f32(sum1);
+    out4[2] = vaddvq_f32(sum2);
+    out4[3] = vaddvq_f32(sum3);
+    for (; i < n; ++i) {
+        const float ai = a[i];
+        const float difference0 = ai - b0[i];
+        const float difference1 = ai - b1[i];
+        const float difference2 = ai - b2[i];
+        const float difference3 = ai - b3[i];
+        out4[0] += difference0 * difference0;
+        out4[1] += difference1 * difference1;
+        out4[2] += difference2 * difference2;
+        out4[3] += difference3 * difference3;
+    }
+}
+
 void dot4_neon(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,
                float* out4, std::uint32_t n) noexcept {
     detail::debug_assert_buffer(a, n);

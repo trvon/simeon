@@ -166,6 +166,11 @@ void test_simd_span_parity() {
     assert(
         std::fabs(simeon::simd::l2_squared(std::span<const float>(a), std::span<const float>(b)) -
                   20.0f) < 1e-5f);
+    std::array<float, 4> l2_output{};
+    simeon::simd::l2_squared4(std::span<const float>(a), std::span<const float>(b),
+                              std::span<const float>(b), std::span<const float>(b),
+                              std::span<const float>(b), std::span<float>(l2_output));
+    assert((l2_output == std::array<float, 4>{20.0f, 20.0f, 20.0f, 20.0f}));
 }
 
 void test_simd_span_misuse() {
@@ -183,6 +188,17 @@ void test_simd_span_misuse() {
     expect_invalid_argument([&] {
         (void)simeon::simd::l2_squared(std::span<const float>(values),
                                        std::span<const float>(short_values));
+    });
+    expect_invalid_argument([&] {
+        simeon::simd::l2_squared4(std::span<const float>(values),
+                                  std::span<const float>(short_values),
+                                  std::span<const float>(values), std::span<const float>(values),
+                                  std::span<const float>(values), std::span<float>(output));
+    });
+    expect_invalid_argument([&] {
+        simeon::simd::l2_squared4(std::span<const float>(values), std::span<const float>(values),
+                                  std::span<const float>(values), std::span<const float>(values),
+                                  std::span<const float>(values), std::span<float>(short_output));
     });
     expect_invalid_argument([&] {
         simeon::simd::dot4(std::span<const float>(values), std::span<const float>(values),
@@ -250,6 +266,7 @@ void test_simd_zero_length_contracts() {
 
     std::array<float, 4> out0{};
     std::array<float, 4> out1{};
+    simeon::simd::l2_squared4(empty, empty, empty, empty, empty, std::span<float>(out0));
     simeon::simd::dot4(empty, empty, empty, empty, empty, std::span<float>(out0));
     simeon::simd::dot2x4(empty, empty, empty, empty, empty, empty, std::span<float>(out0),
                          std::span<float>(out1));

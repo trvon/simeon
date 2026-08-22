@@ -27,6 +27,18 @@ inline int ctz_nonzero(unsigned mask) noexcept {
 #endif
 }
 
+float horizontal_sum(__m256 value) noexcept {
+    alignas(32) float lanes[8];
+    _mm256_store_ps(lanes, value);
+    return lanes[0] + lanes[1] + lanes[2] + lanes[3] + lanes[4] + lanes[5] + lanes[6] + lanes[7];
+}
+
+float horizontal_sum(__m128 value) noexcept {
+    alignas(16) float lanes[4];
+    _mm_store_ps(lanes, value);
+    return lanes[0] + lanes[1] + lanes[2] + lanes[3];
+}
+
 } // namespace
 
 float l2_normalize_avx2(float* v, std::uint32_t n) noexcept {
@@ -92,15 +104,10 @@ float l2_squared_avx2(const float* a, const float* b, std::uint32_t n) noexcept 
         const __m256 difference = _mm256_sub_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
         sum8 = _mm256_fmadd_ps(difference, difference, sum8);
     }
-    alignas(32) float lanes8[8];
-    _mm256_store_ps(lanes8, sum8);
-    float result = lanes8[0] + lanes8[1] + lanes8[2] + lanes8[3] + lanes8[4] + lanes8[5] +
-                   lanes8[6] + lanes8[7];
+    float result = horizontal_sum(sum8);
     if (i + 4 <= n) {
         const __m128 difference = _mm_sub_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i));
-        alignas(16) float lanes4[4];
-        _mm_store_ps(lanes4, _mm_mul_ps(difference, difference));
-        result += lanes4[0] + lanes4[1] + lanes4[2] + lanes4[3];
+        result += horizontal_sum(_mm_mul_ps(difference, difference));
         i += 4;
     }
     for (; i < n; ++i) {
@@ -108,6 +115,59 @@ float l2_squared_avx2(const float* a, const float* b, std::uint32_t n) noexcept 
         result += difference * difference;
     }
     return result;
+}
+
+void l2_squared4_avx2(const float* a, const float* b0, const float* b1, const float* b2,
+                      const float* b3, float* out4, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(a, n);
+    detail::debug_assert_buffer(b0, n);
+    detail::debug_assert_buffer(b1, n);
+    detail::debug_assert_buffer(b2, n);
+    detail::debug_assert_buffer(b3, n);
+    detail::debug_assert_required(out4);
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    __m256 sum2 = _mm256_setzero_ps();
+    __m256 sum3 = _mm256_setzero_ps();
+    std::uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 av = _mm256_loadu_ps(a + i);
+        const __m256 difference0 = _mm256_sub_ps(av, _mm256_loadu_ps(b0 + i));
+        const __m256 difference1 = _mm256_sub_ps(av, _mm256_loadu_ps(b1 + i));
+        const __m256 difference2 = _mm256_sub_ps(av, _mm256_loadu_ps(b2 + i));
+        const __m256 difference3 = _mm256_sub_ps(av, _mm256_loadu_ps(b3 + i));
+        sum0 = _mm256_fmadd_ps(difference0, difference0, sum0);
+        sum1 = _mm256_fmadd_ps(difference1, difference1, sum1);
+        sum2 = _mm256_fmadd_ps(difference2, difference2, sum2);
+        sum3 = _mm256_fmadd_ps(difference3, difference3, sum3);
+    }
+    out4[0] = horizontal_sum(sum0);
+    out4[1] = horizontal_sum(sum1);
+    out4[2] = horizontal_sum(sum2);
+    out4[3] = horizontal_sum(sum3);
+    if (i + 4 <= n) {
+        const __m128 av = _mm_loadu_ps(a + i);
+        const __m128 difference0 = _mm_sub_ps(av, _mm_loadu_ps(b0 + i));
+        const __m128 difference1 = _mm_sub_ps(av, _mm_loadu_ps(b1 + i));
+        const __m128 difference2 = _mm_sub_ps(av, _mm_loadu_ps(b2 + i));
+        const __m128 difference3 = _mm_sub_ps(av, _mm_loadu_ps(b3 + i));
+        out4[0] += horizontal_sum(_mm_mul_ps(difference0, difference0));
+        out4[1] += horizontal_sum(_mm_mul_ps(difference1, difference1));
+        out4[2] += horizontal_sum(_mm_mul_ps(difference2, difference2));
+        out4[3] += horizontal_sum(_mm_mul_ps(difference3, difference3));
+        i += 4;
+    }
+    for (; i < n; ++i) {
+        const float ai = a[i];
+        const float difference0 = ai - b0[i];
+        const float difference1 = ai - b1[i];
+        const float difference2 = ai - b2[i];
+        const float difference3 = ai - b3[i];
+        out4[0] += difference0 * difference0;
+        out4[1] += difference1 * difference1;
+        out4[2] += difference2 * difference2;
+        out4[3] += difference3 * difference3;
+    }
 }
 
 void dot4_avx2(const float* a, const float* b0, const float* b1, const float* b2, const float* b3,

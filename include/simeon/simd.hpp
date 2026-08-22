@@ -53,6 +53,22 @@ float l2_squared_neon(const float* a, const float* b, std::uint32_t n) noexcept;
 float l2_squared_avx2(const float* a, const float* b, std::uint32_t n) noexcept;
 #endif
 
+// Blocked squared L2: one row `a` against four rows `b0..b3`, writing
+// out4[0..3]. PQ scans contiguous centroids and training subvectors in groups
+// of four, allowing the shared `a` load and loop overhead to be amortized.
+void l2_squared4_scalar(const float* a, const float* b0, const float* b1, const float* b2,
+                        const float* b3, float* out4, std::uint32_t n) noexcept;
+
+#if defined(SIMEON_HAS_NEON)
+void l2_squared4_neon(const float* a, const float* b0, const float* b1, const float* b2,
+                      const float* b3, float* out4, std::uint32_t n) noexcept;
+#endif
+
+#if defined(SIMEON_HAS_AVX2)
+void l2_squared4_avx2(const float* a, const float* b0, const float* b1, const float* b2,
+                      const float* b3, float* out4, std::uint32_t n) noexcept;
+#endif
+
 // Blocked inner product: one row `a` against four rows `b0..b3`, writing
 // out4[0..3]. Each output keeps the accumulator structure of dot_*, so results
 // are bit-identical to four independent dot() calls; the win is amortizing the
@@ -226,6 +242,26 @@ inline float l2_squared(const float* a, const float* b, std::uint32_t n) noexcep
 #endif
         default:
             return l2_squared_scalar(a, b, n);
+    }
+}
+
+inline void l2_squared4(const float* a, const float* b0, const float* b1, const float* b2,
+                        const float* b3, float* out4, std::uint32_t n) noexcept {
+    SimdTier tier = active_simd_tier();
+    switch (tier) {
+#if defined(SIMEON_HAS_NEON)
+        case SimdTier::Neon:
+            l2_squared4_neon(a, b0, b1, b2, b3, out4, n);
+            return;
+#endif
+#if defined(SIMEON_HAS_AVX2)
+        case SimdTier::Avx2:
+            l2_squared4_avx2(a, b0, b1, b2, b3, out4, n);
+            return;
+#endif
+        default:
+            l2_squared4_scalar(a, b0, b1, b2, b3, out4, n);
+            return;
     }
 }
 
@@ -459,6 +495,18 @@ inline float dot(std::span<const float> a, std::span<const float> b) {
 inline float l2_squared(std::span<const float> a, std::span<const float> b) {
     detail::require_size(b.size(), a.size());
     return l2_squared(a.data(), b.data(), detail::checked_count(a.size()));
+}
+
+inline void l2_squared4(std::span<const float> a, std::span<const float> b0,
+                        std::span<const float> b1, std::span<const float> b2,
+                        std::span<const float> b3, std::span<float> output) {
+    detail::require_size(b0.size(), a.size());
+    detail::require_size(b1.size(), a.size());
+    detail::require_size(b2.size(), a.size());
+    detail::require_size(b3.size(), a.size());
+    detail::require_output4(output);
+    l2_squared4(a.data(), b0.data(), b1.data(), b2.data(), b3.data(), output.data(),
+                detail::checked_count(a.size()));
 }
 
 inline void dot4(std::span<const float> a, std::span<const float> b0, std::span<const float> b1,
