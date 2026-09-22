@@ -388,6 +388,44 @@ void test_recall_at_10() {
 
 } // namespace
 
+// Batched scans must return exactly the per-code scores (same summation order per code), so
+// callers can switch to them without moving ranking tie-breaks. Counts cover empty input and
+// tails that are not a multiple of the interleave width.
+void test_inner_product_batch_bit_identical() {
+    PQConfig cfg{.dim = 128, .m = 32, .k = 256, .seed = 0x6262};
+    auto train_data = make_random_vectors(2048, cfg.dim, 51);
+    ProductQuantizer pq(cfg);
+    pq.train(train_data.data(), 2048, 10);
+
+    constexpr std::uint32_t kRows = 67;
+    auto query = make_random_vectors(1, cfg.dim, 52);
+    auto db = make_random_vectors(kRows, cfg.dim, 53);
+    std::vector<std::uint8_t> codes(static_cast<std::size_t>(kRows) * cfg.m);
+    pq.encode_batch(db.data(), kRows, codes.data());
+
+    PQInnerProductQuery q(pq, query.data());
+    for (std::size_t count : {std::size_t{0}, std::size_t{1}, std::size_t{3}, std::size_t{4},
+                              std::size_t{9}, std::size_t{kRows}}) {
+        std::vector<float> batch(count + 1, -1.0f);
+        q.inner_product_batch(codes.data(), count, batch.data());
+        for (std::size_t i = 0; i < count; ++i) {
+            assert(batch[i] == q.inner_product(codes.data() + i * cfg.m));
+        }
+        assert(batch[count] == -1.0f); // never writes past `count`
+    }
+
+    std::vector<std::size_t> indices;
+    for (std::size_t i = kRows; i-- > 0;) {
+        if (i % 3 != 1)
+            indices.push_back(i);
+    }
+    std::vector<float> gathered(indices.size());
+    q.inner_product_gather(codes.data(), indices.data(), indices.size(), gathered.data());
+    for (std::size_t i = 0; i < indices.size(); ++i) {
+        assert(gathered[i] == q.inner_product(codes.data() + indices[i] * cfg.m));
+    }
+}
+
 int main() {
     test_construction_validation();
     test_random_gaussian_init_deterministic();
@@ -396,6 +434,7 @@ int main() {
     test_encode_decode_roundtrip_uses_full_codebook();
     test_adc_parity_l2_and_ip();
     test_inner_product_only_query_parity();
+    test_inner_product_batch_bit_identical();
     test_non_multiple_of_four_centroids();
     test_recall_at_10();
     std::printf("test_pq: all passed\n");

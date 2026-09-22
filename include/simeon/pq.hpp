@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -128,6 +129,12 @@ public:
     PQInnerProductQuery& operator=(PQInnerProductQuery&&) noexcept;
 
     float inner_product(const std::uint8_t* code) const noexcept;
+    /// Scores `count` contiguous codes (stride m) into `out`; bit-identical to inner_product().
+    void inner_product_batch(const std::uint8_t* codes, std::size_t count,
+                             float* out) const noexcept;
+    /// Scores codes[indices[i] * m] for i < count into `out`; bit-identical to inner_product().
+    void inner_product_gather(const std::uint8_t* codes, const std::size_t* indices,
+                              std::size_t count, float* out) const noexcept;
     std::span<const float> lut_ip() const noexcept;
 
 private:
