@@ -1,5 +1,7 @@
 #include "simeon/corpus_adapter.hpp"
 
+#include "simeon/detail/ascii.hpp"
+
 #include <algorithm>
 #include <cmath>
 
@@ -20,7 +22,7 @@ std::string extract_lead_tokens(std::string_view text, std::uint32_t max_tokens)
     bool in_token = false;
 
     for (char c : text) {
-        if (std::isspace(static_cast<unsigned char>(c))) {
+        if (detail::ascii_isspace(static_cast<unsigned char>(c))) {
             if (in_token) {
                 ++tokens;
                 in_token = false;
@@ -79,7 +81,7 @@ bool ends_with_biomedical(std::string_view word) {
             continue;
         if (word.ends_with(suffix)) {
             const char prev = word[word.size() - suffix.size() - 1];
-            if (std::isalpha(static_cast<unsigned char>(prev)))
+            if (detail::ascii_isalpha(static_cast<unsigned char>(prev)))
                 return true;
         }
     }
@@ -91,8 +93,8 @@ bool is_all_caps_word(std::string_view word) {
         return false;
     bool has_letter = false;
     for (char c : word) {
-        if (std::isalpha(static_cast<unsigned char>(c))) {
-            if (!std::isupper(static_cast<unsigned char>(c)))
+        if (detail::ascii_isalpha(static_cast<unsigned char>(c))) {
+            if (!detail::ascii_isupper(static_cast<unsigned char>(c)))
                 return false;
             has_letter = true;
         }
@@ -101,13 +103,13 @@ bool is_all_caps_word(std::string_view word) {
 }
 
 bool is_measurement(std::string_view text) {
-    if (text.empty() || !std::isdigit(static_cast<unsigned char>(text[0])))
+    if (text.empty() || !detail::ascii_isdigit(static_cast<unsigned char>(text[0])))
         return false;
     for (std::size_t i = 1; i < text.size(); ++i) {
         char c = text[i];
-        if (std::isdigit(static_cast<unsigned char>(c)) || c == '.' || c == ',')
+        if (detail::ascii_isdigit(static_cast<unsigned char>(c)) || c == '.' || c == ',')
             continue;
-        if (std::isalpha(static_cast<unsigned char>(c)) || c == '%')
+        if (detail::ascii_isalpha(static_cast<unsigned char>(c)) || c == '%')
             return i >= 1;
         break;
     }
@@ -118,8 +120,9 @@ std::string normalize_entity(std::string_view raw) {
     std::string out;
     out.reserve(raw.size());
     for (char c : raw) {
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '(' || c == ')')
-            out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        if (detail::ascii_isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '(' ||
+            c == ')')
+            out.push_back(static_cast<char>(detail::ascii_tolower(static_cast<unsigned char>(c))));
     }
     while (!out.empty() && out.back() == '-')
         out.pop_back();
@@ -141,9 +144,9 @@ std::vector<Section> detect_sections(std::string_view text, std::size_t max_s = 
             nl = lim;
         std::string_view line = text.substr(pos, nl - pos);
         std::size_t si = 0;
-        while (si < line.size() && std::isspace(static_cast<unsigned char>(line[si])))
+        while (si < line.size() && detail::ascii_isspace(static_cast<unsigned char>(line[si])))
             ++si;
-        while (si < line.size() && (std::isdigit(static_cast<unsigned char>(line[si])) ||
+        while (si < line.size() && (detail::ascii_isdigit(static_cast<unsigned char>(line[si])) ||
                                     line[si] == '.' || line[si] == ' '))
             ++si;
         bool hdr = false;
@@ -153,16 +156,16 @@ std::vector<Section> detect_sections(std::string_view text, std::size_t max_s = 
             bool hl = false;
             for (std::size_t i = si; i < line.size(); ++i) {
                 unsigned char c = static_cast<unsigned char>(line[i]);
-                if (std::isspace(c)) {
+                if (detail::ascii_isspace(c)) {
                     iw = false;
                 } else {
                     if (!iw) {
                         ++w;
                         iw = true;
                     }
-                    if (std::isalpha(c)) {
+                    if (detail::ascii_isalpha(c)) {
                         hl = true;
-                        if (!std::isupper(c))
+                        if (!detail::ascii_isupper(c))
                             ac = false;
                     }
                 }
@@ -242,8 +245,8 @@ std::vector<std::string> extract_robust_entities(std::string_view text,
 
     for (std::size_t i = 0; i <= text.size() && entities.size() < max_entities; ++i) {
         const char c = i < text.size() ? text[i] : ' ';
-        bool d = std::isspace(static_cast<unsigned char>(c)) || c == '.' || c == ',' || c == ';' ||
-                 c == ':' || c == '!' || c == '?' || c == '(' || c == ')' || c == '"' ||
+        bool d = detail::ascii_isspace(static_cast<unsigned char>(c)) || c == '.' || c == ',' ||
+                 c == ';' || c == ':' || c == '!' || c == '?' || c == '(' || c == ')' || c == '"' ||
                  c == '\n' || c == '\t';
         if (!d) {
             cur.push_back(c);
@@ -261,11 +264,11 @@ std::vector<std::string> extract_robust_entities(std::string_view text,
             entities.push_back(cur);
             added = true;
             cap.push_back(cur);
-        } else if (!cur.empty() && std::isupper(static_cast<unsigned char>(cur[0])) &&
+        } else if (!cur.empty() && detail::ascii_isupper(static_cast<unsigned char>(cur[0])) &&
                    cur.size() >= 3) {
             bool aa = true;
             for (char ch : cur)
-                if (!std::isalpha(static_cast<unsigned char>(ch))) {
+                if (!detail::ascii_isalpha(static_cast<unsigned char>(ch))) {
                     aa = false;
                     break;
                 }

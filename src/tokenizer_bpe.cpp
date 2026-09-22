@@ -1,8 +1,9 @@
 #include "simeon/tokenizer_bpe.hpp"
 
+#include "simeon/detail/ascii.hpp"
+
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <limits>
@@ -25,9 +26,9 @@ void for_each_word(std::string_view text, F&& fn) {
     const std::size_t n = text.size();
     std::size_t i = 0;
     while (i < n) {
-        while (i < n && std::isspace(static_cast<unsigned char>(text[i]))) ++i;
+        while (i < n && detail::ascii_isspace(static_cast<unsigned char>(text[i]))) ++i;
         const std::size_t start = i;
-        while (i < n && !std::isspace(static_cast<unsigned char>(text[i]))) ++i;
+        while (i < n && !detail::ascii_isspace(static_cast<unsigned char>(text[i]))) ++i;
         if (start < i) fn(text.substr(start, i - start));
     }
 }

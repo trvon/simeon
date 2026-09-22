@@ -1,6 +1,7 @@
 #include "simeon/tokenizer.hpp"
 
-#include <cctype>
+#include "simeon/detail/ascii.hpp"
+
 #include <cstring>
 #include <string>
 
@@ -11,7 +12,7 @@ namespace simeon {
 namespace {
 
 bool is_word_char(unsigned char c) noexcept {
-    return std::isalnum(c) != 0 || c == '_';
+    return detail::ascii_isalnum(c) || c == '_';
 }
 
 bool is_boundary_word_char(unsigned char c) noexcept {

@@ -65,7 +65,7 @@ public:
 };
 
 // Extract at most `max_tokens` leading tokens from `text`.
-// Token boundaries are defined by std::isspace().
+// Token boundaries are ASCII whitespace (std::isspace() in the "C" locale).
 std::string extract_lead_tokens(std::string_view text, std::uint32_t max_tokens);
 
 // ---------------------------------------------------------------------------

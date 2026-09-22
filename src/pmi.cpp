@@ -1,8 +1,9 @@
 #include "simeon/pmi.hpp"
 
+#include "simeon/detail/ascii.hpp"
+
 #include <algorithm>
 #include <cassert>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -36,7 +37,7 @@ inline float gauss(std::uint64_t& state) noexcept {
 }
 
 inline bool is_word_char(unsigned char c) noexcept {
-    return std::isalnum(c) != 0 || c == '_';
+    return detail::ascii_isalnum(c) || c == '_';
 }
 
 // Walks `text` emitting lowercased word tokens via `cb(tok)`. Matches the
@@ -53,7 +54,7 @@ template <typename Cb> void for_each_word(std::string_view text, Cb&& cb) {
         if (start < i) {
             std::string tok(text.substr(start, i - start));
             for (auto& c : tok)
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                c = static_cast<char>(detail::ascii_tolower(static_cast<unsigned char>(c)));
             cb(std::move(tok));
         }
     }
@@ -468,7 +469,7 @@ const float* PmiEmbeddings::row(std::string_view tok) const noexcept {
         buf = heap_buf.data();
     }
     for (std::size_t i = 0; i < n; ++i) {
-        buf[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(tok[i])));
+        buf[i] = static_cast<char>(detail::ascii_tolower(static_cast<unsigned char>(tok[i])));
     }
     auto it = index_.find(std::string(buf, n));
     if (it == index_.end())

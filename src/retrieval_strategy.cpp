@@ -1,6 +1,8 @@
 #include "simeon/retrieval_strategy.hpp"
+
 #include "simeon/bm25.hpp"
 #include "simeon/corpus_adapter.hpp"
+#include "simeon/detail/ascii.hpp"
 #include "simeon/fusion.hpp"
 #include "simeon/prf.hpp"
 #include "simeon/tokenizer.hpp"
@@ -155,19 +157,22 @@ std::vector<std::string> extract_keyphrases(std::string_view text) {
     // Tokenize into lowercase words
     while (!remaining.empty()) {
         // Skip non-alpha
-        while (!remaining.empty() && !std::isalpha(static_cast<unsigned char>(remaining.front())))
+        while (!remaining.empty() &&
+               !detail::ascii_isalpha(static_cast<unsigned char>(remaining.front())))
             remaining.remove_prefix(1);
         if (remaining.empty())
             break;
         const char* start = remaining.data();
-        while (!remaining.empty() && std::isalpha(static_cast<unsigned char>(remaining.front())))
+        while (!remaining.empty() &&
+               detail::ascii_isalpha(static_cast<unsigned char>(remaining.front())))
             remaining.remove_prefix(1);
         std::string_view word(start, remaining.data() - start);
         if (word.size() < 2)
             continue;
         lower.clear();
         for (char c : word)
-            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            lower.push_back(
+                static_cast<char>(detail::ascii_tolower(static_cast<unsigned char>(c))));
         if (!is_stopword(lower)) {
             phrases.push_back(lower);
         } else if (!phrases.empty()) {

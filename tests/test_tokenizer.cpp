@@ -1,4 +1,7 @@
 #include <cassert>
+#include <cctype>
+#include <clocale>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -101,6 +104,34 @@ void test_word_bounded_char_ngrams_ignore_punctuation_only_input() {
     assert(c.tokens.empty());
 }
 
+// Tokenization must not depend on the host's LC_CTYPE: an embedding library linked into an app
+// that calls setlocale() would otherwise produce different vectors for the same text.
+void test_word_tokens_ignore_host_locale() {
+    TokenizerConfig cfg{3, 3, false, true};
+    const std::string text = "caf\xE9 NA\xCFVE ok";
+    Collector baseline;
+    tokenize(text, cfg, baseline);
+
+    const char* latin1[] = {"de_DE.ISO8859-1",  "en_US.ISO8859-1", "de_DE.ISO-8859-1",
+                            "en_US.ISO-8859-1", "de_DE",           "en_US"};
+    const char* chosen = nullptr;
+    for (const char* name : latin1) {
+        if (std::setlocale(LC_CTYPE, name) != nullptr && std::isalnum(0xE9) != 0) {
+            chosen = name;
+            break;
+        }
+    }
+    if (chosen == nullptr) {
+        std::setlocale(LC_CTYPE, "C");
+        std::puts("SKIP test_word_tokens_ignore_host_locale: no Latin-1 locale available");
+        return;
+    }
+    Collector localized;
+    tokenize(text, cfg, localized);
+    std::setlocale(LC_CTYPE, "C");
+    assert(localized.tokens == baseline.tokens);
+}
+
 } // namespace
 
 int main() {
@@ -113,5 +144,6 @@ int main() {
     test_word_bounded_char_ngrams_add_markers_and_do_not_cross_words();
     test_word_bounded_char_ngrams_preserve_utf8_bytes();
     test_word_bounded_char_ngrams_ignore_punctuation_only_input();
+    test_word_tokens_ignore_host_locale();
     return 0;
 }
