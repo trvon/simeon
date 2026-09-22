@@ -139,8 +139,59 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
     if (mode_ == ProjectionMode::DenseGaussian) {
         dense_.assign(static_cast<std::size_t>(output_dim_) * sketch_dim_, 0.0f);
     }
-    if (mode_ == ProjectionMode::AchlioptasSparse)
-        achlioptas_.resize(output_dim_);
+    if (mode_ == ProjectionMode::AchlioptasSparse) {
+        achlioptas_col_begin_.assign(static_cast<std::size_t>(sketch_dim_) + 1, 0);
+        achlioptas_col_neg_.assign(sketch_dim_, 0);
+        achlioptas_rows_.reserve(static_cast<std::size_t>(sketch_dim_) * output_dim_ / 3 + 64);
+        std::vector<std::uint32_t> neg_rows;
+        for (std::uint32_t col = 0; col < sketch_dim_; ++col) {
+            achlioptas_col_begin_[col] = static_cast<std::uint32_t>(achlioptas_rows_.size());
+            neg_rows.clear();
+            for (std::uint32_t row = 0; row < output_dim_; ++row) {
+                const float w = achlioptas_entry(row, col, seed_);
+                if (w > 0.0f)
+                    achlioptas_rows_.push_back(row);
+                else if (w < 0.0f)
+                    neg_rows.push_back(row);
+            }
+            achlioptas_col_neg_[col] = static_cast<std::uint32_t>(achlioptas_rows_.size());
+            achlioptas_rows_.insert(achlioptas_rows_.end(), neg_rows.begin(), neg_rows.end());
+        }
+        achlioptas_col_begin_[sketch_dim_] = static_cast<std::uint32_t>(achlioptas_rows_.size());
+        // Row-major view of the same entries (columns ascending per row): count, then fill.
+        std::vector<std::uint32_t> pos_count(output_dim_, 0);
+        std::vector<std::uint32_t> neg_count(output_dim_, 0);
+        for (std::uint32_t col = 0; col < sketch_dim_; ++col) {
+            for (std::uint32_t i = achlioptas_col_begin_[col]; i < achlioptas_col_neg_[col]; ++i)
+                ++pos_count[achlioptas_rows_[i]];
+            for (std::uint32_t i = achlioptas_col_neg_[col]; i < achlioptas_col_begin_[col + 1];
+                 ++i)
+                ++neg_count[achlioptas_rows_[i]];
+        }
+        achlioptas_row_begin_.assign(static_cast<std::size_t>(output_dim_) + 1, 0);
+        achlioptas_row_neg_.assign(output_dim_, 0);
+        std::vector<std::uint32_t> pos_fill(output_dim_);
+        std::vector<std::uint32_t> neg_fill(output_dim_);
+        std::uint32_t offset = 0;
+        for (std::uint32_t row = 0; row < output_dim_; ++row) {
+            achlioptas_row_begin_[row] = offset;
+            pos_fill[row] = offset;
+            offset += pos_count[row];
+            achlioptas_row_neg_[row] = offset;
+            neg_fill[row] = offset;
+            offset += neg_count[row];
+        }
+        achlioptas_row_begin_[output_dim_] = offset;
+        achlioptas_cols_.resize(offset);
+        for (std::uint32_t col = 0; col < sketch_dim_; ++col) {
+            for (std::uint32_t i = achlioptas_col_begin_[col]; i < achlioptas_col_neg_[col]; ++i)
+                achlioptas_cols_[pos_fill[achlioptas_rows_[i]]++] = col;
+            for (std::uint32_t i = achlioptas_col_neg_[col]; i < achlioptas_col_begin_[col + 1];
+                 ++i)
+                achlioptas_cols_[neg_fill[achlioptas_rows_[i]]++] = col;
+        }
+        return;
+    }
     if (mode_ == ProjectionMode::VerySparse)
         sparse_.resize(output_dim_);
     if (mode_ == ProjectionMode::SparseJL)
@@ -238,13 +289,6 @@ Projection::Projection(std::uint32_t sketch_dim, std::uint32_t output_dim, Proje
         for (std::uint32_t col = 0; col < sketch_dim_; ++col) {
             float w = 0.0f;
             switch (mode_) {
-                case ProjectionMode::AchlioptasSparse:
-                    w = achlioptas_entry(row, col, seed_);
-                    if (w > 0.0f)
-                        achlioptas_[row].pos_cols.push_back(col);
-                    else if (w < 0.0f)
-                        achlioptas_[row].neg_cols.push_back(col);
-                    break;
                 case ProjectionMode::DenseGaussian:
                     w = gaussian_entry(row, col, seed_);
                     break;
@@ -320,24 +364,48 @@ void Projection::applyUnchecked(std::span<const std::int32_t> sketch, std::span<
         return;
     }
 
-    // Achlioptas: weights are {-sqrt(3), 0, +sqrt(3)}. Gather per-row by
-    // sign and compute (sum_pos - sum_neg) as plain int64 accumulation, then
-    // scale once. No float multiply inside the inner loop.
+    // Achlioptas: weights are {-sqrt(3), 0, +sqrt(3)}; outputs are exact int64
+    // (sum_pos - sum_neg) scaled once, so both traversals below are
+    // bit-identical. Short texts fill a few hundred of the sketch_dim buckets:
+    // scatter only those through the column-major CSR. Dense sketches (long
+    // texts) gather per row instead, which avoids read-modify-write traffic.
     if (mode_ == ProjectionMode::AchlioptasSparse) {
-        for (std::uint32_t row = 0; row < output_dim_; ++row) {
-            const auto& ar = achlioptas_[row];
-            std::int64_t pos = 0;
-            std::int64_t neg = 0;
-            const auto* pc = ar.pos_cols.data();
-            const std::size_t np = ar.pos_cols.size();
-            for (std::size_t i = 0; i < np; ++i)
-                pos += sketch[pc[i]];
-            const auto* nc = ar.neg_cols.data();
-            const std::size_t nn = ar.neg_cols.size();
-            for (std::size_t i = 0; i < nn; ++i)
-                neg += sketch[nc[i]];
-            out[row] = static_cast<float>(pos - neg) * achlioptas_scale_;
+        std::uint32_t nonzero = 0;
+        for (std::uint32_t col = 0; col < sketch_dim_; ++col)
+            nonzero += sketch[col] != 0 ? 1u : 0u;
+        if (nonzero * 2 >= sketch_dim_) {
+            const std::uint32_t* cols = achlioptas_cols_.data();
+            for (std::uint32_t row = 0; row < output_dim_; ++row) {
+                const std::uint32_t begin = achlioptas_row_begin_[row];
+                const std::uint32_t neg_begin = achlioptas_row_neg_[row];
+                const std::uint32_t end = achlioptas_row_begin_[row + 1];
+                std::int64_t pos = 0;
+                std::int64_t neg = 0;
+                for (std::uint32_t i = begin; i < neg_begin; ++i)
+                    pos += sketch[cols[i]];
+                for (std::uint32_t i = neg_begin; i < end; ++i)
+                    neg += sketch[cols[i]];
+                out[row] = static_cast<float>(pos - neg) * achlioptas_scale_;
+            }
+            return;
         }
+        thread_local std::vector<std::int64_t> acc;
+        acc.assign(output_dim_, 0);
+        const std::uint32_t* rows = achlioptas_rows_.data();
+        for (std::uint32_t col = 0; col < sketch_dim_; ++col) {
+            const std::int64_t v = sketch[col];
+            if (v == 0)
+                continue;
+            const std::uint32_t begin = achlioptas_col_begin_[col];
+            const std::uint32_t neg = achlioptas_col_neg_[col];
+            const std::uint32_t end = achlioptas_col_begin_[col + 1];
+            for (std::uint32_t i = begin; i < neg; ++i)
+                acc[rows[i]] += v;
+            for (std::uint32_t i = neg; i < end; ++i)
+                acc[rows[i]] -= v;
+        }
+        for (std::uint32_t row = 0; row < output_dim_; ++row)
+            out[row] = static_cast<float>(acc[row]) * achlioptas_scale_;
         return;
     }
 

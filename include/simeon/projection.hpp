@@ -37,15 +37,13 @@ public:
 
 private:
     // Cached projection matrix. For AchlioptasSparse, weights are only
-    // {-scale, 0, +scale} so we split per-row nonzeros into positive/negative
-    // index lists and skip the multiply inside the hot loop (just int32
-    // sum/sub over sketch indices). VerySparse falls back to (col, weight)
-    // pairs because its nonzero magnitude depends on the sampled s value.
+    // {-scale, 0, +scale}, so apply() accumulates exact int64 sums without a
+    // multiply. It keeps two layouts of the same +/-1 entries: row-major
+    // CSR (gather; fastest when most sketch buckets are non-zero, i.e. long
+    // texts) and a column-major CSR (scatter; visits only non-zero buckets,
+    // i.e. short texts). Both are flat arrays so traversal stays sequential. VerySparse falls back
+    // to (col, weight) pairs because its nonzero magnitude depends on the sampled s value.
     // DenseGaussian uses a row-major float matrix.
-    struct AchlioptasRow {
-        std::vector<std::uint32_t> pos_cols;
-        std::vector<std::uint32_t> neg_cols;
-    };
     struct WeightedSparseRow {
         std::vector<std::uint32_t> cols;
         std::vector<float> weights;
@@ -56,9 +54,18 @@ private:
     ProjectionMode mode_;
     std::uint64_t seed_;
     float inv_scale_ = 1.0f;
-    float achlioptas_scale_ = 1.0f;         // cached sqrt(3) * inv_scale for Achlioptas
-    std::vector<float> dense_;              // output_dim_ * sketch_dim_ (Gaussian path)
-    std::vector<AchlioptasRow> achlioptas_; // per-row pos/neg col lists (Achlioptas)
+    float achlioptas_scale_ = 1.0f; // cached sqrt(3) * inv_scale for Achlioptas
+    std::vector<float> dense_;      // output_dim_ * sketch_dim_ (Gaussian path)
+    // Achlioptas row r: columns [row_begin[r], row_neg[r]) are +1 and
+    // [row_neg[r], row_begin[r + 1]) are -1 in achlioptas_cols_.
+    std::vector<std::uint32_t> achlioptas_row_begin_; // output_dim_ + 1
+    std::vector<std::uint32_t> achlioptas_row_neg_;   // output_dim_
+    std::vector<std::uint32_t> achlioptas_cols_;
+    // Achlioptas column c: rows [col_begin[c], col_neg[c]) are +1 and
+    // [col_neg[c], col_begin[c + 1]) are -1 in achlioptas_rows_.
+    std::vector<std::uint32_t> achlioptas_col_begin_; // sketch_dim_ + 1
+    std::vector<std::uint32_t> achlioptas_col_neg_;   // sketch_dim_
+    std::vector<std::uint32_t> achlioptas_rows_;
     std::vector<WeightedSparseRow> sparse_; // per-row nonzeros (VerySparse)
 
     // Fwht-only state. pad_n_ is the next power of 2 ≥ sketch_dim_; signs_

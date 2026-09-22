@@ -1,6 +1,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -76,6 +77,43 @@ void test_output_dim_validation() {
     assert(threw);
 }
 
+// apply() must equal the exact integer sum (pos - neg) over the matrix's +/-1 entries, scaled once,
+// for both short-text sketches (few non-zero buckets) and dense ones. Any traversal order is fine
+// because the sum is exact, so this pins the output bit for bit.
+void test_achlioptas_apply_matches_exact_reference() {
+    constexpr std::uint32_t kSketch = 4096;
+    constexpr std::uint32_t kOut = 384;
+    Projection p(kSketch, kOut, ProjectionMode::AchlioptasSparse, 0x5eed);
+    const float scale = std::sqrt(3.0f) * (1.0f / std::sqrt(static_cast<float>(kOut)));
+
+    std::mt19937 rng(11);
+    std::uniform_int_distribution<std::uint32_t> pick_col(0, kSketch - 1);
+    std::uniform_int_distribution<std::int32_t> pick_count(-3, 9);
+    for (const std::uint32_t nonzeros : {0u, 1u, 350u, kSketch}) {
+        std::vector<std::int32_t> sketch(kSketch, 0);
+        if (nonzeros == kSketch) {
+            for (auto& v : sketch)
+                v = pick_count(rng);
+        } else {
+            for (std::uint32_t i = 0; i < nonzeros; ++i)
+                sketch[pick_col(rng)] += pick_count(rng) | 1;
+        }
+        std::vector<float> out(kOut, -1.0f);
+        p.apply(sketch.data(), out.data());
+        for (std::uint32_t r = 0; r < kOut; ++r) {
+            std::int64_t acc = 0;
+            for (std::uint32_t c = 0; c < kSketch; ++c) {
+                const float w = p.entry(r, c);
+                if (w > 0.0f)
+                    acc += sketch[c];
+                else if (w < 0.0f)
+                    acc -= sketch[c];
+            }
+            assert(out[r] == static_cast<float>(acc) * scale);
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -83,6 +121,7 @@ int main() {
     test_achlioptas_seed_determinism();
     test_achlioptas_values();
     test_apply_nonzero();
+    test_achlioptas_apply_matches_exact_reference();
     test_output_dim_validation();
     return 0;
 }
