@@ -29,11 +29,20 @@ float gaussian_from_key(std::uint64_t key, std::uint64_t seed) noexcept {
 
 // Squared L2 is the dominant PQ training kernel: tiny subspaces still produce
 // millions of calls during assignment and k-means++ initialization.
+// NEON is the AArch64 baseline; AVX2 must be confirmed on the running CPU
+// (cached once, so the hot path pays one predictable branch).
+#if defined(SIMEON_HAS_AVX2)
+bool use_avx2() noexcept {
+    static const bool enabled = active_simd_tier() == SimdTier::Avx2;
+    return enabled;
+}
+#endif
+
 float l2_sq(const float* a, const float* b, std::uint32_t n) noexcept {
 #if defined(SIMEON_HAS_NEON)
     return simd::l2_squared_neon(a, b, n);
 #elif defined(SIMEON_HAS_AVX2)
-    return simd::l2_squared_avx2(a, b, n);
+    return use_avx2() ? simd::l2_squared_avx2(a, b, n) : simd::l2_squared_scalar(a, b, n);
 #else
     return simd::l2_squared_scalar(a, b, n);
 #endif
@@ -44,7 +53,10 @@ void l2_sq4(const float* a, const float* b0, const float* b1, const float* b2, c
 #if defined(SIMEON_HAS_NEON)
     simd::l2_squared4_neon(a, b0, b1, b2, b3, out4, n);
 #elif defined(SIMEON_HAS_AVX2)
-    simd::l2_squared4_avx2(a, b0, b1, b2, b3, out4, n);
+    if (use_avx2())
+        simd::l2_squared4_avx2(a, b0, b1, b2, b3, out4, n);
+    else
+        simd::l2_squared4_scalar(a, b0, b1, b2, b3, out4, n);
 #else
     simd::l2_squared4_scalar(a, b0, b1, b2, b3, out4, n);
 #endif
