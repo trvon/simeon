@@ -29,11 +29,20 @@ float gaussian_from_key(std::uint64_t key, std::uint64_t seed) noexcept {
 
 // Squared L2 is the dominant PQ training kernel: tiny subspaces still produce
 // millions of calls during assignment and k-means++ initialization.
+// NEON is the AArch64 baseline; AVX2 must be confirmed on the running CPU
+// (cached once, so the hot path pays one predictable branch).
+#if defined(SIMEON_HAS_AVX2)
+bool use_avx2() noexcept {
+    static const bool enabled = active_simd_tier() == SimdTier::Avx2;
+    return enabled;
+}
+#endif
+
 float l2_sq(const float* a, const float* b, std::uint32_t n) noexcept {
 #if defined(SIMEON_HAS_NEON)
     return simd::l2_squared_neon(a, b, n);
 #elif defined(SIMEON_HAS_AVX2)
-    return simd::l2_squared_avx2(a, b, n);
+    return use_avx2() ? simd::l2_squared_avx2(a, b, n) : simd::l2_squared_scalar(a, b, n);
 #else
     return simd::l2_squared_scalar(a, b, n);
 #endif
@@ -44,7 +53,10 @@ void l2_sq4(const float* a, const float* b0, const float* b1, const float* b2, c
 #if defined(SIMEON_HAS_NEON)
     simd::l2_squared4_neon(a, b0, b1, b2, b3, out4, n);
 #elif defined(SIMEON_HAS_AVX2)
-    simd::l2_squared4_avx2(a, b0, b1, b2, b3, out4, n);
+    if (use_avx2())
+        simd::l2_squared4_avx2(a, b0, b1, b2, b3, out4, n);
+    else
+        simd::l2_squared4_scalar(a, b0, b1, b2, b3, out4, n);
 #else
     simd::l2_squared4_scalar(a, b0, b1, b2, b3, out4, n);
 #endif
@@ -92,6 +104,40 @@ float inner_product_from_lut(std::span<const float> lut, std::uint32_t m, std::u
         acc += lut[static_cast<std::size_t>(mi) * k + code[mi]];
     }
     return acc;
+}
+
+// Scores `count` codes, four at a time. Interleaving independent accumulators hides the latency
+// of the serial add chain; each code still sums its m entries in order from 0.0f, so every
+// result equals inner_product_from_lut() bit for bit.
+template <typename CodeAt>
+void inner_product_from_lut_many(std::span<const float> lut, std::uint32_t m, std::uint32_t k,
+                                 CodeAt code_at, std::size_t count, float* out) noexcept {
+    const float* table = lut.data();
+    std::size_t i = 0;
+    for (; i + 4 <= count; i += 4) {
+        const std::uint8_t* c0 = code_at(i);
+        const std::uint8_t* c1 = code_at(i + 1);
+        const std::uint8_t* c2 = code_at(i + 2);
+        const std::uint8_t* c3 = code_at(i + 3);
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+        float a2 = 0.0f;
+        float a3 = 0.0f;
+        for (std::uint32_t mi = 0; mi < m; ++mi) {
+            const float* row = table + static_cast<std::size_t>(mi) * k;
+            a0 += row[c0[mi]];
+            a1 += row[c1[mi]];
+            a2 += row[c2[mi]];
+            a3 += row[c3[mi]];
+        }
+        out[i] = a0;
+        out[i + 1] = a1;
+        out[i + 2] = a2;
+        out[i + 3] = a3;
+    }
+    for (; i < count; ++i) {
+        out[i] = inner_product_from_lut(lut, m, k, code_at(i));
+    }
 }
 
 } // namespace
@@ -439,6 +485,23 @@ public:
         return inner_product_from_lut(lut_ip_, m_, k_, code);
     }
 
+    void inner_product_batch(const std::uint8_t* codes, std::size_t count,
+                             float* out) const noexcept {
+        const std::size_t stride = m_;
+        inner_product_from_lut_many(
+            lut_ip_, m_, k_, [codes, stride](std::size_t i) { return codes + i * stride; }, count,
+            out);
+    }
+
+    void inner_product_gather(const std::uint8_t* codes, const std::size_t* indices,
+                              std::size_t count, float* out) const noexcept {
+        const std::size_t stride = m_;
+        inner_product_from_lut_many(
+            lut_ip_, m_, k_,
+            [codes, indices, stride](std::size_t i) { return codes + indices[i] * stride; }, count,
+            out);
+    }
+
     std::span<const float> lut_ip() const noexcept { return {lut_ip_.data(), lut_ip_.size()}; }
 
 private:
@@ -459,6 +522,15 @@ PQInnerProductQuery& PQInnerProductQuery::operator=(PQInnerProductQuery&&) noexc
 
 float PQInnerProductQuery::inner_product(const std::uint8_t* code) const noexcept {
     return impl_->inner_product(code);
+}
+void PQInnerProductQuery::inner_product_batch(const std::uint8_t* codes, std::size_t count,
+                                              float* out) const noexcept {
+    impl_->inner_product_batch(codes, count, out);
+}
+void PQInnerProductQuery::inner_product_gather(const std::uint8_t* codes,
+                                               const std::size_t* indices, std::size_t count,
+                                               float* out) const noexcept {
+    impl_->inner_product_gather(codes, indices, count, out);
 }
 std::span<const float> PQInnerProductQuery::lut_ip() const noexcept {
     return impl_->lut_ip();

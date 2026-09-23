@@ -1,5 +1,9 @@
 #include "simeon/simeon.hpp"
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
+
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -50,11 +54,40 @@ std::uint32_t sketch_bucket(std::uint64_t hash, std::uint32_t dimension) noexcep
 
 } // namespace
 
+namespace {
+
+#if defined(SIMEON_HAS_AVX2)
+// SIMEON_HAS_AVX2 only means the AVX2/FMA kernels were compiled (in their own
+// TU); the rest of the library targets the baseline ISA. Confirm the running
+// CPU and OS support them before any dispatcher selects that tier.
+bool cpu_supports_avx2_fma() noexcept {
+#if defined(_MSC_VER) && !defined(__clang__)
+    int regs[4] = {};
+    __cpuid(regs, 0);
+    if (regs[0] < 7)
+        return false;
+    __cpuid(regs, 1);
+    const bool fma = (regs[2] & (1 << 12)) != 0;
+    const bool osxsave = (regs[2] & (1 << 27)) != 0;
+    if (!fma || !osxsave || (_xgetbv(0) & 0x6) != 0x6)
+        return false;
+    __cpuidex(regs, 7, 0);
+    return (regs[1] & (1 << 5)) != 0;
+#else
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#endif
+}
+#endif
+
+} // namespace
+
 SimdTier active_simd_tier() noexcept {
 #if defined(SIMEON_HAS_NEON)
     return SimdTier::Neon;
 #elif defined(SIMEON_HAS_AVX2)
-    return SimdTier::Avx2;
+    static const SimdTier tier = cpu_supports_avx2_fma() ? SimdTier::Avx2 : SimdTier::Scalar;
+    return tier;
 #else
     return SimdTier::Scalar;
 #endif

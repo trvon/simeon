@@ -1,7 +1,8 @@
 #include "simeon/bm25.hpp"
 
+#include "simeon/detail/ascii.hpp"
+
 #include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -28,7 +29,7 @@ std::string ascii_fold(std::string_view tok) {
     std::string out;
     out.reserve(tok.size());
     for (unsigned char c : tok) {
-        out.push_back(static_cast<char>(std::tolower(c)));
+        out.push_back(static_cast<char>(detail::ascii_tolower(c)));
     }
     return out;
 }
@@ -101,7 +102,7 @@ inline TokenizerConfig ngram_only_cfg(std::uint32_t lo, std::uint32_t hi) noexce
 }
 
 bool is_word_char(unsigned char c) noexcept {
-    return std::isalnum(c) != 0 || c == '_';
+    return detail::ascii_isalnum(c) || c == '_';
 }
 
 void collect_field_term_stats(std::string_view text, HashFamily family, std::uint64_t seed,
