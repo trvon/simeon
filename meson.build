@@ -107,6 +107,7 @@ common_srcs = [
   'src/aho_corasick.cpp',
   'src/text_rank.cpp',
   'src/fragment_geometry.cpp',
+  'src/static_embedding.cpp',
   'src/arch/scalar.cpp',
   'src/persistent_homology.cpp',
 ]
@@ -178,6 +179,7 @@ install_headers(
     'include/simeon/text_rank.hpp',
     'include/simeon/fragment_geometry.hpp',
     'include/simeon/persistent_homology.hpp',
+    'include/simeon/static_embedding.hpp',
   ],
   subdir: 'simeon',
 )

@@ -41,6 +41,15 @@ foreach name, src : simeon_tests
   test(name, exe, suite: 'simeon')
 endforeach
 
+static_embedding_test = executable('test_static_embedding', 'test_static_embedding.cpp',
+  dependencies: simeon_dep,
+  cpp_args: simeon_test_args,
+)
+test('test_static_embedding', static_embedding_test,
+  args: [meson.current_source_dir() / 'data/static_fixture'],
+  suite: 'simeon',
+)
+
 experiment_support_test = executable('test_experiment_support',
   ['test_experiment_support.cpp', '../benchmarks/experiment_support.cpp',
    '../benchmarks/fusion_experiment_support.cpp',
