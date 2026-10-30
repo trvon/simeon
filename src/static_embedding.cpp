@@ -99,13 +99,16 @@ void append_utf8(std::string& out, std::uint32_t cp) {
 }
 
 bool is_whitespace(std::uint32_t cp) {
-    return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' ||
-           (cp < 0x10000 && in_ranges(kSpaceSeparator, cp));
+    if (cp < 0x80)
+        return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r';
+    return cp < 0x10000 && in_ranges(kSpaceSeparator, cp);
 }
 
 bool is_control(std::uint32_t cp) {
     if (cp == '\t' || cp == '\n' || cp == '\r')
         return false;
+    if (cp < 0x80)
+        return cp < 0x20 || cp == 0x7F;
     return cp < 0x10000 && in_ranges(kControlOrFormat, cp);
 }
 
@@ -118,9 +121,9 @@ bool is_cjk(std::uint32_t cp) {
 }
 
 bool is_punctuation(std::uint32_t cp) {
-    if ((cp >= 33 && cp <= 47) || (cp >= 58 && cp <= 64) || (cp >= 91 && cp <= 96) ||
-        (cp >= 123 && cp <= 126))
-        return true;
+    if (cp < 0x80)
+        return (cp >= 33 && cp <= 47) || (cp >= 58 && cp <= 64) || (cp >= 91 && cp <= 96) ||
+               (cp >= 123 && cp <= 126);
     return cp < 0x10000 && in_ranges(kPunctuation, cp);
 }
 
@@ -231,8 +234,23 @@ std::string StaticEmbedding::normalize(std::string_view text) const {
     out.reserve(text.size() + 8);
     std::size_t i = 0;
     while (i < text.size()) {
+        const auto byte = static_cast<unsigned char>(text[i]);
+        if (byte < 0x80) {
+            // ASCII: no table lookups.
+            ++i;
+            if (byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r') {
+                out.push_back(' ');
+            } else if (byte < 0x20 || byte == 0x7F) {
+                continue;
+            } else if (lowercase_ && byte >= 'A' && byte <= 'Z') {
+                out.push_back(static_cast<char>(byte + ('a' - 'A')));
+            } else {
+                out.push_back(static_cast<char>(byte));
+            }
+            continue;
+        }
         const std::uint32_t cp = next_codepoint(text, i);
-        if (cp == 0 || cp == kReplacement || is_control(cp))
+        if (cp == kReplacement || is_control(cp))
             continue;
         if (is_whitespace(cp)) {
             out.push_back(' ');
@@ -265,8 +283,9 @@ std::string StaticEmbedding::normalize(std::string_view text) const {
 }
 
 void StaticEmbedding::wordpiece(std::string_view word, std::vector<std::uint32_t>& out) const {
-    // Code point boundaries of the word.
-    std::vector<std::size_t> starts;
+    // Code point boundaries of the word (buffers reused across calls on this thread).
+    thread_local std::vector<std::size_t> starts;
+    starts.clear();
     for (std::size_t i = 0; i < word.size();) {
         starts.push_back(i);
         next_codepoint(word, i);
@@ -282,7 +301,7 @@ void StaticEmbedding::wordpiece(std::string_view word, std::vector<std::uint32_t
     starts.push_back(word.size());
 
     const std::size_t mark = out.size();
-    std::string piece;
+    thread_local std::string piece;
     std::size_t start = 0;
     while (start < n) {
         std::size_t end = std::min(n, start + max_piece_chars_);
