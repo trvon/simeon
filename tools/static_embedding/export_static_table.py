@@ -6,13 +6,17 @@
 
 Format (little-endian):
     magic        8 bytes  "SMSTAT01"
-    version      u32      1
+    version      u32      2 (1: no added-token section)
     dim          u32
     vocab_size   u32
     flags        u32      bit0 lowercase, bit1 strip_accents
     unk_id       u32      0xFFFFFFFF when the vocabulary has no [UNK]
     max_word     u32      WordPiece max_input_chars_per_word
     vocab        vocab_size x (u16 length, UTF-8 bytes); continuation pieces start with "##"
+    added        (version 2) u32 count, then count x (u32 id, u32 flags: bit0 normalized,
+                 bit1 special). Added tokens are matched before pre-tokenization, leftmost-longest:
+                 special/non-normalized ones on the raw text, normalized ones on the normalized
+                 text (HuggingFace AddedVocabulary semantics; lstrip/rstrip only absorb spaces).
     scales       vocab_size x f32
     rows         vocab_size x dim x i8   (row value = int8 * scale)
 
@@ -36,16 +40,21 @@ def quantize(E):
     return scales.astype(np.float32), q
 
 
-def write_smstat(path, tokens, E, lowercase, strip_accents, unk_id, max_word):
+def write_smstat(path, tokens, E, lowercase, strip_accents, unk_id, max_word, added=()):
+    """added: iterable of (token id, normalized: bool, special: bool)."""
     scales, q = quantize(E)
     flags = (1 if lowercase else 0) | (2 if strip_accents else 0)
     with open(path, "wb") as f:
         f.write(b"SMSTAT01")
-        f.write(struct.pack("<6I", 1, q.shape[1], len(tokens), flags, unk_id, max_word))
+        f.write(struct.pack("<6I", 2, q.shape[1], len(tokens), flags, unk_id, max_word))
         for token in tokens:
             b = token.encode("utf-8")
             f.write(struct.pack("<H", len(b)))
             f.write(b)
+        added = list(added)
+        f.write(struct.pack("<I", len(added)))
+        for tid, normalized, special in added:
+            f.write(struct.pack("<II", tid, (1 if normalized else 0) | (2 if special else 0)))
         f.write(scales.astype("<f4").tobytes())
         f.write(q.tobytes())
     return scales, q
@@ -91,9 +100,19 @@ def main() -> int:
         E = (E - mu) @ vt[: a.dims].T
     dim = E.shape[1]
 
+    added = []
+    for at in tok.get("added_tokens") or []:
+        if at.get("single_word"):
+            print(f"unsupported added token (single_word): {at['content']!r}", file=sys.stderr)
+            return 2
+        if at["content"] not in model["vocab"] or model["vocab"][at["content"]] != at["id"]:
+            print(f"added token not in the vocabulary: {at['content']!r}", file=sys.stderr)
+            return 2
+        added.append((at["id"], bool(at.get("normalized", not at.get("special"))), bool(at.get("special"))))
     write_smstat(a.out, [t for t, _ in vocab], E, lowercase, strip_accents, unk_id,
-                 int(model.get("max_input_chars_per_word", 100)))
-    print(f"wrote {a.out}: vocab={len(vocab)} dim={dim} lowercase={lowercase} strip_accents={strip_accents}")
+                 int(model.get("max_input_chars_per_word", 100)), added)
+    print(f"wrote {a.out}: vocab={len(vocab)} dim={dim} added={len(added)} lowercase={lowercase} "
+          f"strip_accents={strip_accents}")
     return 0
 
 

@@ -12,7 +12,7 @@ import os
 import sys
 
 import numpy as np
-from tokenizers import Tokenizer, models, normalizers, pre_tokenizers
+from tokenizers import AddedToken, Tokenizer, models, normalizers, pre_tokenizers
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools", "static_embedding"))
@@ -28,6 +28,10 @@ PIECES = """##s ##ing ##ed ##er ##est ##ly ##able ##tion ##ness ##al ##ic ##ize 
 ##a ##b ##c ##d ##e ##f ##g ##h ##i ##k ##l ##m ##n ##o ##p ##r ##t ##u ##v ##x ##y ##z
 ##1 ##2 ##0 ##9 ##4 ##ll ##rd ##ps ##ee ##ou ##an ##en ##in ##on
 """.split()
+# Multi-character punctuation pieces as Tokenlearn adds them (normalized, lstrip/rstrip), plus a
+# special token matched on the raw text.
+ADDED = [").", "),", "...", ".,", "..", "”.", "!!", "²."]
+SPECIAL = ["[MASK]"]
 CHARS = list("abcdefghijklmnopqrstuvwxyz0123456789") + list(".,;:!?()[]{}'\"-/&%$#@*+=<>_~^|\\`") + ["中", "文", "の"]
 CASES = [
     "Vitamin D deficiency increases cardiovascular risk",
@@ -46,6 +50,10 @@ CASES = [
     "   ",
     "a",
     "The THE the",
+    "the end), and so on...",
+    "word.,next and ...... dots",
+    "e.g., (1990). “quoted”.",
+    "x². wow!!! [MASK] and [mask]",
 ]
 MAX_WORD = 20
 
@@ -56,18 +64,21 @@ def esc(s: str) -> str:
 
 def main() -> int:
     tokens = ["[UNK]"]
-    for t in WORDS + PIECES + CHARS:
+    for t in WORDS + PIECES + CHARS + ADDED + SPECIAL:
         if t not in tokens:
             tokens.append(t)
     vocab = {t: i for i, t in enumerate(tokens)}
     tk = Tokenizer(models.WordPiece(vocab=vocab, unk_token="[UNK]", max_input_chars_per_word=MAX_WORD))
     tk.normalizer = normalizers.BertNormalizer(clean_text=True, handle_chinese_chars=True, strip_accents=None, lowercase=True)
     tk.pre_tokenizer = pre_tokenizers.BertPreTokenizer()
+    tk.add_tokens([AddedToken(t, normalized=True, lstrip=True, rstrip=True) for t in ADDED])
+    tk.add_special_tokens([AddedToken(t, normalized=False, special=True) for t in SPECIAL])
+    added = [(vocab[t], True, False) for t in ADDED] + [(vocab[t], False, True) for t in SPECIAL]
 
     rng = np.random.default_rng(7)
     E = rng.standard_normal((len(tokens), 8)) * rng.uniform(0.2, 2.0, (len(tokens), 1))
     out = os.path.join(HERE, "tiny.smstat")
-    scales, q = write_smstat(out, tokens, E, True, True, vocab["[UNK]"], MAX_WORD)
+    scales, q = write_smstat(out, tokens, E, True, True, vocab["[UNK]"], MAX_WORD, added)
     deq = q.astype(np.float64) * scales.astype(np.float64)[:, None]
 
     with open(os.path.join(HERE, "cases.tsv"), "w", encoding="utf-8") as f:

@@ -2,11 +2,13 @@
 
 // Static (lookup) text embeddings: WordPiece tokens -> mean of table rows -> L2 normalize.
 //
-// The table is a SMSTAT01 file (see tools/static_embedding/export_static_table.py), typically exported from a
-// model2vec model with PCA and per-row int8. Tokenization follows HuggingFace's BertNormalizer,
-// BertPreTokenizer and WordPiece. Limits: accent stripping and lowercasing are exact for Latin,
-// Greek and Cyrillic (tables generated from Unicode data); other scripts pass through unchanged.
+// The table is a SMSTAT01 file (see tools/static_embedding/export_static_table.py), typically
+// exported from a model2vec model with PCA and per-row int8. Tokenization follows HuggingFace's
+// BertNormalizer, BertPreTokenizer and WordPiece. Limits: accent stripping and lowercasing are
+// exact for Latin, Greek and Cyrillic (tables generated from Unicode data); other scripts pass
+// through unchanged.
 
+#include <bitset>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -36,8 +38,22 @@ public:
     std::vector<float> encode(std::string_view text) const;
 
 private:
+    // Added tokens (HuggingFace AddedVocabulary): matched leftmost-longest before
+    // pre-tokenization; non-normalized ones on the raw text, normalized ones after normalization.
+    struct AddedTokenSet {
+        std::unordered_map<std::string, std::uint32_t> ids;
+        std::bitset<256> firstBytes;
+        std::size_t maxBytes = 0;
+        bool empty() const noexcept { return ids.empty(); }
+    };
+
     std::string normalize(std::string_view text) const;
     void wordpiece(std::string_view word, std::vector<std::uint32_t>& out) const;
+    void pretokenize(std::string_view normalized, std::vector<std::uint32_t>& out) const;
+    void normalizedSegment(std::string_view raw, std::vector<std::uint32_t>& out) const;
+    template <class Fn>
+    static void splitAdded(std::string_view text, const AddedTokenSet& set,
+                           std::vector<std::uint32_t>& out, Fn&& onSegment);
 
     std::uint32_t dim_ = 0;
     std::uint32_t unk_id_ = UINT32_MAX;
@@ -48,6 +64,8 @@ private:
     bool strip_accents_ = true;
     std::vector<std::string> tokens_;
     std::unordered_map<std::string, std::uint32_t> ids_;
+    AddedTokenSet addedRaw_;        // normalized = false (e.g. special tokens)
+    AddedTokenSet addedNormalized_; // normalized = true
     std::vector<float> scales_;
     std::vector<std::int8_t> rows_;
 };
