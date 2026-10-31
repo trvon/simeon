@@ -175,7 +175,8 @@ StaticEmbedding StaticEmbedding::from_bytes(std::span<const std::uint8_t> bytes)
     if (std::memcmp(bytes.data(), "SMSTAT01", 8) != 0)
         throw std::runtime_error("StaticEmbedding: bad magic");
     r.pos = 8;
-    if (r.u32() != 1)
+    const std::uint32_t version = r.u32();
+    if (version != 1 && version != 2)
         throw std::runtime_error("StaticEmbedding: unsupported version");
     StaticEmbedding e;
     e.dim_ = r.u32();
@@ -210,6 +211,24 @@ StaticEmbedding StaticEmbedding::from_bytes(std::span<const std::uint8_t> bytes)
         }
         e.ids_.emplace(tok, i);
         e.tokens_.push_back(std::move(tok));
+    }
+    if (version >= 2) {
+        const std::uint32_t added = r.u32();
+        if (added > vocab)
+            throw std::runtime_error("StaticEmbedding: implausible added-token count");
+        for (std::uint32_t k = 0; k < added; ++k) {
+            const std::uint32_t id = r.u32();
+            const std::uint32_t aflags = r.u32();
+            if (id >= vocab)
+                throw std::runtime_error("StaticEmbedding: added token id out of range");
+            const std::string& content = e.tokens_[id];
+            if (content.empty())
+                throw std::runtime_error("StaticEmbedding: empty added token");
+            AddedTokenSet& set = (aflags & 1u) != 0 ? e.addedNormalized_ : e.addedRaw_;
+            set.ids.emplace(content, id);
+            set.firstBytes.set(static_cast<unsigned char>(content.front()));
+            set.maxBytes = std::max(set.maxBytes, content.size());
+        }
     }
     r.need(static_cast<std::size_t>(vocab) * 4);
     e.scales_.resize(vocab);
@@ -328,13 +347,50 @@ void StaticEmbedding::wordpiece(std::string_view word, std::vector<std::uint32_t
     }
 }
 
-std::vector<std::uint32_t> StaticEmbedding::tokenize(std::string_view text) const {
-    const std::string norm = normalize(text);
-    std::vector<std::uint32_t> ids;
+template <class Fn>
+void StaticEmbedding::splitAdded(std::string_view text, const AddedTokenSet& set,
+                                 std::vector<std::uint32_t>& out, Fn&& onSegment) {
+    if (set.empty()) {
+        onSegment(text);
+        return;
+    }
+    thread_local std::string probe;
+    std::size_t segStart = 0;
+    std::size_t i = 0;
+    while (i < text.size()) {
+        if (!set.firstBytes.test(static_cast<unsigned char>(text[i]))) {
+            ++i;
+            continue;
+        }
+        std::size_t matched = 0;
+        std::uint32_t id = 0;
+        for (std::size_t len = std::min(set.maxBytes, text.size() - i); len > 0; --len) {
+            probe.assign(text.substr(i, len));
+            if (const auto it = set.ids.find(probe); it != set.ids.end()) {
+                matched = len;
+                id = it->second;
+                break;
+            }
+        }
+        if (matched == 0) {
+            ++i;
+            continue;
+        }
+        if (i > segStart)
+            onSegment(text.substr(segStart, i - segStart));
+        out.push_back(id);
+        i += matched;
+        segStart = i;
+    }
+    if (segStart < text.size())
+        onSegment(text.substr(segStart));
+}
+
+void StaticEmbedding::pretokenize(std::string_view norm, std::vector<std::uint32_t>& ids) const {
     std::size_t word_start = std::string::npos;
     auto flush = [&](std::size_t end) {
         if (word_start != std::string::npos) {
-            wordpiece(std::string_view(norm).substr(word_start, end - word_start), ids);
+            wordpiece(norm.substr(word_start, end - word_start), ids);
             word_start = std::string::npos;
         }
     };
@@ -346,12 +402,25 @@ std::vector<std::uint32_t> StaticEmbedding::tokenize(std::string_view text) cons
             flush(at);
         } else if (is_punctuation(cp)) {
             flush(at);
-            wordpiece(std::string_view(norm).substr(at, i - at), ids);
+            wordpiece(norm.substr(at, i - at), ids);
         } else if (word_start == std::string::npos) {
             word_start = at;
         }
     }
     flush(norm.size());
+}
+
+void StaticEmbedding::normalizedSegment(std::string_view raw,
+                                        std::vector<std::uint32_t>& ids) const {
+    const std::string norm = normalize(raw);
+    splitAdded(norm, addedNormalized_, ids,
+               [&](std::string_view segment) { pretokenize(segment, ids); });
+}
+
+std::vector<std::uint32_t> StaticEmbedding::tokenize(std::string_view text) const {
+    std::vector<std::uint32_t> ids;
+    splitAdded(text, addedRaw_, ids,
+               [&](std::string_view segment) { normalizedSegment(segment, ids); });
     return ids;
 }
 
