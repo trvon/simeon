@@ -20,6 +20,7 @@ simeon_tests = {
   'test_matryoshka_tuner': 'test_matryoshka_tuner.cpp',
   'test_projection_fwht': 'test_projection_fwht.cpp',
   'test_bm25_variants': 'test_bm25_variants.cpp',
+  'test_bm25_memory': 'test_bm25_memory.cpp',
   'test_query_router': 'test_query_router.cpp',
   'test_query_router_post_retrieval': 'test_query_router_post_retrieval.cpp',
   'test_pmi': 'test_pmi.cpp',
