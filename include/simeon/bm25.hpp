@@ -138,14 +138,20 @@ struct Bm25Config {
     // LayeredW per-bigram IDF reweighting exponent (Bendersky-Croft 2010).
     // β=0 reduces to fixed-λ Layered; β=1 is canonical IDF reweighting.
     float layered_w_beta = 1.0f;
-    // Soft memory cap in bytes, as counted by Bm25Index::memory_bytes().
-    // 0 = unlimited. Once the index holds this much, try_add_doc() refuses
-    // new docs and add_doc() throws Bm25MemoryBudgetExceeded; the index is
-    // left unchanged and can still be finalized and scored. The cap is
-    // checked before each doc, so it can be exceeded by one doc's postings.
-    // It bounds live heap. Peak RSS while building runs up to ~2x higher:
-    // the largest arrays double when they grow, so old and new copies
-    // briefly coexist. Size the cap at about half the memory you can spare.
+    // Soft cap in bytes on memory the index owns, as counted by
+    // Bm25Index::memory_bytes(). 0 = unlimited. Once the index holds this
+    // much, try_add_doc() refuses new docs and add_doc() throws
+    // Bm25MemoryBudgetExceeded; the index is left unchanged and can still be
+    // finalized and scored. The cap is checked before each doc, so it can be
+    // exceeded by one doc's postings. reserve_docs() keeps up-front space
+    // within it and skips reservations that do not fit.
+    //
+    // Not counted: per-thread scratch used while adding one document, which
+    // grows with that document's unique terms and is released after the
+    // document once above ~1 MiB per buffer. Peak RSS while building also
+    // runs up to ~2x the cap: the largest arrays double when they grow, so
+    // old and new copies briefly coexist. Size the cap at about half the
+    // memory you can spare.
     std::size_t max_memory_bytes = 0;
 };
 

@@ -150,6 +150,25 @@ void test_reserve_docs_is_bounded() {
     Bm25Index capped(cfg);
     capped.reserve_docs(1'000'000);
     assert(capped.memory_bytes() <= cfg.max_memory_bytes / 2);
+
+    // Tiny budgets: up-front space stays within half the budget, and a
+    // budget too small for any table reserves nothing.
+    for (std::size_t tiny : {std::size_t{1}, std::size_t{64}, std::size_t{1024}}) {
+        Bm25Config tcfg = make_cfg(Bm25Variant::SubwordAwareBackoff, true);
+        tcfg.max_memory_bytes = tiny;
+        Bm25Index t(tcfg);
+        t.reserve_docs(1'000);
+        assert(t.memory_bytes() <= tiny / 2);
+        if (tiny == 1)
+            assert(t.memory_bytes() == 0);
+        // Docs are admitted until the cap is reached, then refused.
+        std::size_t added = 0;
+        while (t.try_add_doc("alpha beta gamma delta"))
+            ++added;
+        assert(added >= 1);
+        assert(t.memory_bytes() >= tiny);
+        CHECK_VALID(t);
+    }
 }
 
 void test_accounting_tracks_every_add() {

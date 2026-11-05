@@ -557,23 +557,51 @@ void Bm25Index::reserve_docs(std::size_t expected_docs) {
         // entry plus key and index slots at up to 2/0.7 slots per entry.
         const std::size_t share = cfg_.max_memory_bytes / 16;
         const std::size_t per_entry = sizeof(PostingsMap::value_type) + 36;
-        const std::size_t cap_entries = std::max<std::size_t>(1, share / per_entry);
+        // A share too small for one entry reserves nothing: the minimum
+        // table size alone could exceed a tiny budget.
+        const std::size_t cap_entries = share / per_entry;
         word_est = std::min(word_est, cap_entries);
         ngram_est = std::min(ngram_est, cap_entries);
-        doc_est = std::min(doc_est, std::max<std::size_t>(1, share / (2 * sizeof(std::uint32_t))));
+        doc_est = std::min(doc_est, share / (2 * sizeof(std::uint32_t)));
     }
+    if (doc_est == 0 && word_est == 0)
+        return;
 
-    postings_.reserve(word_est);
-    doc_lengths_.reserve(doc_est);
+    if (word_est > 0)
+        postings_.reserve(word_est);
+    if (doc_est > 0)
+        doc_lengths_.reserve(doc_est);
     if (cfg_.variant == Bm25Variant::SubwordAwareBackoff) {
-        ngram_postings_.reserve(ngram_est);
-        ngram_doc_lengths_.reserve(doc_est);
+        if (ngram_est > 0)
+            ngram_postings_.reserve(ngram_est);
+        if (doc_est > 0)
+            ngram_doc_lengths_.reserve(doc_est);
     }
-    if (cfg_.build_word_bigrams) {
+    if (cfg_.build_word_bigrams && word_est > 0) {
         ordered_bigram_postings_.reserve(word_est);
         unordered_bigram_postings_.reserve(word_est);
     }
 }
+
+namespace {
+
+// Per-thread scratch for add_doc() is not part of any index and is not counted
+// by memory_bytes(). Keep it small: after a document with many unique terms,
+// release scratch that grew past ~1 MiB instead of holding it for the thread.
+constexpr std::size_t kScratchKeepSlots = std::size_t{1} << 16;
+constexpr std::size_t kScratchKeepWords = std::size_t{1} << 17;
+
+void trim_scratch(FlatHashMapU64<std::uint32_t>& m) {
+    if (m.capacity() > kScratchKeepSlots)
+        m = FlatHashMapU64<std::uint32_t>{};
+}
+
+void trim_scratch(std::vector<std::uint64_t>& v) {
+    if (v.capacity() > kScratchKeepWords)
+        std::vector<std::uint64_t>().swap(v);
+}
+
+} // namespace
 
 std::size_t Bm25Index::list_alloc_bytes(std::size_t cap) noexcept {
     if (cap == 0)
@@ -687,6 +715,7 @@ bool Bm25Index::try_add_doc(std::string_view text, std::string_view aux_text) {
         for (const auto& [h, c] : ord_bgm_tf) {
             append_posting(ordered_bigram_postings_[h], did, c, bigram_list_bytes_);
         }
+        trim_scratch(ord_bgm_tf);
 
         // Unordered bigrams: every pair within `bigram_unordered_window`
         // positions of each other, canonicalized via (min, max) so (a,b) and
@@ -710,6 +739,7 @@ bool Bm25Index::try_add_doc(std::string_view text, std::string_view aux_text) {
         for (const auto& [h, c] : unord_bgm_tf) {
             append_posting(unordered_bigram_postings_[h], did, c, bigram_list_bytes_);
         }
+        trim_scratch(unord_bgm_tf);
     }
 
     bool aux_active = !aux_doc_lengths_.empty();
@@ -724,6 +754,9 @@ bool Bm25Index::try_add_doc(std::string_view text, std::string_view aux_text) {
                   sab ? &aux_ngram_doc_lengths_ : nullptr, sab ? &aux_ngram_postings_ : nullptr,
                   sab ? &aux_ngram_list_bytes_ : nullptr);
     }
+    trim_scratch(tf);
+    trim_scratch(ngram_tf);
+    trim_scratch(ordered_words);
     return true;
 }
 
