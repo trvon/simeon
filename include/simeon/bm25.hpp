@@ -5,6 +5,8 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -136,6 +138,43 @@ struct Bm25Config {
     // LayeredW per-bigram IDF reweighting exponent (Bendersky-Croft 2010).
     // β=0 reduces to fixed-λ Layered; β=1 is canonical IDF reweighting.
     float layered_w_beta = 1.0f;
+    // Soft cap in bytes on memory the index owns, as counted by
+    // Bm25Index::memory_bytes(). 0 = unlimited. Once the index holds this
+    // much, try_add_doc() refuses new docs and add_doc() throws
+    // Bm25MemoryBudgetExceeded; the index is left unchanged and can still be
+    // finalized and scored. The cap is checked before each doc, so it can be
+    // exceeded by one doc's postings. reserve_docs() keeps up-front space
+    // within it and skips reservations that do not fit.
+    //
+    // Not counted: per-thread scratch used while adding one document, which
+    // grows with that document's unique terms and is released after the
+    // document once above ~1 MiB per buffer. Peak RSS while building also
+    // runs up to ~2x the cap: the largest arrays double when they grow, so
+    // old and new copies briefly coexist. Size the cap at about half the
+    // memory you can spare.
+    std::size_t max_memory_bytes = 0;
+};
+
+// Thrown by Bm25Index::add_doc() when Bm25Config::max_memory_bytes is reached.
+class Bm25MemoryBudgetExceeded : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// Bytes held by each part of a Bm25Index. Posting-list bytes count each list's
+// capacity rounded up to a 16-byte allocation; other allocator overhead is not
+// counted. Values are approximate, but they track growth and are O(1) to read.
+struct Bm25MemoryBreakdown {
+    std::size_t doc_lengths = 0; // all per-doc length arrays
+    std::size_t word = 0;        // body word postings (map + lists)
+    std::size_t aux_word = 0;    // aux-field word postings
+    std::size_t ngram = 0;       // SubwordAwareBackoff body n-gram postings
+    std::size_t aux_ngram = 0;   // SubwordAwareBackoff aux n-gram postings
+    std::size_t bigram = 0;      // ordered + unordered word-bigram postings
+    std::size_t forward = 0;     // lazy forward index (PRF)
+    std::size_t total() const noexcept {
+        return doc_lengths + word + aux_word + ngram + aux_ngram + bigram + forward;
+    }
 };
 
 // Sequential Dependence Model (Metzler & Croft 2005, SIGIR). Adds ordered
@@ -194,7 +233,21 @@ public:
     // the default router and shipped production rows remain body-only unless the
     // caller explicitly uses score_bm25f().
     void add_doc(std::string_view text, std::string_view aux_text);
+    // Like add_doc(), but returns false instead of throwing when the memory
+    // budget is reached. A false return leaves the index unchanged.
+    // Still throws std::runtime_error after finalize().
+    bool try_add_doc(std::string_view text, std::string_view aux_text = {});
     void finalize();
+
+    // Approximate bytes held by the index; see Bm25MemoryBreakdown. O(1).
+    std::size_t memory_bytes() const noexcept { return memory_breakdown().total(); }
+    Bm25MemoryBreakdown memory_breakdown() const noexcept;
+    bool finalized() const noexcept { return finalized_; }
+
+    // Full structural check, O(total postings). Returns an empty string when
+    // every invariant holds, otherwise a description of the first violation.
+    // For tests and fuzzers; not for hot paths.
+    std::string validate() const;
     void score(std::string_view query, std::span<float> out_scores) const;
     // Opt-in multi-field scoring path. `weight_aux = 0` recovers body-only
     // BM25. Useful for explicit auxiliary fields, but not part of the default
@@ -313,6 +366,23 @@ private:
         std::uint64_t total_tf = 0;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> docs;
     };
+    using PostingsMap = FlatHashMapU64<TermPostings>;
+
+    // Allocation size counted for one posting list of `cap` entries.
+    static std::size_t list_alloc_bytes(std::size_t cap) noexcept;
+    // Sum of list_alloc_bytes() over a table. O(terms).
+    static std::size_t count_list_bytes(const PostingsMap& table) noexcept;
+    // Append (did, tf) to a posting list and charge capacity growth to `list_bytes`.
+    static void append_posting(TermPostings& tp, std::uint32_t did, std::uint32_t tf,
+                               std::size_t& list_bytes);
+
+    // Running totals of list_alloc_bytes() per table, kept in step with the
+    // posting lists so memory_bytes() stays O(1). validate() rechecks them.
+    std::size_t word_list_bytes_ = 0;
+    std::size_t aux_word_list_bytes_ = 0;
+    std::size_t ngram_list_bytes_ = 0;
+    std::size_t aux_ngram_list_bytes_ = 0;
+    std::size_t bigram_list_bytes_ = 0;
 
     Bm25Config cfg_;
     std::vector<std::uint32_t> doc_lengths_;
@@ -338,6 +408,8 @@ private:
     struct ForwardSync {
         std::atomic<bool> ready{false};
         std::mutex mtx;
+        // Bytes held by forward_, published with `ready`.
+        std::atomic<std::size_t> bytes{0};
     };
     mutable std::unique_ptr<ForwardSync> forward_sync_ = std::make_unique<ForwardSync>();
     // One-time O(total postings) inversion of postings_ into forward_; a no-op

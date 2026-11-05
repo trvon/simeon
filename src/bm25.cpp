@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -400,6 +401,10 @@ void Bm25Index::ensure_forward_index() const {
                 forward_[did].emplace_back(h, tf);
         }
     }
+    std::size_t fwd_bytes = forward_.capacity() * sizeof(forward_[0]);
+    for (const auto& row : forward_)
+        fwd_bytes += row.capacity() * sizeof(row[0]);
+    forward_sync_->bytes.store(fwd_bytes, std::memory_order_relaxed);
     forward_sync_->ready.store(true, std::memory_order_release);
 }
 
@@ -534,27 +539,110 @@ void Bm25Index::score_weighted_hashes(
 void Bm25Index::reserve_docs(std::size_t expected_docs) {
     if (finalized_ || expected_docs == 0)
         return;
-    const std::size_t word_est =
-        std::min<std::size_t>(10'000'000u, std::max<std::size_t>(128u, expected_docs * 100u));
-    const std::size_t ngram_est =
-        std::min<std::size_t>(100'000'000u, std::max<std::size_t>(1024u, expected_docs * 1100u));
-
-    postings_.reserve(word_est);
-    aux_postings_.reserve(word_est);
-    doc_lengths_.reserve(expected_docs);
-    aux_doc_lengths_.reserve(expected_docs);
-    if (cfg_.variant == Bm25Variant::SubwordAwareBackoff) {
-        ngram_postings_.reserve(ngram_est);
-        aux_ngram_postings_.reserve(ngram_est);
-        ngram_doc_lengths_.reserve(expected_docs);
-        aux_ngram_doc_lengths_.reserve(expected_docs);
+    // Pre-size the per-doc arrays fully, but keep map reservations modest:
+    // the maps grow geometrically on their own. Sizing them from per-doc
+    // guesses (100 words, 1100 n-grams per doc) reserved ~99M n-gram entries
+    // per table for a 90k-doc corpus, several GB before any doc arrived.
+    // Aux maps are not reserved: most callers never use the aux field.
+    constexpr std::size_t kMaxWordReserve = std::size_t{1} << 18;
+    constexpr std::size_t kMaxNgramReserve = std::size_t{1} << 19;
+    std::size_t word_est =
+        std::min<std::size_t>(kMaxWordReserve, std::max<std::size_t>(128u, expected_docs * 16u));
+    std::size_t ngram_est =
+        std::min<std::size_t>(kMaxNgramReserve, std::max<std::size_t>(1024u, expected_docs * 64u));
+    std::size_t doc_est = expected_docs;
+    if (cfg_.max_memory_bytes > 0) {
+        // Each reservation (doc arrays, each map) gets 1/16 of the budget, so
+        // up-front space stays under a third of it. Per entry: the dense
+        // entry plus key and index slots at up to 2/0.7 slots per entry.
+        const std::size_t share = cfg_.max_memory_bytes / 16;
+        const std::size_t per_entry = sizeof(PostingsMap::value_type) + 36;
+        // A share too small for one entry reserves nothing: the minimum
+        // table size alone could exceed a tiny budget.
+        const std::size_t cap_entries = share / per_entry;
+        word_est = std::min(word_est, cap_entries);
+        ngram_est = std::min(ngram_est, cap_entries);
+        doc_est = std::min(doc_est, share / (2 * sizeof(std::uint32_t)));
     }
-    if (cfg_.build_word_bigrams) {
-        // Bigrams sublinear in unique words but in-doc counts; use the word
-        // estimate as a generous upper bound.
+    if (doc_est == 0 && word_est == 0)
+        return;
+
+    if (word_est > 0)
+        postings_.reserve(word_est);
+    if (doc_est > 0)
+        doc_lengths_.reserve(doc_est);
+    if (cfg_.variant == Bm25Variant::SubwordAwareBackoff) {
+        if (ngram_est > 0)
+            ngram_postings_.reserve(ngram_est);
+        if (doc_est > 0)
+            ngram_doc_lengths_.reserve(doc_est);
+    }
+    if (cfg_.build_word_bigrams && word_est > 0) {
         ordered_bigram_postings_.reserve(word_est);
         unordered_bigram_postings_.reserve(word_est);
     }
+}
+
+namespace {
+
+// Per-thread scratch for add_doc() is not part of any index and is not counted
+// by memory_bytes(). Keep it small: after a document with many unique terms,
+// release scratch that grew past ~1 MiB instead of holding it for the thread.
+constexpr std::size_t kScratchKeepSlots = std::size_t{1} << 16;
+constexpr std::size_t kScratchKeepWords = std::size_t{1} << 17;
+
+void trim_scratch(FlatHashMapU64<std::uint32_t>& m) {
+    if (m.capacity() > kScratchKeepSlots)
+        m = FlatHashMapU64<std::uint32_t>{};
+}
+
+void trim_scratch(std::vector<std::uint64_t>& v) {
+    if (v.capacity() > kScratchKeepWords)
+        std::vector<std::uint64_t>().swap(v);
+}
+
+} // namespace
+
+std::size_t Bm25Index::list_alloc_bytes(std::size_t cap) noexcept {
+    if (cap == 0)
+        return 0;
+    const std::size_t raw = cap * sizeof(std::pair<std::uint32_t, std::uint32_t>);
+    return (raw + 15u) & ~std::size_t{15u};
+}
+
+std::size_t Bm25Index::count_list_bytes(const PostingsMap& table) noexcept {
+    std::size_t total = 0;
+    for (const auto& [h, tp] : table) {
+        (void)h;
+        total += list_alloc_bytes(tp.docs.capacity());
+    }
+    return total;
+}
+
+void Bm25Index::append_posting(TermPostings& tp, std::uint32_t did, std::uint32_t tf,
+                               std::size_t& list_bytes) {
+    const std::size_t before = tp.docs.capacity();
+    tp.docs.emplace_back(did, tf);
+    const std::size_t after = tp.docs.capacity();
+    if (after != before)
+        list_bytes += list_alloc_bytes(after) - list_alloc_bytes(before);
+}
+
+Bm25MemoryBreakdown Bm25Index::memory_breakdown() const noexcept {
+    Bm25MemoryBreakdown m;
+    const auto vec_bytes = [](const std::vector<std::uint32_t>& v) {
+        return v.capacity() * sizeof(std::uint32_t);
+    };
+    m.doc_lengths = vec_bytes(doc_lengths_) + vec_bytes(aux_doc_lengths_) +
+                    vec_bytes(ngram_doc_lengths_) + vec_bytes(aux_ngram_doc_lengths_);
+    m.word = postings_.memory_bytes() + word_list_bytes_;
+    m.aux_word = aux_postings_.memory_bytes() + aux_word_list_bytes_;
+    m.ngram = ngram_postings_.memory_bytes() + ngram_list_bytes_;
+    m.aux_ngram = aux_ngram_postings_.memory_bytes() + aux_ngram_list_bytes_;
+    m.bigram = ordered_bigram_postings_.memory_bytes() + unordered_bigram_postings_.memory_bytes() +
+               bigram_list_bytes_;
+    m.forward = forward_sync_ ? forward_sync_->bytes.load(std::memory_order_acquire) : 0;
+    return m;
 }
 
 void Bm25Index::add_doc(std::string_view text) {
@@ -562,16 +650,26 @@ void Bm25Index::add_doc(std::string_view text) {
 }
 
 void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
+    if (!try_add_doc(text, aux_text)) {
+        throw Bm25MemoryBudgetExceeded(
+            "Bm25Index::add_doc: memory budget of " + std::to_string(cfg_.max_memory_bytes) +
+            " bytes reached at " + std::to_string(doc_count()) + " docs");
+    }
+}
+
+bool Bm25Index::try_add_doc(std::string_view text, std::string_view aux_text) {
     if (finalized_)
         throw std::runtime_error("Bm25Index::add_doc after finalize()");
+    if (cfg_.max_memory_bytes > 0 && memory_bytes() >= cfg_.max_memory_bytes)
+        return false;
     const std::uint32_t did = static_cast<std::uint32_t>(doc_lengths_.size());
     static thread_local FlatHashMapU64<std::uint32_t> tf;
     static thread_local FlatHashMapU64<std::uint32_t> ngram_tf;
     static thread_local std::vector<std::uint64_t> ordered_words;
     auto add_field = [&](std::string_view field_text, std::vector<std::uint32_t>& lengths,
-                         FlatHashMapU64<TermPostings>& postings, bool keep_ordered,
-                         std::vector<std::uint32_t>* ngram_lengths,
-                         FlatHashMapU64<TermPostings>* ngram_postings) {
+                         PostingsMap& postings, std::size_t& list_bytes, bool keep_ordered,
+                         std::vector<std::uint32_t>* ngram_lengths, PostingsMap* ngram_postings,
+                         std::size_t* ngram_list_bytes) {
         tf.clear();
         if (keep_ordered)
             ordered_words.clear();
@@ -589,21 +687,22 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
         lengths.push_back(dl);
         postings.reserve(postings.size() + tf.size());
         for (const auto& [h, c] : tf) {
-            postings[h].docs.emplace_back(did, c);
+            append_posting(postings[h], did, c, list_bytes);
         }
 
         if (ngram_lengths && ngram_postings) {
             ngram_lengths->push_back(ngram_dl);
             ngram_postings->reserve(ngram_postings->size() + ngram_tf.size());
             for (const auto& [h, c] : ngram_tf) {
-                (*ngram_postings)[h].docs.emplace_back(did, c);
+                append_posting((*ngram_postings)[h], did, c, *ngram_list_bytes);
             }
         }
     };
 
-    add_field(text, doc_lengths_, postings_, cfg_.build_word_bigrams,
-              cfg_.variant == Bm25Variant::SubwordAwareBackoff ? &ngram_doc_lengths_ : nullptr,
-              cfg_.variant == Bm25Variant::SubwordAwareBackoff ? &ngram_postings_ : nullptr);
+    const bool sab = cfg_.variant == Bm25Variant::SubwordAwareBackoff;
+    add_field(text, doc_lengths_, postings_, word_list_bytes_, cfg_.build_word_bigrams,
+              sab ? &ngram_doc_lengths_ : nullptr, sab ? &ngram_postings_ : nullptr,
+              sab ? &ngram_list_bytes_ : nullptr);
 
     if (cfg_.build_word_bigrams) {
         // Ordered bigrams: adjacent (w_i, w_{i+1}) pairs.
@@ -614,8 +713,9 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
         }
         ordered_bigram_postings_.reserve(ordered_bigram_postings_.size() + ord_bgm_tf.size());
         for (const auto& [h, c] : ord_bgm_tf) {
-            ordered_bigram_postings_[h].docs.emplace_back(did, c);
+            append_posting(ordered_bigram_postings_[h], did, c, bigram_list_bytes_);
         }
+        trim_scratch(ord_bgm_tf);
 
         // Unordered bigrams: every pair within `bigram_unordered_window`
         // positions of each other, canonicalized via (min, max) so (a,b) and
@@ -637,8 +737,9 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
         }
         unordered_bigram_postings_.reserve(unordered_bigram_postings_.size() + unord_bgm_tf.size());
         for (const auto& [h, c] : unord_bgm_tf) {
-            unordered_bigram_postings_[h].docs.emplace_back(did, c);
+            append_posting(unordered_bigram_postings_[h], did, c, bigram_list_bytes_);
         }
+        trim_scratch(unord_bgm_tf);
     }
 
     bool aux_active = !aux_doc_lengths_.empty();
@@ -649,11 +750,14 @@ void Bm25Index::add_doc(std::string_view text, std::string_view aux_text) {
         aux_active = true;
     }
     if (aux_active) {
-        add_field(
-            aux_text, aux_doc_lengths_, aux_postings_, false,
-            cfg_.variant == Bm25Variant::SubwordAwareBackoff ? &aux_ngram_doc_lengths_ : nullptr,
-            cfg_.variant == Bm25Variant::SubwordAwareBackoff ? &aux_ngram_postings_ : nullptr);
+        add_field(aux_text, aux_doc_lengths_, aux_postings_, aux_word_list_bytes_, false,
+                  sab ? &aux_ngram_doc_lengths_ : nullptr, sab ? &aux_ngram_postings_ : nullptr,
+                  sab ? &aux_ngram_list_bytes_ : nullptr);
     }
+    trim_scratch(tf);
+    trim_scratch(ngram_tf);
+    trim_scratch(ordered_words);
+    return true;
 }
 
 void Bm25Index::finalize() {
@@ -662,6 +766,7 @@ void Bm25Index::finalize() {
     // A re-finalized index must rebuild the forward view on next use. finalize()
     // is single-threaded, so a plain reset is sufficient.
     forward_sync_->ready.store(false, std::memory_order_relaxed);
+    forward_sync_->bytes.store(0, std::memory_order_relaxed);
     forward_.clear();
     auto finalize_word_field = [&](const std::vector<std::uint32_t>& lengths,
                                    FlatHashMapU64<TermPostings>& postings, float& avg_dl,
@@ -764,6 +869,13 @@ void Bm25Index::finalize() {
             table->shrink_to_fit();
         }
     }
+    // Lists were shrunk and n-gram tables pruned; recount once.
+    word_list_bytes_ = count_list_bytes(postings_);
+    aux_word_list_bytes_ = count_list_bytes(aux_postings_);
+    ngram_list_bytes_ = count_list_bytes(ngram_postings_);
+    aux_ngram_list_bytes_ = count_list_bytes(aux_ngram_postings_);
+    bigram_list_bytes_ =
+        count_list_bytes(ordered_bigram_postings_) + count_list_bytes(unordered_bigram_postings_);
     finalized_ = true;
 }
 
@@ -1581,6 +1693,132 @@ void Bm25Index::score_wsdm(std::string_view query, std::span<float> out_scores,
             }
         }
     }
+}
+
+std::string Bm25Index::validate() const {
+    const std::size_t n = doc_lengths_.size();
+    const bool sab = cfg_.variant == Bm25Variant::SubwordAwareBackoff;
+    const bool aux_active = !aux_doc_lengths_.empty();
+    constexpr std::size_t kSkip = std::numeric_limits<std::size_t>::max();
+
+    if (aux_active && aux_doc_lengths_.size() != n)
+        return "aux_doc_lengths size != doc_count";
+    if (sab) {
+        if (ngram_doc_lengths_.size() != n)
+            return "ngram_doc_lengths size != doc_count";
+        if (aux_ngram_doc_lengths_.size() != (aux_active ? n : 0))
+            return "aux_ngram_doc_lengths size does not match the aux field";
+    } else if (!ngram_doc_lengths_.empty() || !ngram_postings_.empty() ||
+               !aux_ngram_doc_lengths_.empty() || !aux_ngram_postings_.empty()) {
+        return "n-gram state on a non-SubwordAwareBackoff index";
+    }
+    if (!cfg_.build_word_bigrams &&
+        (!ordered_bigram_postings_.empty() || !unordered_bigram_postings_.empty()))
+        return "bigram postings without build_word_bigrams";
+    if (!aux_active && !aux_postings_.empty())
+        return "aux postings without an aux field";
+
+    // Checks one postings table. `lengths` bounds each tf by its doc length;
+    // `exact_sum` also requires sum(tf) == sum(lengths). Returns the table's
+    // list bytes through `list_bytes_out`.
+    const auto check_table = [&](const char* name, const PostingsMap& table,
+                                 const std::vector<std::uint32_t>* lengths, bool exact_sum,
+                                 std::size_t& list_bytes_out) -> std::string {
+        const std::string prefix = std::string(name) + ": ";
+        std::uint64_t tf_sum = 0;
+        std::size_t list_bytes = 0;
+        std::size_t visited = 0;
+        for (const auto& [h, tp] : table) {
+            (void)h;
+            ++visited;
+            if (tp.docs.empty())
+                return prefix + "empty posting list";
+            std::uint64_t ttf = 0;
+            bool first = true;
+            std::uint32_t prev = 0;
+            for (const auto& [did, tf] : tp.docs) {
+                if (did >= n)
+                    return prefix + "doc id " + std::to_string(did) + " >= doc_count";
+                if (!first && did <= prev)
+                    return prefix + "doc ids not strictly increasing";
+                if (tf == 0)
+                    return prefix + "zero tf";
+                if (lengths && tf > (*lengths)[did])
+                    return prefix + "tf exceeds doc length";
+                first = false;
+                prev = did;
+                ttf += tf;
+            }
+            if (finalized_) {
+                if (tp.total_tf != ttf)
+                    return prefix + "total_tf != sum of tf";
+                if (!std::isfinite(tp.idf) || tp.idf <= 0.0f)
+                    return prefix + "idf not finite and positive";
+            }
+            tf_sum += ttf;
+            list_bytes += list_alloc_bytes(tp.docs.capacity());
+        }
+        if (visited != table.size())
+            return prefix + "iteration visited " + std::to_string(visited) + " of " +
+                   std::to_string(table.size()) + " entries";
+        if (exact_sum && lengths) {
+            std::uint64_t len_sum = 0;
+            for (auto l : *lengths)
+                len_sum += l;
+            if (len_sum != tf_sum)
+                return prefix + "sum of tf (" + std::to_string(tf_sum) +
+                       ") != sum of doc lengths (" + std::to_string(len_sum) + ")";
+        }
+        list_bytes_out = list_bytes;
+        return {};
+    };
+
+    struct TableCheck {
+        const char* name;
+        const PostingsMap* table;
+        const std::vector<std::uint32_t>* lengths;
+        bool exact_sum;
+        std::size_t counted;
+    };
+    // Word tables are never pruned, so their tf sums always match. N-gram
+    // tables are pruned by df at finalize(), so the sum only holds before.
+    const TableCheck checks[] = {
+        {"word", &postings_, &doc_lengths_, true, word_list_bytes_},
+        {"aux_word", &aux_postings_, aux_active ? &aux_doc_lengths_ : nullptr, true,
+         aux_word_list_bytes_},
+        {"ngram", &ngram_postings_, sab ? &ngram_doc_lengths_ : nullptr, !finalized_,
+         ngram_list_bytes_},
+        {"aux_ngram", &aux_ngram_postings_, (sab && aux_active) ? &aux_ngram_doc_lengths_ : nullptr,
+         !finalized_, aux_ngram_list_bytes_},
+        {"ordered_bigram", &ordered_bigram_postings_, nullptr, false, kSkip},
+        {"unordered_bigram", &unordered_bigram_postings_, nullptr, false, kSkip},
+    };
+    std::size_t bigram_bytes = 0;
+    for (const auto& c : checks) {
+        std::size_t bytes = 0;
+        if (auto err = check_table(c.name, *c.table, c.lengths, c.exact_sum, bytes); !err.empty())
+            return err;
+        if (c.counted == kSkip)
+            bigram_bytes += bytes;
+        else if (bytes != c.counted)
+            return std::string(c.name) + ": list byte counter " + std::to_string(c.counted) +
+                   " != recount " + std::to_string(bytes);
+    }
+    if (bigram_bytes != bigram_list_bytes_)
+        return "bigram: list byte counter " + std::to_string(bigram_list_bytes_) + " != recount " +
+               std::to_string(bigram_bytes);
+
+    if (finalized_) {
+        std::uint64_t total = 0;
+        for (auto l : doc_lengths_)
+            total += l;
+        if (total != total_tokens_)
+            return "total_tokens != sum of doc lengths";
+        const double expect = n == 0 ? 0.0 : static_cast<double>(total) / static_cast<double>(n);
+        if (std::abs(static_cast<double>(avg_dl_) - expect) > 1e-3 * std::max(1.0, expect))
+            return "avg_dl != mean doc length";
+    }
+    return {};
 }
 
 } // namespace simeon
