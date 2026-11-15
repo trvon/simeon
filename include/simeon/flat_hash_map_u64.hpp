@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <iterator>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -148,19 +149,32 @@ public:
             idx = (idx + 1) & mask_;
         }
 
+        if (entries_.size() >= kEmptyEntry)
+            throw std::length_error("FlatHashMapU64: more than 2^32-1 entries");
         keys_[idx] = key;
         entry_indices_[idx] = static_cast<std::uint32_t>(entries_.size());
         entries_.emplace_back(key, V{});
         return entries_.back().second;
     }
 
+    // Grows geometrically. Callers reserve incrementally (Bm25Index::add_doc
+    // reserves size() + new_terms per doc), so an exact entries_.reserve(n)
+    // would reallocate and move the whole entries array on every call.
     void reserve(std::size_t n) {
         std::size_t target = 1;
         while (static_cast<double>(n) > kMaxLoadFactor * static_cast<double>(target))
             target <<= 1;
-        entries_.reserve(n);
+        if (n > entries_.capacity())
+            entries_.reserve(std::max(n, entries_.capacity() * 2));
         if (target > capacity())
             rehash(target);
+    }
+
+    // Bytes held by the map's own arrays. Excludes heap memory owned by the
+    // mapped values. O(1).
+    std::size_t memory_bytes() const noexcept {
+        return entries_.capacity() * sizeof(value_type) + keys_.capacity() * sizeof(key_type) +
+               entry_indices_.capacity() * sizeof(std::uint32_t);
     }
 
     // Reset all entries while keeping the allocated capacity. Useful for
@@ -192,7 +206,9 @@ public:
         }
 
         entries_.shrink_to_fit();
-        if (target != capacity()) {
+        // Only ever shrink: reserve() can size a table below kDefaultCapacity,
+        // and growing it here would make "shrink" allocate.
+        if (target < capacity()) {
             rehash(target);
         }
         keys_.shrink_to_fit();

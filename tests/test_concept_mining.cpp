@@ -1,6 +1,7 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -211,9 +212,65 @@ void test_max_concepts_cap_is_respected() {
     assert(concepts.size() <= 2u);
 }
 
+// A fixed, generated corpus with many distinct bigrams, most below min_ttf, and many
+// accepted ones tied on PMI, capped low enough that the cap cuts through the ties. Mining
+// keeps postings only for selected bigrams; this pins the exact output (selection, postings,
+// statistics) so that change cannot alter what is mined.
+std::vector<std::string> generated_corpus() {
+    std::uint64_t state = 0x9E3779B97F4A7C15ULL;
+    const auto next = [&state]() {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        return static_cast<std::uint32_t>(state >> 33);
+    };
+    std::vector<std::string> docs;
+    for (int d = 0; d < 300; ++d) {
+        std::string text;
+        const int words = 20 + static_cast<int>(next() % 60);
+        for (int w = 0; w < words; ++w) {
+            // A skewed vocabulary: a few common words, a long tail of rare ones.
+            const auto r = next() % 100;
+            const auto word = r < 60 ? next() % 40 : 40 + next() % 4000;
+            text += "w" + std::to_string(word) + " ";
+        }
+        // Planted phrases repeated across documents, so several bigrams tie exactly.
+        if (d % 3 == 0)
+            text += "alpha beta gamma delta ";
+        if (d % 5 == 0)
+            text += "epsilon zeta eta theta ";
+        docs.push_back(std::move(text));
+    }
+    return docs;
+}
+
+std::uint64_t mined_fingerprint(std::uint32_t max_concepts, std::uint32_t* size_out) {
+    Fixture f(generated_corpus());
+    ConceptConfig cfg;
+    cfg.min_ttf = 3;
+    cfg.pmi_floor = -10.0f;
+    cfg.max_concepts = max_concepts;
+    auto concepts = mine_concepts(f.idx, std::span<const std::string_view>(f.docs_view), cfg);
+    *size_out = concepts.size();
+    return simeon::detail::ConceptIndexFingerprint::compute(concepts);
+}
+
+void test_mined_output_is_pinned() {
+    std::uint32_t capped_size = 0;
+    std::uint32_t uncapped_size = 0;
+    const auto capped = mined_fingerprint(25, &capped_size);
+    const auto uncapped = mined_fingerprint(200000, &uncapped_size);
+    // Captured from the single-pass implementation that kept postings for every bigram.
+    assert(capped_size == 25u);
+    assert(capped == 73459894355622804ULL);
+    assert(uncapped_size == 1041u);
+    assert(uncapped == 5263375026253446367ULL);
+    (void)capped;
+    (void)uncapped;
+}
+
 } // namespace
 
 int main() {
+    test_mined_output_is_pinned();
     test_pmi_matches_hand_computed_reference();
     test_min_ttf_floor_excludes_rare_concepts();
     test_concept_mining_is_deterministic();
