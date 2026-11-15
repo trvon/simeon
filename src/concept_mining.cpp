@@ -195,26 +195,31 @@ ConceptIndex mine_concepts(const Bm25Index& idx, std::span<const std::string_vie
     std::vector<std::uint64_t> words;
     DocumentBigramCounts doc_bgm_tf;
 
-    // Raw accumulator: concept_hash -> (total_tf, postings).
+    // Pass 1 counts each distinct bigram (total tf and its first-seen components) without
+    // postings. Most bigrams in real text occur once and fail min_ttf or the PMI floor, so
+    // keeping a postings vector for every one of them only to discard it was most of the peak
+    // memory (about 750 MB on a 31k-document store). Postings are built in pass 3, only for the
+    // selected concepts. Keys are inserted in the same order as before, so iteration order, and
+    // with it the cap's tie-breaking, is unchanged.
     struct RawEntry {
         std::uint64_t total_tf = 0;
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> docs;
         std::uint64_t a_hash = 0; // first unigram component (for PMI)
         std::uint64_t b_hash = 0; // second unigram component (for PMI)
     };
     std::unordered_map<std::uint64_t, RawEntry> raw;
 
-    // Pass 1: tokenize each doc, accumulate bigram postings and doc lengths.
     const auto tcfg = word_only_cfg();
-    std::uint64_t total_bigrams_across_corpus = 0;
-    for (std::uint32_t did = 0; did < docs.size(); ++did) {
+    const auto tokenize_doc = [&](std::uint32_t did) {
         words.clear();
         WordHashSink sink{};
         sink.out = &words;
         sink.family = out.hash_family_;
         sink.seed = out.hash_seed_;
         tokenize(docs[did], tcfg, sink);
-
+    };
+    std::uint64_t total_bigrams_across_corpus = 0;
+    for (std::uint32_t did = 0; did < docs.size(); ++did) {
+        tokenize_doc(did);
         if (words.size() < 2)
             continue;
 
@@ -222,8 +227,6 @@ ConceptIndex mine_concepts(const Bm25Index& idx, std::span<const std::string_vie
         out.bigram_doc_lengths_[did] = doc_bgm_count;
         total_bigrams_across_corpus += doc_bgm_count;
 
-        // Pair each bigram hash with its first-seen (a, b) components in
-        // this doc, then roll into per-doc tf.
         doc_bgm_tf.reset(words.size() - 1);
         for (std::size_t i = 1; i < words.size(); ++i) {
             const std::uint64_t a = words[i - 1];
@@ -237,11 +240,7 @@ ConceptIndex mine_concepts(const Bm25Index& idx, std::span<const std::string_vie
                 }
             }
         }
-        doc_bgm_tf.for_each([&](std::uint64_t bh, std::uint32_t tf) {
-            auto& e = raw[bh];
-            e.total_tf += tf;
-            e.docs.emplace_back(did, tf);
-        });
+        doc_bgm_tf.for_each([&](std::uint64_t bh, std::uint32_t tf) { raw[bh].total_tf += tf; });
     }
 
     const float avg_bigram_dl =
@@ -295,20 +294,49 @@ ConceptIndex mine_concepts(const Bm25Index& idx, std::span<const std::string_vie
         accepted.resize(cfg.max_concepts);
     }
 
+    // Pass 3: postings for the selected concepts only, in document order as before. The
+    // selected counts are copied out and the full count map freed first, so the peak is the
+    // larger of the two passes rather than their sum.
+    struct Selected {
+        RawEntry counts;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> docs;
+    };
+    std::unordered_map<std::uint64_t, Selected> selected;
+    selected.reserve(accepted.size());
+    for (const auto& [bh, pmi] : accepted) {
+        (void)pmi;
+        if (const auto rit = raw.find(bh); rit != raw.end())
+            selected.try_emplace(bh, Selected{rit->second, {}});
+    }
+    std::unordered_map<std::uint64_t, RawEntry>().swap(raw);
+
+    for (std::uint32_t did = 0; did < docs.size() && !selected.empty(); ++did) {
+        tokenize_doc(did);
+        if (words.size() < 2)
+            continue;
+        doc_bgm_tf.reset(words.size() - 1);
+        for (std::size_t i = 1; i < words.size(); ++i)
+            (void)doc_bgm_tf.increment(ConceptIndex::hash_bigram(words[i - 1], words[i]));
+        doc_bgm_tf.for_each([&](std::uint64_t bh, std::uint32_t tf) {
+            if (const auto it = selected.find(bh); it != selected.end())
+                it->second.docs.emplace_back(did, tf);
+        });
+    }
+
     // Build concept index from accepted set. idf uses the BM25 document
     // frequency formula applied to doc_count_ and posting size.
     const float nf = static_cast<float>(out.doc_count_);
     out.concepts_.reserve(accepted.size());
     for (const auto& [bh, pmi] : accepted) {
-        const auto rit = raw.find(bh);
-        if (rit == raw.end())
+        const auto sit = selected.find(bh);
+        if (sit == selected.end())
             continue;
         ConceptEntry entry;
         entry.pmi = pmi;
-        entry.total_tf = rit->second.total_tf;
-        entry.a_hash = rit->second.a_hash;
-        entry.b_hash = rit->second.b_hash;
-        entry.docs = rit->second.docs;
+        entry.total_tf = sit->second.counts.total_tf;
+        entry.a_hash = sit->second.counts.a_hash;
+        entry.b_hash = sit->second.counts.b_hash;
+        entry.docs = std::move(sit->second.docs);
         std::sort(entry.docs.begin(), entry.docs.end(),
                   [](const auto& x, const auto& y) { return x.first < y.first; });
         const float df = static_cast<float>(entry.docs.size());
