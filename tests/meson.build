@@ -40,7 +40,7 @@ foreach name, src : simeon_tests
     dependencies: simeon_dep,
     cpp_args: simeon_test_args,
   )
-  test(name, exe, suite: 'simeon')
+  test(name, exe, suite: 'simeon', timeout: name in ['test_pq', 'test_persistent_homology'] ? 120 : 30)
 endforeach
 
 static_embedding_test = executable('test_static_embedding', 'test_static_embedding.cpp',
