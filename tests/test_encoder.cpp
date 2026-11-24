@@ -325,6 +325,26 @@ void test_invalid_enum_values_are_rejected() {
     expect_invalid_config(config);
 }
 
+void test_sketch_sink_high_repetition_stays_finite_and_exact() {
+    EncoderConfig cfg = highdim_cfg();
+    cfg.ngram_mode = NGramMode::WordOnly;
+    cfg.sketch_dim = 1;
+    cfg.l2_normalize = false;
+    Encoder encoder(cfg);
+
+    std::string repeated;
+    repeated.reserve(60000);
+    for (int i = 0; i < 10000; ++i) {
+        repeated += "alpha ";
+    }
+    std::vector<float> out(1, 0.0f);
+    encoder.encode(repeated, out.data());
+    const auto h = simeon::hash64("alpha", cfg.hash_seed, cfg.hash);
+    const float sign = ((h >> 63) & 1ULL) ? -1.0f : 1.0f;
+    assert(std::isfinite(out[0]));
+    assert(out[0] == sign * 10000.0f);
+}
+
 } // namespace
 
 int main() {
@@ -341,5 +361,6 @@ int main() {
     test_simeon_v1_384_config_is_frozen();
     test_word_bounded_char_ngrams_are_opt_in_and_reach_encoder();
     test_invalid_enum_values_are_rejected();
+    test_sketch_sink_high_repetition_stays_finite_and_exact();
     return 0;
 }

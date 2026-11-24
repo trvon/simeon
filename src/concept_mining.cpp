@@ -1,10 +1,13 @@
 #include "simeon/concept_mining.hpp"
 
+#include "simeon/detail/ascii.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -15,12 +18,35 @@ namespace simeon {
 
 namespace {
 
+std::uint64_t hash_folded(std::string_view tok, std::uint64_t seed, HashFamily family) {
+    bool needs_fold = false;
+    for (unsigned char c : tok) {
+        if (detail::ascii_isupper(c)) {
+            needs_fold = true;
+            break;
+        }
+    }
+    if (!needs_fold)
+        return hash64(tok, seed, family);
+    if (tok.size() <= 256) {
+        char buf[256];
+        for (std::size_t i = 0; i < tok.size(); ++i)
+            buf[i] = static_cast<char>(detail::ascii_tolower(static_cast<unsigned char>(tok[i])));
+        return hash64(std::string_view(buf, tok.size()), seed, family);
+    }
+    std::string folded;
+    folded.reserve(tok.size());
+    for (unsigned char c : tok)
+        folded.push_back(static_cast<char>(detail::ascii_tolower(c)));
+    return hash64(folded, seed, family);
+}
+
 struct WordHashSink final : NGramEmitter {
     std::vector<std::uint64_t>* out;
     HashFamily family;
     std::uint64_t seed;
     void on_token(std::string_view tok, float) override {
-        out->push_back(hash64(tok, seed, family));
+        out->push_back(hash_folded(tok, seed, family));
     }
 };
 

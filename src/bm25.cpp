@@ -38,6 +38,12 @@ std::string ascii_fold(std::string_view tok) {
 std::uint64_t hash_folded(std::string_view tok, std::uint64_t seed, HashFamily family) {
     if (!needs_ascii_fold(tok))
         return hash64(tok, seed, family);
+    if (tok.size() <= 256) {
+        char buf[256];
+        for (std::size_t i = 0; i < tok.size(); ++i)
+            buf[i] = static_cast<char>(detail::ascii_tolower(static_cast<unsigned char>(tok[i])));
+        return hash64(std::string_view(buf, tok.size()), seed, family);
+    }
     const auto folded = ascii_fold(tok);
     return hash64(folded, seed, family);
 }
@@ -300,7 +306,7 @@ std::uint64_t Bm25Index::hash_bigram(std::uint64_t a, std::uint64_t b) const noe
 std::uint32_t Bm25Index::df(std::string_view term) const noexcept {
     if (!finalized_ || term.empty())
         return 0;
-    const std::uint64_t h = hash64(term, cfg_.hash_seed, cfg_.hash);
+    const std::uint64_t h = hash_folded(term, cfg_.hash_seed, cfg_.hash);
     auto it = postings_.find(h);
     if (it == postings_.end())
         return 0;
@@ -310,7 +316,7 @@ std::uint32_t Bm25Index::df(std::string_view term) const noexcept {
 float Bm25Index::idf(std::string_view term) const noexcept {
     if (!finalized_ || term.empty())
         return 0.0f;
-    const std::uint64_t h = hash64(term, cfg_.hash_seed, cfg_.hash);
+    const std::uint64_t h = hash_folded(term, cfg_.hash_seed, cfg_.hash);
     auto it = postings_.find(h);
     if (it == postings_.end())
         return 0.0f;
@@ -318,13 +324,13 @@ float Bm25Index::idf(std::string_view term) const noexcept {
 }
 
 std::uint64_t Bm25Index::hash_term(std::string_view term) const noexcept {
-    return hash64(term, cfg_.hash_seed, cfg_.hash);
+    return hash_folded(term, cfg_.hash_seed, cfg_.hash);
 }
 
 std::uint64_t Bm25Index::total_tf(std::string_view term) const noexcept {
     if (!finalized_ || term.empty())
         return 0;
-    const std::uint64_t h = hash64(term, cfg_.hash_seed, cfg_.hash);
+    const std::uint64_t h = hash_folded(term, cfg_.hash_seed, cfg_.hash);
     auto it = postings_.find(h);
     if (it == postings_.end())
         return 0;
@@ -930,22 +936,25 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
             }
 
             // N-gram contribution: tokenize this query term into char
-            // n-grams, look each up in ngram_postings_, sum BM25+ scoring
-            // weighted by (1-α). Skips entirely if α==1 (γ=0 + df>0).
+            // n-grams, look each up in ngram_postings_, and take the mean
+            // BM25+ score over |G(t)| weighted by (1-α) so long terms stay
+            // commensurate with exact single-term BM25+. Skips if α==1.
             if (alpha < 1.0f) {
                 collect_unique_query_ngrams(q_strs[qi], cfg_.hash, cfg_.hash_seed, cfg_.ngram_min,
                                             cfg_.ngram_max, term_ngram_hashes);
-                const float w = 1.0f - alpha;
-                for (const auto gh : term_ngram_hashes) {
-                    const auto git = ngram_postings_.find(gh);
-                    if (git == ngram_postings_.end())
-                        continue;
-                    const float idf_g = git->second.idf;
-                    for (const auto& [did, tf] : git->second.docs) {
-                        const float tff = static_cast<float>(tf);
-                        const float dl = static_cast<float>(ngram_doc_lengths_[did]);
-                        out_scores[did] +=
-                            w * score_bm25_plus(tff, dl, idf_g, k1, b, ngram_avg, delta);
+                if (!term_ngram_hashes.empty()) {
+                    const float w = (1.0f - alpha) / static_cast<float>(term_ngram_hashes.size());
+                    for (const auto gh : term_ngram_hashes) {
+                        const auto git = ngram_postings_.find(gh);
+                        if (git == ngram_postings_.end())
+                            continue;
+                        const float idf_g = git->second.idf;
+                        for (const auto& [did, tf] : git->second.docs) {
+                            const float tff = static_cast<float>(tf);
+                            const float dl = static_cast<float>(ngram_doc_lengths_[did]);
+                            out_scores[did] +=
+                                w * score_bm25_plus(tff, dl, idf_g, k1, b, ngram_avg, delta);
+                        }
                     }
                 }
             }

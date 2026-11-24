@@ -12,6 +12,7 @@
 #include <unordered_set>
 
 #include "simeon/bm25.hpp"
+#include "simeon/detail/ascii.hpp"
 #include "simeon/fusion.hpp"
 #include "simeon/hasher.hpp"
 #include "simeon/manifold.hpp"
@@ -50,7 +51,13 @@ bool is_stopword(std::string_view token) {
 
 struct StringTokenSink final : NGramEmitter {
     std::vector<std::string>* out = nullptr;
-    void on_token(std::string_view tok, float) override { out->emplace_back(tok); }
+    void on_token(std::string_view tok, float) override {
+        std::string folded;
+        folded.reserve(tok.size());
+        for (unsigned char c : tok)
+            folded.push_back(static_cast<char>(detail::ascii_tolower(c)));
+        out->push_back(std::move(folded));
+    }
 };
 
 constexpr TokenizerConfig word_only_cfg() noexcept {
@@ -953,15 +960,16 @@ std::vector<SemanticFragment> build_doc_semantic_fragments_richcov_bsif(
 std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Index& idx,
                                            const Encoder& enc,
                                            std::span<const std::vector<SemanticFragment>> doc_frags,
-                                           const FragmentGeometryConfig& cfg) {
-    return score_fragment_geometry_profiled(query, idx, enc, doc_frags, cfg, nullptr);
+                                           const FragmentGeometryConfig& cfg,
+                                           std::span<const float> precomputed_bm25) {
+    return score_fragment_geometry_profiled(query, idx, enc, doc_frags, cfg, nullptr,
+                                            precomputed_bm25);
 }
 
-std::vector<float>
-score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, const Encoder& enc,
-                                 std::span<const std::vector<SemanticFragment>> doc_frags,
-                                 const FragmentGeometryConfig& cfg,
-                                 FragmentGeometryProfile* profile) {
+std::vector<float> score_fragment_geometry_profiled(
+    std::string_view query, const Bm25Index& idx, const Encoder& enc,
+    std::span<const std::vector<SemanticFragment>> doc_frags, const FragmentGeometryConfig& cfg,
+    FragmentGeometryProfile* profile, std::span<const float> precomputed_bm25) {
     const auto t_total0 = profile ? Clock::now() : Clock::time_point{};
     if (profile)
         *profile = FragmentGeometryProfile{};
@@ -969,13 +977,24 @@ score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, c
     validate_geometry_config(idx, enc, doc_frags, cfg);
 
     const std::uint32_t nd = static_cast<std::uint32_t>(doc_frags.size());
+    if (!precomputed_bm25.empty() && precomputed_bm25.size() != nd) {
+        throw std::invalid_argument(
+            "fragment geometry precomputed BM25 count must match document count");
+    }
     const std::uint32_t dim = enc.output_dim();
     const float neg_inf = -std::numeric_limits<float>::infinity();
-    std::vector<float> bm25_scores(nd, 0.0f);
+    std::vector<float> owned_bm25_scores;
+    std::span<const float> bm25_scores;
     std::vector<float> qvec(dim, 0.0f);
 
     const auto t_bm250 = profile ? Clock::now() : Clock::time_point{};
-    idx.score(query, bm25_scores);
+    if (!precomputed_bm25.empty()) {
+        bm25_scores = precomputed_bm25;
+    } else {
+        owned_bm25_scores.assign(nd, 0.0f);
+        idx.score(query, owned_bm25_scores);
+        bm25_scores = owned_bm25_scores;
+    }
     auto pool = top_k(bm25_scores, cfg.pool_size);
 
     const auto t_bm251 = profile ? Clock::now() : Clock::time_point{};

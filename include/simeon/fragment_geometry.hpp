@@ -291,13 +291,13 @@ std::vector<SemanticFragment> build_doc_semantic_fragments_richcov_bsif_from_pre
 std::vector<float> score_fragment_geometry(std::string_view query, const Bm25Index& idx,
                                            const Encoder& enc,
                                            std::span<const std::vector<SemanticFragment>> doc_frags,
-                                           const FragmentGeometryConfig& cfg);
+                                           const FragmentGeometryConfig& cfg,
+                                           std::span<const float> precomputed_bm25 = {});
 
-std::vector<float>
-score_fragment_geometry_profiled(std::string_view query, const Bm25Index& idx, const Encoder& enc,
-                                 std::span<const std::vector<SemanticFragment>> doc_frags,
-                                 const FragmentGeometryConfig& cfg,
-                                 FragmentGeometryProfile* profile);
+std::vector<float> score_fragment_geometry_profiled(
+    std::string_view query, const Bm25Index& idx, const Encoder& enc,
+    std::span<const std::vector<SemanticFragment>> doc_frags, const FragmentGeometryConfig& cfg,
+    FragmentGeometryProfile* profile, std::span<const float> precomputed_bm25 = {});
 
 // Compress all fragment vectors from float32 to bfloat16 in-place.
 // After calling, vec_bf16 holds the compressed data and vec is cleared.

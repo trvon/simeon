@@ -397,6 +397,27 @@ void bf16_unpack_avx2(const std::uint16_t* src, float* dst, std::uint32_t n) noe
     }
 }
 
+void fwht_inplace_avx2(float* data, std::uint32_t n) noexcept {
+    detail::debug_assert_buffer(data, n);
+    for (std::uint32_t h = 1; h < n; h <<= 1) {
+        for (std::uint32_t i = 0; i < n; i += h << 1) {
+            std::uint32_t j = i;
+            for (; j + 8 <= i + h; j += 8) {
+                const __m256 x = _mm256_loadu_ps(data + j);
+                const __m256 y = _mm256_loadu_ps(data + j + h);
+                _mm256_storeu_ps(data + j, _mm256_add_ps(x, y));
+                _mm256_storeu_ps(data + j + h, _mm256_sub_ps(x, y));
+            }
+            for (; j < i + h; ++j) {
+                const float x = data[j];
+                const float y = data[j + h];
+                data[j] = x + y;
+                data[j + h] = x - y;
+            }
+        }
+    }
+}
+
 } // namespace simeon::simd
 
 #endif

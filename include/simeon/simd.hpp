@@ -194,6 +194,7 @@ void bf16_unpack_neon(const std::uint16_t* src, float* dst, std::uint32_t n) noe
 #if defined(SIMEON_HAS_AVX2)
 void bf16_pack_avx2(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept;
 void bf16_unpack_avx2(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept;
+void fwht_inplace_avx2(float* data, std::uint32_t n) noexcept;
 #endif
 
 // Runtime-selected dispatcher.
