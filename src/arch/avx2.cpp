@@ -54,7 +54,7 @@ float l2_normalize_avx2(float* v, std::uint32_t n) noexcept {
     }
     __m256 acc = _mm256_add_ps(acc0, acc1);
     alignas(32) float tmp[8];
-    _mm256_store_ps(tmp, acc);
+    _mm256_storeu_ps(tmp, acc);
     float sum = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
     for (; i < n; ++i)
         sum = std::fma(v[i], v[i], sum);
@@ -92,7 +92,7 @@ float dot_avx2(const float* a, const float* b, std::uint32_t n) noexcept {
     }
     __m256 acc = _mm256_add_ps(acc0, acc1);
     alignas(32) float tmp[8];
-    _mm256_store_ps(tmp, acc);
+    _mm256_storeu_ps(tmp, acc);
     float s = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
     if (i + 4 <= n) {
         s += horizontal_sum(_mm_mul_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i)));
@@ -219,7 +219,7 @@ void dot4_avx2(const float* a, const float* b0, const float* b1, const float* b2
                             _mm256_add_ps(c20, c21), _mm256_add_ps(c30, c31)};
     for (int k = 0; k < 4; ++k) {
         alignas(32) float tmp[8];
-        _mm256_store_ps(tmp, accs[k]);
+        _mm256_storeu_ps(tmp, accs[k]);
         float s = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
         std::uint32_t t = i;
         if (t + 4 <= n) {
@@ -472,7 +472,7 @@ void pq_fastscan_lut16_avx2(const std::uint8_t* lut_u8, const std::uint8_t* code
                 for (std::size_t lane = 0; lane < 32; ++lane) {
                     idx_buf[lane] = col[lane * m] & 0x0Fu;
                 }
-                const __m256i idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(idx_buf));
+                const __m256i idx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(idx_buf));
                 const __m256i vals = _mm256_shuffle_epi8(lut, idx);
                 acc_a = _mm256_add_epi16(acc_a, _mm256_unpacklo_epi8(vals, zero));
                 acc_b = _mm256_add_epi16(acc_b, _mm256_unpackhi_epi8(vals, zero));
