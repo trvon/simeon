@@ -73,10 +73,11 @@ inline double elapsed_us(Clock::time_point a, Clock::time_point b) {
 
 namespace detail {
 
-PhssResult phss_largest_gap_sorted(std::span<const float> similarities, float threshold) {
+PhssResult phss_largest_gap_sorted(std::span<const float> similarities, float threshold,
+                                   bool collect_timings) {
     PhssResult result;
 
-    const auto t_gather0 = Clock::now();
+    const auto t_gather0 = collect_timings ? Clock::now() : Clock::time_point{};
     std::vector<float> sims;
     sims.reserve(similarities.size());
     for (float s : similarities) {
@@ -84,24 +85,24 @@ PhssResult phss_largest_gap_sorted(std::span<const float> similarities, float th
             sims.push_back(s);
     }
     result.n_edges = static_cast<std::uint32_t>(sims.size());
-    const auto t_gather1 = Clock::now();
-    result.edge_gather_us = elapsed_us(t_gather0, t_gather1);
+    if (collect_timings)
+        result.edge_gather_us = elapsed_us(t_gather0, Clock::now());
 
     if (sims.empty()) {
         result.selected_scale = 0.0f;
         return result;
     }
-    const auto t_sort0 = Clock::now();
+    const auto t_sort0 = collect_timings ? Clock::now() : Clock::time_point{};
     std::sort(sims.begin(), sims.end());
-    const auto t_sort1 = Clock::now();
-    result.edge_sort_us = elapsed_us(t_sort0, t_sort1);
+    if (collect_timings)
+        result.edge_sort_us = elapsed_us(t_sort0, Clock::now());
 
     result.n_pairs = static_cast<std::uint32_t>(sims.size());
     if (sims.size() < 2) {
         result.selected_scale = sims[0];
         return result;
     }
-    const auto t_crit0 = Clock::now();
+    const auto t_crit0 = collect_timings ? Clock::now() : Clock::time_point{};
     float max_gap = -1.0f;
     std::size_t best_idx = 0;
     for (std::size_t i = 0; i + 1 < sims.size(); ++i) {
@@ -113,8 +114,8 @@ PhssResult phss_largest_gap_sorted(std::span<const float> similarities, float th
     }
     result.max_gap = max_gap > 0.0f ? max_gap : 0.0f;
     result.selected_scale = (sims[best_idx] + sims[best_idx + 1]) * 0.5f;
-    const auto t_crit1 = Clock::now();
-    result.criterion_us = elapsed_us(t_crit0, t_crit1);
+    if (collect_timings)
+        result.criterion_us = elapsed_us(t_crit0, Clock::now());
     return result;
 }
 
@@ -131,6 +132,8 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
     if (n == 0)
         return result;
 
+    const bool collect_timings = cfg.collect_timings;
+
     if (cfg.criterion == PhssConfig::Criterion::LargestGapApprox) {
         // O(m) pigeonhole maximum-gap. Pass 1 summarizes the (threshold-filtered)
         // similarities; pass 2 buckets them with per-bucket min/max; pass 3 scans
@@ -142,7 +145,7 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
         // bit-identical. In the degenerate regime (gap not strictly above mean
         // spacing, e.g. ~uniform spacing) we defer to the sorted reference to
         // keep first-maximum tie-breaking exact.
-        const auto t_gather0 = Clock::now();
+        const auto t_gather0 = collect_timings ? Clock::now() : Clock::time_point{};
         const bool use_threshold = cfg.threshold > 0.0f;
         std::uint32_t m = 0;
         float vmin = std::numeric_limits<float>::infinity();
@@ -163,8 +166,8 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
             }
         }
         result.n_edges = m;
-        const auto t_gather1 = Clock::now();
-        result.edge_gather_us = elapsed_us(t_gather0, t_gather1);
+        if (collect_timings)
+            result.edge_gather_us = elapsed_us(t_gather0, Clock::now());
 
         if (m == 0) {
             result.selected_scale = 0.0f;
@@ -186,7 +189,7 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
         // largest gap to exceed the bin width span/nb; capping nb keeps the bin
         // arrays cache-resident for large edge counts (m ~ n²/2), and any gap
         // narrower than the wider bin width falls through to the sorted oracle.
-        const auto t_sort0 = Clock::now();
+        const auto t_sort0 = collect_timings ? Clock::now() : Clock::time_point{};
         const std::uint32_t nb = std::min<std::uint32_t>(m - 1, 8192u);
         std::vector<float> bmin(nb, std::numeric_limits<float>::infinity());
         std::vector<float> bmax(nb, -std::numeric_limits<float>::infinity());
@@ -213,11 +216,11 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
             for (float s : similarities)
                 bucket_update(s);
         }
-        const auto t_sort1 = Clock::now();
-        result.edge_sort_us = elapsed_us(t_sort0, t_sort1);
+        if (collect_timings)
+            result.edge_sort_us = elapsed_us(t_sort0, Clock::now());
 
         // Pass 3: largest cross-bucket gap, first maximum (strict >).
-        const auto t_crit0 = Clock::now();
+        const auto t_crit0 = collect_timings ? Clock::now() : Clock::time_point{};
         float best_gap = -1.0f;
         float best_lo = vmin;
         float best_hi = vmin;
@@ -244,23 +247,25 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
         const double fallback_width = (span / static_cast<double>(nb)) * (1.0 + 1.0 / 64.0);
         if (best_gap < 0.0f || static_cast<double>(best_gap) <= fallback_width) {
             // Degenerate/tie regime — defer to the bit-exact sorted reference.
-            const auto fb = detail::phss_largest_gap_sorted(similarities, cfg.threshold);
+            const auto fb =
+                detail::phss_largest_gap_sorted(similarities, cfg.threshold, collect_timings);
             result.selected_scale = fb.selected_scale;
             result.max_gap = fb.max_gap;
-            result.criterion_us = elapsed_us(t_crit0, Clock::now());
+            if (collect_timings)
+                result.criterion_us = elapsed_us(t_crit0, Clock::now());
             return result;
         }
         result.max_gap = best_gap > 0.0f ? best_gap : 0.0f;
         result.selected_scale = (best_lo + best_hi) * 0.5f;
-        const auto t_crit1 = Clock::now();
-        result.criterion_us = elapsed_us(t_crit0, t_crit1);
+        if (collect_timings)
+            result.criterion_us = elapsed_us(t_crit0, Clock::now());
         return result;
     }
 
     const UpperTriangular sim{similarities, n};
 
     // Phase 1: edge materialization
-    const auto t_gather0 = Clock::now();
+    const auto t_gather0 = collect_timings ? Clock::now() : Clock::time_point{};
     struct Edge {
         std::uint32_t i, j;
         float sim;
@@ -275,19 +280,19 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
             }
         }
     }
-    const auto t_gather1 = Clock::now();
-    result.edge_gather_us = elapsed_us(t_gather0, t_gather1);
+    if (collect_timings)
+        result.edge_gather_us = elapsed_us(t_gather0, Clock::now());
     result.n_edges = static_cast<std::uint32_t>(edges.size());
 
     // Phase 2: sort edges by decreasing similarity
-    const auto t_sort0 = Clock::now();
+    const auto t_sort0 = collect_timings ? Clock::now() : Clock::time_point{};
     std::sort(edges.begin(), edges.end(),
               [](const Edge& a, const Edge& b) { return a.sim > b.sim; });
-    const auto t_sort1 = Clock::now();
-    result.edge_sort_us = elapsed_us(t_sort0, t_sort1);
+    if (collect_timings)
+        result.edge_sort_us = elapsed_us(t_sort0, Clock::now());
 
     // Phase 3: UF traversal — 0D persistent homology
-    const auto t_uf0 = Clock::now();
+    const auto t_uf0 = collect_timings ? Clock::now() : Clock::time_point{};
     UnionFind uf(n);
     std::vector<float> births(n, 1.0f);
     std::vector<PersistencePair0D> diagram;
@@ -316,11 +321,11 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
 
         uf.unite(dying, surviving);
     }
-    const auto t_uf1 = Clock::now();
-    result.uf_traversal_us = elapsed_us(t_uf0, t_uf1);
+    if (collect_timings)
+        result.uf_traversal_us = elapsed_us(t_uf0, Clock::now());
 
     // Phase 4: survivor scan
-    const auto t_surv0 = Clock::now();
+    const auto t_surv0 = collect_timings ? Clock::now() : Clock::time_point{};
     for (std::uint32_t i = 0; i < n; ++i) {
         if (uf.find(i) == i) {
             PersistencePair0D pair;
@@ -335,8 +340,8 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
             diagram.push_back(std::move(pair));
         }
     }
-    const auto t_surv1 = Clock::now();
-    result.survivor_scan_us = elapsed_us(t_surv0, t_surv1);
+    if (collect_timings)
+        result.survivor_scan_us = elapsed_us(t_surv0, Clock::now());
 
     result.n_pairs = static_cast<std::uint32_t>(diagram.size());
     if (cfg.output_diagram) {
@@ -350,7 +355,7 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
     }
 
     // Phase 5: death collection + sort
-    const auto t_death0 = Clock::now();
+    const auto t_death0 = collect_timings ? Clock::now() : Clock::time_point{};
     const auto& diagram_ref = cfg.output_diagram ? result.diagram : diagram;
     std::vector<float> deaths;
     deaths.reserve(result.n_pairs);
@@ -362,17 +367,17 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
 
     if (deaths.empty()) {
         result.selected_scale = 0.0f;
-        const auto t_death1 = Clock::now();
-        result.death_sort_us = elapsed_us(t_death0, t_death1);
+        if (collect_timings)
+            result.death_sort_us = elapsed_us(t_death0, Clock::now());
         return result;
     }
 
     std::sort(deaths.begin(), deaths.end());
-    const auto t_death1 = Clock::now();
-    result.death_sort_us = elapsed_us(t_death0, t_death1);
+    if (collect_timings)
+        result.death_sort_us = elapsed_us(t_death0, Clock::now());
 
     // Phase 6: criterion selection
-    const auto t_crit0 = Clock::now();
+    const auto t_crit0 = collect_timings ? Clock::now() : Clock::time_point{};
 
     switch (cfg.criterion) {
         case PhssConfig::Criterion::LargestGap: {
@@ -430,8 +435,8 @@ PhssResult phss_select_scale(std::span<const float> similarities, std::uint32_t 
             break;
         }
     }
-    const auto t_crit1 = Clock::now();
-    result.criterion_us = elapsed_us(t_crit0, t_crit1);
+    if (collect_timings)
+        result.criterion_us = elapsed_us(t_crit0, Clock::now());
 
     return result;
 }

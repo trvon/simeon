@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -445,6 +447,94 @@ std::vector<float> encode_bsif_weighted(const Encoder& enc, const Bm25Index& idx
         vec.clear();
     return vec;
 }
+
+// ---------------------------------------------------------------------------
+// Reusable per-thread scratch workspace for score_fragment_geometry_profiled.
+// Eliminates per-query heap churn while remaining thread-safe across concurrent
+// callers. Every buffer is explicitly cleared/reassigned before use.
+// ---------------------------------------------------------------------------
+
+struct FragRef {
+    std::uint32_t pool_index = 0;
+    std::uint32_t frag_index = 0;
+    const float* vec = nullptr;
+};
+
+struct SurvivorEdge {
+    std::uint32_t i, j;
+    float sim;
+};
+
+struct FragmentGeometryScratch {
+    std::vector<float> owned_bm25_scores;
+    std::vector<float> qvec;
+    std::vector<FragRef> frags;
+    std::vector<float> fvecs_raw;
+    std::vector<float> mean;
+    std::vector<float> var;
+    std::vector<float> m2;
+    std::vector<float> wq;
+    std::vector<float> fvecs;
+    std::vector<float> qsim;
+    std::vector<float> bm_pool;
+    std::vector<float> geom_pool;
+    std::vector<std::vector<std::uint32_t>> frags_by_pool;
+    std::vector<float> max_pool;
+    std::vector<float> topk_vals;
+    std::vector<float> gvecs;
+    std::vector<float> sims_tri;
+    std::vector<float> csls_topk;
+    std::vector<float> mass;
+    std::vector<float> ns;
+    std::vector<std::vector<std::pair<std::uint32_t, float>>> adj;
+    std::vector<SurvivorEdge> survivors;
+    std::vector<std::uint32_t> hits;
+    std::vector<float> row_maxes;
+    std::vector<float> row_sums;
+    std::vector<std::pair<float, std::uint32_t>> knn_sims;
+};
+
+struct FragmentGeometryScratchPool {
+    static constexpr std::size_t kMaxCached = 8;
+    std::mutex mutex;
+    std::vector<std::unique_ptr<FragmentGeometryScratch>> cached;
+
+    std::unique_ptr<FragmentGeometryScratch> acquire() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!cached.empty()) {
+            auto ptr = std::move(cached.back());
+            cached.pop_back();
+            return ptr;
+        }
+        return std::make_unique<FragmentGeometryScratch>();
+    }
+
+    void release(std::unique_ptr<FragmentGeometryScratch> ptr) noexcept {
+        if (!ptr)
+            return;
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (cached.size() < kMaxCached) {
+                cached.push_back(std::move(ptr));
+            }
+        } catch (...) {
+        }
+    }
+};
+
+FragmentGeometryScratchPool& fragment_geometry_scratch_pool() {
+    static FragmentGeometryScratchPool pool;
+    return pool;
+}
+
+struct FragmentGeometryScratchLease {
+    std::unique_ptr<FragmentGeometryScratch> ptr;
+    FragmentGeometryScratchLease() : ptr(fragment_geometry_scratch_pool().acquire()) {}
+    ~FragmentGeometryScratchLease() { fragment_geometry_scratch_pool().release(std::move(ptr)); }
+    FragmentGeometryScratchLease(const FragmentGeometryScratchLease&) = delete;
+    FragmentGeometryScratchLease& operator=(const FragmentGeometryScratchLease&) = delete;
+    FragmentGeometryScratch& get() noexcept { return *ptr; }
+};
 
 } // anonymous namespace
 
@@ -983,9 +1073,12 @@ std::vector<float> score_fragment_geometry_profiled(
     }
     const std::uint32_t dim = enc.output_dim();
     const float neg_inf = -std::numeric_limits<float>::infinity();
-    std::vector<float> owned_bm25_scores;
+    FragmentGeometryScratchLease scratch_lease;
+    auto& scratch = scratch_lease.get();
+    auto& owned_bm25_scores = scratch.owned_bm25_scores;
     std::span<const float> bm25_scores;
-    std::vector<float> qvec(dim, 0.0f);
+    auto& qvec = scratch.qvec;
+    qvec.assign(dim, 0.0f);
 
     const auto t_bm250 = profile ? Clock::now() : Clock::time_point{};
     if (!precomputed_bm25.empty()) {
@@ -1050,14 +1143,9 @@ std::vector<float> score_fragment_geometry_profiled(
         return scores;
     }
 
-    struct FragRef {
-        std::uint32_t pool_index = 0;
-        std::uint32_t frag_index = 0;
-        const float* vec = nullptr;
-    };
-
     const auto t_gather0 = profile ? Clock::now() : Clock::time_point{};
-    std::vector<FragRef> frags;
+    auto& frags = scratch.frags;
+    frags.clear();
     frags.reserve(checked_product(pool.size(), cfg.top_fragments_per_doc,
                                   "fragment geometry gather list is too large"));
     for (std::size_t pi = 0; pi < pool.size(); ++pi) {
@@ -1086,11 +1174,15 @@ std::vector<float> score_fragment_geometry_profiled(
     const auto t_white0 = profile ? Clock::now() : Clock::time_point{};
     const std::size_t fragment_value_count =
         checked_product(frags.size(), dim, "fragment geometry vector workspace is too large");
-    std::vector<float> fvecs_raw(fragment_value_count, 0.0f);
+    auto& fvecs_raw = scratch.fvecs_raw;
+    fvecs_raw.resize(fragment_value_count);
     // mean=0 / var=1 makes the transform below the identity, i.e. plain
     // L2-normalized cosine (cfg.whiten=false). Per-query whitening overwrites them
     // with the pool-fragment statistics; see FragmentGeometryConfig::whiten.
-    std::vector<float> mean(dim, 0.0f), var(dim, 1.0f);
+    auto& mean = scratch.mean;
+    auto& var = scratch.var;
+    mean.assign(dim, 0.0f);
+    var.assign(dim, 1.0f);
     for (std::size_t i = 0; i < frags.size(); ++i) {
         const auto did = pool[frags[i].pool_index].first;
         const auto& src_frag = doc_frags[did][frags[i].frag_index];
@@ -1099,7 +1191,8 @@ std::vector<float> score_fragment_geometry_profiled(
         frags[i].vec = dst;
     }
     if (cfg.whiten) {
-        std::vector<float> m2(dim, 0.0f);
+        auto& m2 = scratch.m2;
+        m2.assign(dim, 0.0f);
         std::size_t seen = 0;
         for (std::size_t i = 0; i < frags.size(); ++i) {
             const float* x = fvecs_raw.data() + i * dim;
@@ -1117,7 +1210,8 @@ std::vector<float> score_fragment_geometry_profiled(
             var[d] = std::sqrt(m2[d] * inv_n + 1e-6f);
     }
 
-    std::vector<float> wq(dim);
+    auto& wq = scratch.wq;
+    wq.resize(dim);
     simd::affine_norm(qvec.data(), mean.data(), var.data(), wq.data(), dim);
     const float wq_inv = simd::l2_normalize(wq.data(), dim);
     if (wq_inv <= 0.0f) {
@@ -1128,7 +1222,8 @@ std::vector<float> score_fragment_geometry_profiled(
         return scores;
     }
 
-    std::vector<float> fvecs(fragment_value_count, 0.0f);
+    auto& fvecs = scratch.fvecs;
+    fvecs.resize(fragment_value_count);
     for (std::size_t i = 0; i < frags.size(); ++i) {
         float* dst = fvecs.data() + i * dim;
         simd::affine_norm(fvecs_raw.data() + i * dim, mean.data(), var.data(), dst, dim);
@@ -1138,7 +1233,8 @@ std::vector<float> score_fragment_geometry_profiled(
         profile->whiten_us = elapsed_us(t_white0, Clock::now());
 
     const auto t_qatt0 = profile ? Clock::now() : Clock::time_point{};
-    std::vector<float> qsim(frags.size(), 0.0f);
+    auto& qsim = scratch.qsim;
+    qsim.resize(frags.size());
     for (std::size_t i = 0; i < frags.size(); ++i)
         qsim[i] = dot(wq.data(), fvecs.data() + i * dim, dim);
     if (profile && !cfg.outer_maxsim)
@@ -1148,16 +1244,22 @@ std::vector<float> score_fragment_geometry_profiled(
     // PHSS+diffusion. Aggregator selected by cfg.doc_scorer_kind: MaxSim |
     // MeanSim | TopKMean | SoftMaxSum.
     if (cfg.outer_maxsim) {
-        std::vector<float> bm_pool(pool.size(), 0.0f);
+        auto& bm_pool = scratch.bm_pool;
+        bm_pool.resize(pool.size());
         for (std::size_t i = 0; i < pool.size(); ++i)
             bm_pool[i] = pool[i].second;
 
         // Group fragment indices by pool_index for non-MaxSim aggregators.
-        std::vector<std::vector<std::uint32_t>> frags_by_pool(pool.size());
+        auto& frags_by_pool = scratch.frags_by_pool;
+        if (frags_by_pool.size() < pool.size())
+            frags_by_pool.resize(pool.size());
+        for (std::size_t pi = 0; pi < pool.size(); ++pi)
+            frags_by_pool[pi].clear();
         for (std::size_t i = 0; i < frags.size(); ++i)
             frags_by_pool[frags[i].pool_index].push_back(static_cast<std::uint32_t>(i));
 
-        std::vector<float> geom_pool(pool.size(), 0.0f);
+        auto& geom_pool = scratch.geom_pool;
+        geom_pool.assign(pool.size(), 0.0f);
         using DK = FragmentGeometryConfig::DocScorerKind;
         switch (cfg.doc_scorer_kind) {
             case DK::MeanSim: {
@@ -1176,13 +1278,14 @@ std::vector<float> score_fragment_geometry_profiled(
             }
             case DK::TopKMean: {
                 const std::uint32_t k = std::max<std::uint32_t>(1u, cfg.doc_scorer_top_k);
+                auto& vals = scratch.topk_vals;
                 for (std::size_t pi = 0; pi < pool.size(); ++pi) {
                     const auto& ids = frags_by_pool[pi];
                     if (ids.empty()) {
                         geom_pool[pi] = 0.0f;
                         continue;
                     }
-                    std::vector<float> vals;
+                    vals.clear();
                     vals.reserve(ids.size());
                     for (auto fi : ids)
                         vals.push_back(qsim[fi]);
@@ -1242,7 +1345,8 @@ std::vector<float> score_fragment_geometry_profiled(
             }
             case DK::MaxSim:
             default: {
-                std::vector<float> max_pool(pool.size(), -std::numeric_limits<float>::infinity());
+                auto& max_pool = scratch.max_pool;
+                max_pool.assign(pool.size(), -std::numeric_limits<float>::infinity());
                 for (std::size_t i = 0; i < frags.size(); ++i) {
                     float& slot = max_pool[frags[i].pool_index];
                     if (qsim[i] > slot)
@@ -1284,7 +1388,7 @@ std::vector<float> score_fragment_geometry_profiled(
     // cosines. Query attention (qsim, above) is untouched. Default off.
     const bool use_graph_prefix = cfg.graph_prefix_dim > 0 && cfg.graph_prefix_dim < dim;
     const std::uint32_t gdim = use_graph_prefix ? cfg.graph_prefix_dim : dim;
-    std::vector<float> gvecs;
+    auto& gvecs = scratch.gvecs;
     const float* gbase = fvecs.data();
     if (use_graph_prefix) {
         gvecs.resize(checked_product(nf, gdim, "fragment geometry prefix workspace is too large"));
@@ -1297,7 +1401,8 @@ std::vector<float> score_fragment_geometry_profiled(
         gbase = gvecs.data();
     }
 
-    std::vector<float> sims_tri(tri_count);
+    auto& sims_tri = scratch.sims_tri;
+    sims_tri.resize(tri_count);
     PhssStats sims_stats;
     sims_stats.count = static_cast<std::uint32_t>(tri_count);
     float sims_min = std::numeric_limits<float>::infinity();
@@ -1365,6 +1470,7 @@ std::vector<float> score_fragment_geometry_profiled(
         if (should_run_phss) {
             PhssConfig phss_cfg = cfg.phss_config;
             phss_cfg.dim_max = 0;
+            phss_cfg.collect_timings = (profile != nullptr);
             const auto t_sel0 = profile ? Clock::now() : Clock::time_point{};
             auto phss_result = phss_select_scale(sims_tri, nf, phss_cfg, &sims_stats);
             const auto t_sel1 = profile ? Clock::now() : Clock::time_point{};
@@ -1398,8 +1504,8 @@ std::vector<float> score_fragment_geometry_profiled(
     // per-fragment term changes the mass distribution, not any constant shift.
     if (cfg.csls_k > 0 && nf > 1) {
         const std::uint32_t k = std::min(cfg.csls_k, nf - 1);
-        std::vector<float> topk(static_cast<std::size_t>(nf) * k,
-                                -std::numeric_limits<float>::infinity());
+        auto& topk = scratch.csls_topk;
+        topk.assign(static_cast<std::size_t>(nf) * k, -std::numeric_limits<float>::infinity());
         const auto offer = [&](std::uint32_t f, float s) {
             float* t = topk.data() + static_cast<std::size_t>(f) * k;
             if (s <= t[k - 1])
@@ -1437,7 +1543,8 @@ std::vector<float> score_fragment_geometry_profiled(
     for (std::size_t i = 0; i < frags.size(); ++i)
         max_logit = std::max(max_logit, query_scale * qsim[i]);
 
-    std::vector<float> mass(frags.size(), 0.0f);
+    auto& mass = scratch.mass;
+    mass.resize(frags.size());
     float mass_sum = 0.0f;
     for (std::size_t i = 0; i < frags.size(); ++i) {
         mass[i] = std::exp(query_scale * qsim[i] - max_logit);
@@ -1456,8 +1563,13 @@ std::vector<float> score_fragment_geometry_profiled(
         x /= mass_sum;
 
     const auto t_adj0 = profile ? Clock::now() : Clock::time_point{};
-    std::vector<std::vector<std::pair<std::uint32_t, float>>> adj(frags.size());
-    std::vector<float> ns(frags.size(), 0.0f);
+    auto& adj = scratch.adj;
+    if (adj.size() < frags.size())
+        adj.resize(frags.size());
+    for (std::size_t i = 0; i < frags.size(); ++i)
+        adj[i].clear();
+    auto& ns = scratch.ns;
+    ns.assign(frags.size(), 0.0f);
     std::uint64_t graph_edges = 0;
 
     if (use_phss_for_graph) {
@@ -1468,12 +1580,10 @@ std::vector<float> score_fragment_geometry_profiled(
         // order — the same order the per-row scan used — so row_sum
         // accumulation and the normalized weights are bit-identical; row_max
         // is a float max, order-independent.
-        struct SurvivorEdge {
-            std::uint32_t i, j;
-            float sim;
-        };
-        std::vector<SurvivorEdge> survivors;
-        std::vector<std::uint32_t> hits(frags.size());
+        auto& survivors = scratch.survivors;
+        survivors.clear();
+        auto& hits = scratch.hits;
+        hits.resize(frags.size());
         const std::uint32_t nfr = static_cast<std::uint32_t>(frags.size());
         for (std::uint32_t i = 0; i < nfr; ++i) {
             const float* row = sims_tri.data() + static_cast<std::size_t>(i) *
@@ -1485,8 +1595,10 @@ std::vector<float> score_fragment_geometry_profiled(
                 survivors.push_back({i, i + 1 + hits[k], row[hits[k]]});
         }
 
-        std::vector<float> row_maxes(frags.size(), -std::numeric_limits<float>::infinity());
-        std::vector<float> row_sums(frags.size(), 0.0f);
+        auto& row_maxes = scratch.row_maxes;
+        auto& row_sums = scratch.row_sums;
+        row_maxes.assign(frags.size(), -std::numeric_limits<float>::infinity());
+        row_sums.assign(frags.size(), 0.0f);
         for (const auto& e : survivors) {
             const float qsim_ij = query_scale * e.sim;
             row_maxes[e.i] = std::max(row_maxes[e.i], qsim_ij);
@@ -1508,7 +1620,7 @@ std::vector<float> score_fragment_geometry_profiled(
             graph_edges += adj[i].size();
         }
     } else {
-        std::vector<std::pair<float, std::uint32_t>> sims;
+        auto& sims = scratch.knn_sims;
         sims.reserve(frags.size() > 0 ? frags.size() - 1 : 0);
         for (std::size_t i = 0; i < frags.size(); ++i) {
             sims.clear();
@@ -1565,11 +1677,19 @@ std::vector<float> score_fragment_geometry_profiled(
         }
         mass.swap(ns);
     }
-    if (profile)
+    if (profile) {
         profile->diffuse_us = elapsed_us(t_diff0, Clock::now());
+        double total_mass = 0.0;
+        for (float m : mass)
+            total_mass += static_cast<double>(m);
+        profile->diffused_mass_sum = total_mass;
+    }
 
     const auto t_blend0 = profile ? Clock::now() : Clock::time_point{};
-    std::vector<float> bm_pool(pool.size(), 0.0f), geom_pool(pool.size(), 0.0f);
+    auto& bm_pool = scratch.bm_pool;
+    auto& geom_pool = scratch.geom_pool;
+    bm_pool.assign(pool.size(), 0.0f);
+    geom_pool.assign(pool.size(), 0.0f);
     for (std::size_t i = 0; i < pool.size(); ++i)
         bm_pool[i] = pool[i].second;
     for (std::size_t i = 0; i < frags.size(); ++i)

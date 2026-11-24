@@ -325,6 +325,40 @@ void test_approx_differential_randomized() {
     }
 }
 
+void test_collect_timings_gating() {
+    constexpr std::uint32_t n = 4;
+    std::vector<float> sims(n * n, 0.0f);
+    sims[0 * n + 1] = sims[1 * n + 0] = 0.95f;
+    sims[2 * n + 3] = sims[3 * n + 2] = 0.95f;
+    sims[0 * n + 2] = sims[2 * n + 0] = 0.3f;
+    sims[0 * n + 3] = sims[3 * n + 0] = 0.3f;
+    sims[1 * n + 2] = sims[2 * n + 1] = 0.3f;
+    sims[1 * n + 3] = sims[3 * n + 1] = 0.3f;
+    const auto tri = make_tri(n, sims);
+
+    for (auto crit : {PhssConfig::Criterion::LargestGapApprox, PhssConfig::Criterion::LargestGap}) {
+        PhssConfig cfg_off;
+        cfg_off.criterion = crit;
+        assert(!cfg_off.collect_timings);
+        const auto r_off = phss_select_scale(tri, n, cfg_off);
+        assert(r_off.edge_gather_us == 0.0);
+        assert(r_off.edge_sort_us == 0.0);
+        assert(r_off.uf_traversal_us == 0.0);
+        assert(r_off.survivor_scan_us == 0.0);
+        assert(r_off.death_sort_us == 0.0);
+        assert(r_off.criterion_us == 0.0);
+
+        PhssConfig cfg_on = cfg_off;
+        cfg_on.collect_timings = true;
+        const auto r_on = phss_select_scale(tri, n, cfg_on);
+        assert(bit_eq(r_off.selected_scale, r_on.selected_scale));
+        assert(bit_eq(r_off.max_gap, r_on.max_gap));
+        assert(r_on.edge_gather_us >= 0.0);
+        assert(r_on.edge_sort_us >= 0.0);
+        assert(r_on.criterion_us >= 0.0);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -339,5 +373,6 @@ int main() {
     test_threshold_filters_partial_edges();
     test_approx_differential_edge_cases();
     test_approx_differential_randomized();
+    test_collect_timings_gating();
     return 0;
 }

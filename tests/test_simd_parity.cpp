@@ -582,6 +582,36 @@ void test_bf16_dimensions() {
     }
 }
 
+void test_pq_fastscan_lut16_parity() {
+    std::mt19937 rng(0xFA575CA4u);
+    std::uniform_int_distribution<int> u8_dist(0, 255);
+    std::uniform_int_distribution<int> code_dist(0, 15);
+    // Include m=300 (> 255) to exercise uint16->uint32 accumulator flush.
+    for (std::uint32_t m : {1u, 8u, 32u, 300u}) {
+        std::vector<std::uint8_t> lut(static_cast<std::size_t>(m) * 16u);
+        for (auto& x : lut)
+            x = static_cast<std::uint8_t>(u8_dist(rng));
+        const float scale = 0.0125f;
+        const float offset = -3.25f;
+        for (std::size_t count :
+             {std::size_t{0}, std::size_t{1}, std::size_t{15}, std::size_t{16}, std::size_t{17},
+              std::size_t{31}, std::size_t{32}, std::size_t{33}, std::size_t{67}}) {
+            std::vector<std::uint8_t> codes(count * m);
+            for (auto& c : codes)
+                c = static_cast<std::uint8_t>(code_dist(rng));
+            std::vector<float> ref(count + 1, -99.0f);
+            std::vector<float> got(count + 1, -99.0f);
+            simeon::simd::pq_fastscan_lut16_scalar(lut.data(), codes.data(), m, count, scale,
+                                                   offset, ref.data());
+            simeon::simd::pq_fastscan_lut16(lut.data(), codes.data(), m, count, scale, offset,
+                                            got.data());
+            for (std::size_t i = 0; i < count; ++i)
+                assert(got[i] == ref[i]);
+            assert(got[count] == -99.0f);
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -605,5 +635,6 @@ int main() {
     test_range_parity();
     test_bf16_dimensions();
     test_affine_norm_dimensions();
+    test_pq_fastscan_lut16_parity();
     return 0;
 }

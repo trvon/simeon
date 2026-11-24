@@ -86,10 +86,18 @@ float dot_avx2(const float* a, const float* b, std::uint32_t n) noexcept {
         acc0 = _mm256_fmadd_ps(a0, b0, acc0);
         acc1 = _mm256_fmadd_ps(a1, b1, acc1);
     }
+    if (i + 8 <= n) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
+        i += 8;
+    }
     __m256 acc = _mm256_add_ps(acc0, acc1);
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     float s = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+    if (i + 4 <= n) {
+        s += horizontal_sum(_mm_mul_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i)));
+        i += 4;
+    }
     for (; i < n; ++i)
         s = std::fma(a[i], b[i], s);
     return s;
@@ -198,6 +206,14 @@ void dot4_avx2(const float* a, const float* b0, const float* b1, const float* b2
         c30 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(b3 + i), c30);
         c31 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(b3 + i + 8), c31);
     }
+    if (i + 8 <= n) {
+        const __m256 a0 = _mm256_loadu_ps(a + i);
+        c00 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(b0 + i), c00);
+        c10 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(b1 + i), c10);
+        c20 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(b2 + i), c20);
+        c30 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(b3 + i), c30);
+        i += 8;
+    }
     const float* bs[4] = {b0, b1, b2, b3};
     const __m256 accs[4] = {_mm256_add_ps(c00, c01), _mm256_add_ps(c10, c11),
                             _mm256_add_ps(c20, c21), _mm256_add_ps(c30, c31)};
@@ -205,9 +221,14 @@ void dot4_avx2(const float* a, const float* b0, const float* b1, const float* b2
         alignas(32) float tmp[8];
         _mm256_store_ps(tmp, accs[k]);
         float s = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+        std::uint32_t t = i;
+        if (t + 4 <= n) {
+            s += horizontal_sum(_mm_mul_ps(_mm_loadu_ps(a + t), _mm_loadu_ps(bs[k] + t)));
+            t += 4;
+        }
         // std::fma, not a * b + s: dot_avx2's tail fuses explicitly, and the
         // bit-identical contract must not depend on -ffp-contract.
-        for (std::uint32_t t = i; t < n; ++t)
+        for (; t < n; ++t)
             s = std::fma(a[t], bs[k][t], s);
         out4[k] = s;
     }
@@ -415,6 +436,67 @@ void fwht_inplace_avx2(float* data, std::uint32_t n) noexcept {
                 data[j + h] = x - y;
             }
         }
+    }
+}
+
+void pq_fastscan_lut16_avx2(const std::uint8_t* lut_u8, const std::uint8_t* codes, std::uint32_t m,
+                            std::size_t count, float scale, float offset, float* out) noexcept {
+    if (count == 0)
+        return;
+    detail::debug_assert_buffer(lut_u8, m * 16u);
+    detail::debug_assert_required(codes);
+    detail::debug_assert_required(out);
+
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256 vscale = _mm256_set1_ps(scale);
+    const __m256 voff = _mm256_set1_ps(offset);
+    std::size_t v = 0;
+    for (; v + 32 <= count; v += 32) {
+        __m256i tot0 = _mm256_setzero_si256(); // lanes 0..7
+        __m256i tot1 = _mm256_setzero_si256(); // lanes 8..15
+        __m256i tot2 = _mm256_setzero_si256(); // lanes 16..23
+        __m256i tot3 = _mm256_setzero_si256(); // lanes 24..31
+        const std::uint8_t* block = codes + v * m;
+
+        // Accumulate up to 255 subspaces in uint16 lanes before widening to uint32.
+        for (std::uint32_t mi_base = 0; mi_base < m; mi_base += 255u) {
+            const std::uint32_t mi_end = std::min(m, mi_base + 255u);
+            __m256i acc_a = _mm256_setzero_si256(); // lo: 0..7, hi: 16..23
+            __m256i acc_b = _mm256_setzero_si256(); // lo: 8..15, hi: 24..31
+            for (std::uint32_t mi = mi_base; mi < mi_end; ++mi) {
+                const __m128i lut128 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(lut_u8 + static_cast<std::size_t>(mi) * 16));
+                const __m256i lut = _mm256_broadcastsi128_si256(lut128);
+                alignas(32) std::uint8_t idx_buf[32];
+                const std::uint8_t* col = block + mi;
+                for (std::size_t lane = 0; lane < 32; ++lane) {
+                    idx_buf[lane] = col[lane * m] & 0x0Fu;
+                }
+                const __m256i idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(idx_buf));
+                const __m256i vals = _mm256_shuffle_epi8(lut, idx);
+                acc_a = _mm256_add_epi16(acc_a, _mm256_unpacklo_epi8(vals, zero));
+                acc_b = _mm256_add_epi16(acc_b, _mm256_unpackhi_epi8(vals, zero));
+            }
+            tot0 = _mm256_add_epi32(tot0, _mm256_cvtepu16_epi32(_mm256_castsi256_si128(acc_a)));
+            tot1 = _mm256_add_epi32(tot1, _mm256_cvtepu16_epi32(_mm256_castsi256_si128(acc_b)));
+            tot2 =
+                _mm256_add_epi32(tot2, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(acc_a, 1)));
+            tot3 =
+                _mm256_add_epi32(tot3, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(acc_b, 1)));
+        }
+
+        _mm256_storeu_ps(out + v, _mm256_fmadd_ps(_mm256_cvtepi32_ps(tot0), vscale, voff));
+        _mm256_storeu_ps(out + v + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(tot1), vscale, voff));
+        _mm256_storeu_ps(out + v + 16, _mm256_fmadd_ps(_mm256_cvtepi32_ps(tot2), vscale, voff));
+        _mm256_storeu_ps(out + v + 24, _mm256_fmadd_ps(_mm256_cvtepi32_ps(tot3), vscale, voff));
+    }
+    for (; v < count; ++v) {
+        const std::uint8_t* c = codes + v * m;
+        std::uint32_t sum = 0;
+        for (std::uint32_t mi = 0; mi < m; ++mi) {
+            sum += lut_u8[static_cast<std::size_t>(mi) * 16 + (c[mi] & 0x0Fu)];
+        }
+        out[v] = std::fma(static_cast<float>(sum), scale, offset);
     }
 }
 
