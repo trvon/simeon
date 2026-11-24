@@ -489,10 +489,20 @@ int main() {
     check(/*whiten=*/false);
     check_invalid_inputs_fail_closed();
     check_precomputed_bm25_matches_bit_identically();
+    std::fprintf(stderr, "fg: precomputed_bm25 ok\n");
+    std::fflush(stderr);
     check_alpha_one_bm25_parity();
+    std::fprintf(stderr, "fg: alpha_one ok\n");
+    std::fflush(stderr);
     check_diffusion_mass_conservation();
+    std::fprintf(stderr, "fg: diffusion_mass ok\n");
+    std::fflush(stderr);
     check_outer_maxsim_monotonicity();
+    std::fprintf(stderr, "fg: outer_maxsim ok\n");
+    std::fflush(stderr);
     check_scratch_reuse_and_thread_safety();
+    std::fprintf(stderr, "fg: scratch_reuse ok\n");
+    std::fflush(stderr);
     if (g_failures > 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;
