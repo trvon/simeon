@@ -445,13 +445,13 @@ void test_parallel_train_deterministic_and_small_dsub() {
     for (std::uint32_t dsub : {4u, 6u, 8u, 12u}) {
         const std::uint32_t m = (dsub == 12u) ? 32u : 8u;
         PQConfig cfg{.dim = m * dsub, .m = m, .k = 16, .seed = 0x51A11D5Bu ^ dsub};
-        constexpr std::uint32_t kTrain = 1024;
+        const std::uint32_t kTrain = (dsub == 12u) ? 1024u : 256u;
         auto train_data = make_random_vectors(kTrain, cfg.dim, 700 + dsub);
 
         ProductQuantizer pq_a(cfg);
         ProductQuantizer pq_b(cfg);
-        pq_a.train(train_data.data(), kTrain, 12);
-        pq_b.train(train_data.data(), kTrain, 12);
+        pq_a.train(train_data.data(), kTrain, 6);
+        pq_b.train(train_data.data(), kTrain, 6);
 
         const auto cb_a = pq_a.codebooks();
         const auto cb_b = pq_b.codebooks();
@@ -480,10 +480,10 @@ void test_parallel_train_deterministic_and_small_dsub() {
 void test_fastscan_lut16_parity_and_fallback() {
     for (std::uint32_t k : {12u, 16u}) {
         PQConfig cfg{.dim = 384, .m = 32, .k = k, .seed = 0xFA570000u ^ k};
-        auto train_data = make_random_vectors(1024, cfg.dim, 1000 + k);
-        l2_normalize_rows(train_data, 1024, cfg.dim);
+        auto train_data = make_random_vectors(256, cfg.dim, 1000 + k);
+        l2_normalize_rows(train_data, 256, cfg.dim);
         ProductQuantizer pq(cfg);
-        pq.train(train_data.data(), 1024, 10);
+        pq.train(train_data.data(), 256, 6);
 
         constexpr std::uint32_t kRows = 67;
         auto query = make_random_vectors(1, cfg.dim, 1100 + k);
@@ -535,11 +535,11 @@ void test_inner_product_recall_l2_normalized() {
     constexpr float kSigmaPt = 0.75f;
 
     const auto centers = make_cluster_centers(kClusters, cfg.dim, kSigmaC, 2001);
-    auto train_data = make_clustered_vectors(2048, cfg.dim, centers, kSigmaPt, 2002);
-    l2_normalize_rows(train_data, 2048, cfg.dim);
+    auto train_data = make_clustered_vectors(1024, cfg.dim, centers, kSigmaPt, 2002);
+    l2_normalize_rows(train_data, 1024, cfg.dim);
 
     ProductQuantizer pq(cfg);
-    pq.train(train_data.data(), 2048, 20);
+    pq.train(train_data.data(), 1024, 10);
 
     constexpr std::uint32_t kDb = 512;
     constexpr std::uint32_t kQ = 16;

@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -490,6 +492,48 @@ struct FragmentGeometryScratch {
     std::vector<float> row_maxes;
     std::vector<float> row_sums;
     std::vector<std::pair<float, std::uint32_t>> knn_sims;
+};
+
+struct FragmentGeometryScratchPool {
+    static constexpr std::size_t kMaxCached = 8;
+    std::mutex mutex;
+    std::vector<std::unique_ptr<FragmentGeometryScratch>> cached;
+
+    std::unique_ptr<FragmentGeometryScratch> acquire() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!cached.empty()) {
+            auto ptr = std::move(cached.back());
+            cached.pop_back();
+            return ptr;
+        }
+        return std::make_unique<FragmentGeometryScratch>();
+    }
+
+    void release(std::unique_ptr<FragmentGeometryScratch> ptr) noexcept {
+        if (!ptr)
+            return;
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (cached.size() < kMaxCached) {
+                cached.push_back(std::move(ptr));
+            }
+        } catch (...) {
+        }
+    }
+};
+
+FragmentGeometryScratchPool& fragment_geometry_scratch_pool() {
+    static FragmentGeometryScratchPool pool;
+    return pool;
+}
+
+struct FragmentGeometryScratchLease {
+    std::unique_ptr<FragmentGeometryScratch> ptr;
+    FragmentGeometryScratchLease() : ptr(fragment_geometry_scratch_pool().acquire()) {}
+    ~FragmentGeometryScratchLease() { fragment_geometry_scratch_pool().release(std::move(ptr)); }
+    FragmentGeometryScratchLease(const FragmentGeometryScratchLease&) = delete;
+    FragmentGeometryScratchLease& operator=(const FragmentGeometryScratchLease&) = delete;
+    FragmentGeometryScratch& get() noexcept { return *ptr; }
 };
 
 } // anonymous namespace
@@ -1029,7 +1073,8 @@ std::vector<float> score_fragment_geometry_profiled(
     }
     const std::uint32_t dim = enc.output_dim();
     const float neg_inf = -std::numeric_limits<float>::infinity();
-    thread_local FragmentGeometryScratch scratch;
+    FragmentGeometryScratchLease scratch_lease;
+    auto& scratch = scratch_lease.get();
     auto& owned_bm25_scores = scratch.owned_bm25_scores;
     std::span<const float> bm25_scores;
     auto& qvec = scratch.qvec;
