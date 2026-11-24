@@ -53,6 +53,10 @@ float dot_neon(const float* a, const float* b, std::uint32_t n) noexcept {
         acc0 = vfmaq_f32(acc0, a0, b0);
         acc1 = vfmaq_f32(acc1, a1, b1);
     }
+    if (i + 4 <= n) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), vld1q_f32(b + i));
+        i += 4;
+    }
     float s = vaddvq_f32(vaddq_f32(acc0, acc1));
     for (; i < n; ++i)
         s = std::fma(a[i], b[i], s);
@@ -145,6 +149,14 @@ void dot4_neon(const float* a, const float* b0, const float* b1, const float* b2
         c30 = vfmaq_f32(c30, a0, vld1q_f32(b3 + i));
         c31 = vfmaq_f32(c31, a1, vld1q_f32(b3 + i + 4));
     }
+    if (i + 4 <= n) {
+        const float32x4_t a0 = vld1q_f32(a + i);
+        c00 = vfmaq_f32(c00, a0, vld1q_f32(b0 + i));
+        c10 = vfmaq_f32(c10, a0, vld1q_f32(b1 + i));
+        c20 = vfmaq_f32(c20, a0, vld1q_f32(b2 + i));
+        c30 = vfmaq_f32(c30, a0, vld1q_f32(b3 + i));
+        i += 4;
+    }
     float s0 = vaddvq_f32(vaddq_f32(c00, c01));
     float s1 = vaddvq_f32(vaddq_f32(c10, c11));
     float s2 = vaddvq_f32(vaddq_f32(c20, c21));
@@ -213,6 +225,23 @@ void dot2x4_neon(const float* a0, const float* a1, const float* b0, const float*
         c031 = vfmaq_f32(c031, x01, y1);
         c130 = vfmaq_f32(c130, x10, y0);
         c131 = vfmaq_f32(c131, x11, y1);
+    }
+    if (i + 4 <= n) {
+        const float32x4_t x00 = vld1q_f32(a0 + i);
+        const float32x4_t x10 = vld1q_f32(a1 + i);
+        float32x4_t y0 = vld1q_f32(b0 + i);
+        c000 = vfmaq_f32(c000, x00, y0);
+        c100 = vfmaq_f32(c100, x10, y0);
+        y0 = vld1q_f32(b1 + i);
+        c010 = vfmaq_f32(c010, x00, y0);
+        c110 = vfmaq_f32(c110, x10, y0);
+        y0 = vld1q_f32(b2 + i);
+        c020 = vfmaq_f32(c020, x00, y0);
+        c120 = vfmaq_f32(c120, x10, y0);
+        y0 = vld1q_f32(b3 + i);
+        c030 = vfmaq_f32(c030, x00, y0);
+        c130 = vfmaq_f32(c130, x10, y0);
+        i += 4;
     }
     float s00 = vaddvq_f32(vaddq_f32(c000, c001));
     float s01 = vaddvq_f32(vaddq_f32(c010, c011));
@@ -401,6 +430,62 @@ void bf16_unpack_neon(const std::uint16_t* src, float* dst, std::uint32_t n) noe
     for (; i < n; ++i) {
         const std::uint32_t bits = static_cast<std::uint32_t>(src[i]) << 16;
         std::memcpy(dst + i, &bits, sizeof(bits));
+    }
+}
+
+void pq_fastscan_lut16_neon(const std::uint8_t* lut_u8, const std::uint8_t* codes, std::uint32_t m,
+                            std::size_t count, float scale, float offset, float* out) noexcept {
+    if (count == 0)
+        return;
+    detail::debug_assert_buffer(lut_u8, m * 16u);
+    detail::debug_assert_required(codes);
+    detail::debug_assert_required(out);
+
+    const float32x4_t vscale = vdupq_n_f32(scale);
+    const float32x4_t voff = vdupq_n_f32(offset);
+    std::size_t v = 0;
+    for (; v + 16 <= count; v += 16) {
+        uint32x4_t tot0 = vdupq_n_u32(0);
+        uint32x4_t tot1 = vdupq_n_u32(0);
+        uint32x4_t tot2 = vdupq_n_u32(0);
+        uint32x4_t tot3 = vdupq_n_u32(0);
+        const std::uint8_t* block = codes + v * m;
+
+        // Accumulate up to 255 subspaces in uint16 lanes (255 * 255 = 65025 < 65535)
+        // before widening to uint32.
+        for (std::uint32_t mi_base = 0; mi_base < m; mi_base += 255u) {
+            const std::uint32_t mi_end = std::min(m, mi_base + 255u);
+            uint16x8_t acc_lo = vdupq_n_u16(0);
+            uint16x8_t acc_hi = vdupq_n_u16(0);
+            for (std::uint32_t mi = mi_base; mi < mi_end; ++mi) {
+                const uint8x16_t lut = vld1q_u8(lut_u8 + static_cast<std::size_t>(mi) * 16);
+                alignas(16) std::uint8_t idx_buf[16];
+                const std::uint8_t* col = block + mi;
+                for (std::size_t lane = 0; lane < 16; ++lane) {
+                    idx_buf[lane] = col[lane * m] & 0x0Fu;
+                }
+                const uint8x16_t vals = vqtbl1q_u8(lut, vld1q_u8(idx_buf));
+                acc_lo = vaddw_u8(acc_lo, vget_low_u8(vals));
+                acc_hi = vaddw_u8(acc_hi, vget_high_u8(vals));
+            }
+            tot0 = vaddw_u16(tot0, vget_low_u16(acc_lo));
+            tot1 = vaddw_u16(tot1, vget_high_u16(acc_lo));
+            tot2 = vaddw_u16(tot2, vget_low_u16(acc_hi));
+            tot3 = vaddw_u16(tot3, vget_high_u16(acc_hi));
+        }
+
+        vst1q_f32(out + v, vfmaq_f32(voff, vcvtq_f32_u32(tot0), vscale));
+        vst1q_f32(out + v + 4, vfmaq_f32(voff, vcvtq_f32_u32(tot1), vscale));
+        vst1q_f32(out + v + 8, vfmaq_f32(voff, vcvtq_f32_u32(tot2), vscale));
+        vst1q_f32(out + v + 12, vfmaq_f32(voff, vcvtq_f32_u32(tot3), vscale));
+    }
+    for (; v < count; ++v) {
+        const std::uint8_t* c = codes + v * m;
+        std::uint32_t sum = 0;
+        for (std::uint32_t mi = 0; mi < m; ++mi) {
+            sum += lut_u8[static_cast<std::size_t>(mi) * 16 + (c[mi] & 0x0Fu)];
+        }
+        out[v] = std::fma(static_cast<float>(sum), scale, offset);
     }
 }
 

@@ -1,10 +1,12 @@
 #include "simeon/pq.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "simeon/hasher.hpp"
@@ -89,12 +91,27 @@ std::uint32_t nearest_centroid(const float* x, const float* centroids, std::uint
 }
 
 float dot(const float* a, const float* b, std::uint32_t n) noexcept {
-    if (n >= 16)
-        return simd::dot(a, b, n);
+    if (n >= 4) {
+#if defined(SIMEON_HAS_NEON)
+        return simd::dot_neon(a, b, n);
+#elif defined(SIMEON_HAS_AVX2)
+        return use_avx2() ? simd::dot_avx2(a, b, n) : simd::dot_scalar(a, b, n);
+#else
+        return simd::dot_scalar(a, b, n);
+#endif
+    }
     float acc = 0.0f;
     for (std::uint32_t i = 0; i < n; ++i)
         acc += a[i] * b[i];
     return acc;
+}
+
+inline void prefetch_read(const void* ptr) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(ptr, 0, 1);
+#else
+    (void)ptr;
+#endif
 }
 
 float inner_product_from_lut(std::span<const float> lut, std::uint32_t m, std::uint32_t k,
@@ -106,14 +123,50 @@ float inner_product_from_lut(std::span<const float> lut, std::uint32_t m, std::u
     return acc;
 }
 
-// Scores `count` codes, four at a time. Interleaving independent accumulators hides the latency
-// of the serial add chain; each code still sums its m entries in order from 0.0f, so every
+// Scores `count` codes, eight at a time (with 4-way and 1-way tails). Interleaving
+// independent accumulators hides the latency of the serial add chain and prefetches
+// upcoming code rows; each code still sums its m entries in order from 0.0f, so every
 // result equals inner_product_from_lut() bit for bit.
 template <typename CodeAt>
 void inner_product_from_lut_many(std::span<const float> lut, std::uint32_t m, std::uint32_t k,
                                  CodeAt code_at, std::size_t count, float* out) noexcept {
     const float* table = lut.data();
     std::size_t i = 0;
+    for (; i + 8 <= count; i += 8) {
+        const std::uint8_t* c0 = code_at(i);
+        const std::uint8_t* c1 = code_at(i + 1);
+        const std::uint8_t* c2 = code_at(i + 2);
+        const std::uint8_t* c3 = code_at(i + 3);
+        const std::uint8_t* c4 = code_at(i + 4);
+        const std::uint8_t* c5 = code_at(i + 5);
+        const std::uint8_t* c6 = code_at(i + 6);
+        const std::uint8_t* c7 = code_at(i + 7);
+        if (i + 16 <= count) {
+            prefetch_read(code_at(i + 8));
+            prefetch_read(code_at(i + 12));
+        }
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+        for (std::uint32_t mi = 0; mi < m; ++mi) {
+            const float* row = table + static_cast<std::size_t>(mi) * k;
+            a0 += row[c0[mi]];
+            a1 += row[c1[mi]];
+            a2 += row[c2[mi]];
+            a3 += row[c3[mi]];
+            a4 += row[c4[mi]];
+            a5 += row[c5[mi]];
+            a6 += row[c6[mi]];
+            a7 += row[c7[mi]];
+        }
+        out[i] = a0;
+        out[i + 1] = a1;
+        out[i + 2] = a2;
+        out[i + 3] = a3;
+        out[i + 4] = a4;
+        out[i + 5] = a5;
+        out[i + 6] = a6;
+        out[i + 7] = a7;
+    }
     for (; i + 4 <= count; i += 4) {
         const std::uint8_t* c0 = code_at(i);
         const std::uint8_t* c1 = code_at(i + 1);
@@ -185,16 +238,18 @@ public:
         const std::uint32_t k = cfg_.k;
         codebooks_.assign(static_cast<std::size_t>(cfg_.m) * k * dsub_, 0.0f);
 
-        // Per-subspace working buffers (reused across subspaces).
-        std::vector<float> sub(static_cast<std::size_t>(n_train) * dsub_);
-        std::vector<std::uint32_t> assign(n_train);
-        std::vector<float> new_centroids(static_cast<std::size_t>(k) * dsub_);
-        std::vector<std::uint32_t> counts(k);
+        struct WorkerScratch {
+            std::vector<float> sub;
+            std::vector<std::uint32_t> assign;
+            std::vector<float> new_centroids;
+            std::vector<std::uint32_t> counts;
+            std::vector<float> d2;
+        };
 
-        for (std::uint32_t mi = 0; mi < cfg_.m; ++mi) {
+        auto train_subspace = [&](std::uint32_t mi, WorkerScratch& ws) {
             // Slice subspace `mi` from each training vector.
             for (std::uint32_t i = 0; i < n_train; ++i) {
-                std::memcpy(sub.data() + static_cast<std::size_t>(i) * dsub_,
+                std::memcpy(ws.sub.data() + static_cast<std::size_t>(i) * dsub_,
                             training + static_cast<std::size_t>(i) * cfg_.dim + mi * dsub_,
                             dsub_ * sizeof(float));
             }
@@ -203,9 +258,9 @@ public:
             // (cfg_.seed, mi). Picks the first centroid as training row 0
             // (deterministic; data ordering is the caller's responsibility).
             float* cb = codebooks_.data() + static_cast<std::size_t>(mi) * k * dsub_;
-            std::memcpy(cb, sub.data(), dsub_ * sizeof(float));
+            std::memcpy(cb, ws.sub.data(), dsub_ * sizeof(float));
 
-            std::vector<float> d2(n_train, std::numeric_limits<float>::infinity());
+            std::fill(ws.d2.begin(), ws.d2.end(), std::numeric_limits<float>::infinity());
             std::uint64_t rng_state =
                 splitmix64_mix(cfg_.seed ^ (static_cast<std::uint64_t>(mi) + 1));
             for (std::uint32_t ki = 1; ki < k; ++ki) {
@@ -214,22 +269,22 @@ public:
                 double total = 0.0;
                 std::uint32_t i = 0;
                 for (; i + 4 <= n_train; i += 4) {
-                    const float* batch = sub.data() + static_cast<std::size_t>(i) * dsub_;
+                    const float* batch = ws.sub.data() + static_cast<std::size_t>(i) * dsub_;
                     float distances[4];
                     l2_sq4(last, batch, batch + dsub_, batch + 2 * dsub_, batch + 3 * dsub_,
                            distances, dsub_);
                     for (std::uint32_t lane = 0; lane < 4; ++lane) {
-                        if (distances[lane] < d2[i + lane])
-                            d2[i + lane] = distances[lane];
-                        total += d2[i + lane];
+                        if (distances[lane] < ws.d2[i + lane])
+                            ws.d2[i + lane] = distances[lane];
+                        total += ws.d2[i + lane];
                     }
                 }
                 for (; i < n_train; ++i) {
                     const float distance =
-                        l2_sq(sub.data() + static_cast<std::size_t>(i) * dsub_, last, dsub_);
-                    if (distance < d2[i])
-                        d2[i] = distance;
-                    total += d2[i];
+                        l2_sq(ws.sub.data() + static_cast<std::size_t>(i) * dsub_, last, dsub_);
+                    if (distance < ws.d2[i])
+                        ws.d2[i] = distance;
+                    total += ws.d2[i];
                 }
                 rng_state = splitmix64_mix(rng_state);
                 std::uint32_t pick = 0;
@@ -238,20 +293,20 @@ public:
                         static_cast<double>(rng_state >> 11) / static_cast<double>(1ULL << 53);
                     double target = u * total;
                     double cum = 0.0;
-                    for (std::uint32_t i = 0; i < n_train; ++i) {
-                        cum += d2[i];
+                    for (std::uint32_t j = 0; j < n_train; ++j) {
+                        cum += ws.d2[j];
                         if (cum >= target) {
-                            pick = i;
+                            pick = j;
                             break;
                         }
                     }
                 } else {
                     // All training points coincide with existing centroids —
                     // pick a deterministic fallback.
-                    pick = (rng_state % n_train);
+                    pick = static_cast<std::uint32_t>(rng_state % n_train);
                 }
                 std::memcpy(cb + static_cast<std::size_t>(ki) * dsub_,
-                            sub.data() + static_cast<std::size_t>(pick) * dsub_,
+                            ws.sub.data() + static_cast<std::size_t>(pick) * dsub_,
                             dsub_ * sizeof(float));
             }
 
@@ -260,35 +315,35 @@ public:
                 // Assignment step.
                 std::uint32_t changes = 0;
                 for (std::uint32_t i = 0; i < n_train; ++i) {
-                    const float* x = sub.data() + static_cast<std::size_t>(i) * dsub_;
+                    const float* x = ws.sub.data() + static_cast<std::size_t>(i) * dsub_;
                     const std::uint32_t best = nearest_centroid(x, cb, k, dsub_);
-                    if (it == 0 || assign[i] != best)
+                    if (it == 0 || ws.assign[i] != best)
                         ++changes;
-                    assign[i] = best;
+                    ws.assign[i] = best;
                 }
 
                 // Update step.
-                std::fill(new_centroids.begin(), new_centroids.end(), 0.0f);
-                std::fill(counts.begin(), counts.end(), 0u);
+                std::fill(ws.new_centroids.begin(), ws.new_centroids.end(), 0.0f);
+                std::fill(ws.counts.begin(), ws.counts.end(), 0u);
                 for (std::uint32_t i = 0; i < n_train; ++i) {
-                    const std::uint32_t ki = assign[i];
-                    const float* x = sub.data() + static_cast<std::size_t>(i) * dsub_;
-                    float* c = new_centroids.data() + static_cast<std::size_t>(ki) * dsub_;
+                    const std::uint32_t ki = ws.assign[i];
+                    const float* x = ws.sub.data() + static_cast<std::size_t>(i) * dsub_;
+                    float* c = ws.new_centroids.data() + static_cast<std::size_t>(ki) * dsub_;
                     for (std::uint32_t d = 0; d < dsub_; ++d)
                         c[d] += x[d];
-                    ++counts[ki];
+                    ++ws.counts[ki];
                 }
                 for (std::uint32_t ki = 0; ki < k; ++ki) {
-                    if (counts[ki] == 0) {
+                    if (ws.counts[ki] == 0) {
                         // Empty cluster: reseed from a deterministic pick.
                         rng_state = splitmix64_mix(rng_state);
                         const std::uint32_t pick = static_cast<std::uint32_t>(rng_state % n_train);
                         std::memcpy(cb + static_cast<std::size_t>(ki) * dsub_,
-                                    sub.data() + static_cast<std::size_t>(pick) * dsub_,
+                                    ws.sub.data() + static_cast<std::size_t>(pick) * dsub_,
                                     dsub_ * sizeof(float));
                     } else {
-                        const float inv = 1.0f / static_cast<float>(counts[ki]);
-                        float* c = new_centroids.data() + static_cast<std::size_t>(ki) * dsub_;
+                        const float inv = 1.0f / static_cast<float>(ws.counts[ki]);
+                        float* c = ws.new_centroids.data() + static_cast<std::size_t>(ki) * dsub_;
                         float* dst = cb + static_cast<std::size_t>(ki) * dsub_;
                         for (std::uint32_t d = 0; d < dsub_; ++d)
                             dst[d] = c[d] * inv;
@@ -297,6 +352,49 @@ public:
 
                 if (changes == 0)
                     break;
+            }
+        };
+
+        auto make_scratch = [&]() {
+            WorkerScratch ws;
+            ws.sub.resize(static_cast<std::size_t>(n_train) * dsub_);
+            ws.assign.resize(n_train);
+            ws.new_centroids.resize(static_cast<std::size_t>(k) * dsub_);
+            ws.counts.resize(k);
+            ws.d2.resize(n_train);
+            return ws;
+        };
+
+        const unsigned hw = std::thread::hardware_concurrency();
+        const std::uint32_t n_threads =
+            (cfg_.m >= 8 && n_train >= 1024 && hw > 1)
+                ? std::min<std::uint32_t>(cfg_.m, static_cast<std::uint32_t>(hw))
+                : 1u;
+
+        if (n_threads <= 1u) {
+            auto ws = make_scratch();
+            for (std::uint32_t mi = 0; mi < cfg_.m; ++mi) {
+                train_subspace(mi, ws);
+            }
+        } else {
+            std::atomic<std::uint32_t> next_mi{0};
+            auto worker_fn = [&]() {
+                auto ws = make_scratch();
+                while (true) {
+                    const std::uint32_t mi = next_mi.fetch_add(1u, std::memory_order_relaxed);
+                    if (mi >= cfg_.m)
+                        break;
+                    train_subspace(mi, ws);
+                }
+            };
+            std::vector<std::thread> workers;
+            workers.reserve(n_threads - 1);
+            for (std::uint32_t t = 1; t < n_threads; ++t) {
+                workers.emplace_back(worker_fn);
+            }
+            worker_fn();
+            for (auto& w : workers) {
+                w.join();
             }
         }
 
@@ -479,6 +577,9 @@ public:
                 lut_ip_[static_cast<std::size_t>(mi) * k_ + ki] = dot(q, c, dsub);
             }
         }
+        if (k_ <= 16) {
+            build_fastscan_lut();
+        }
     }
 
     float inner_product(const std::uint8_t* code) const noexcept {
@@ -493,6 +594,16 @@ public:
             out);
     }
 
+    void inner_product_batch_fastscan(const std::uint8_t* codes, std::size_t count,
+                                      float* out) const noexcept {
+        if (k_ <= 16) {
+            simd::pq_fastscan_lut16(lut_u8_.data(), codes, m_, count, fastscan_scale_,
+                                    fastscan_offset_, out);
+            return;
+        }
+        inner_product_batch(codes, count, out);
+    }
+
     void inner_product_gather(const std::uint8_t* codes, const std::size_t* indices,
                               std::size_t count, float* out) const noexcept {
         const std::size_t stride = m_;
@@ -505,9 +616,47 @@ public:
     std::span<const float> lut_ip() const noexcept { return {lut_ip_.data(), lut_ip_.size()}; }
 
 private:
+    void build_fastscan_lut() {
+        lut_u8_.assign(static_cast<std::size_t>(m_) * 16u, 0u);
+        std::vector<float> mins(m_, 0.0f);
+        float max_span = 0.0f;
+        double offset_sum = 0.0;
+        for (std::uint32_t mi = 0; mi < m_; ++mi) {
+            const float* row = lut_ip_.data() + static_cast<std::size_t>(mi) * k_;
+            float mn = row[0];
+            float mx = row[0];
+            for (std::uint32_t ki = 1; ki < k_; ++ki) {
+                mn = std::min(mn, row[ki]);
+                mx = std::max(mx, row[ki]);
+            }
+            mins[mi] = mn;
+            offset_sum += static_cast<double>(mn);
+            max_span = std::max(max_span, mx - mn);
+        }
+        fastscan_offset_ = static_cast<float>(offset_sum);
+        if (max_span <= 0.0f) {
+            fastscan_scale_ = 0.0f;
+            return;
+        }
+        fastscan_scale_ = max_span / 255.0f;
+        const float inv_scale = 255.0f / max_span;
+        for (std::uint32_t mi = 0; mi < m_; ++mi) {
+            const float* row = lut_ip_.data() + static_cast<std::size_t>(mi) * k_;
+            std::uint8_t* dst = lut_u8_.data() + static_cast<std::size_t>(mi) * 16u;
+            const float mn = mins[mi];
+            for (std::uint32_t ki = 0; ki < k_; ++ki) {
+                const float q = std::clamp((row[ki] - mn) * inv_scale, 0.0f, 255.0f);
+                dst[ki] = static_cast<std::uint8_t>(std::lround(q));
+            }
+        }
+    }
+
     std::uint32_t m_;
     std::uint32_t k_;
     std::vector<float> lut_ip_;
+    std::vector<std::uint8_t> lut_u8_;
+    float fastscan_scale_ = 0.0f;
+    float fastscan_offset_ = 0.0f;
 };
 
 PQInnerProductQuery::PQInnerProductQuery(const ProductQuantizer& pq, const float* query) {
@@ -526,6 +675,10 @@ float PQInnerProductQuery::inner_product(const std::uint8_t* code) const noexcep
 void PQInnerProductQuery::inner_product_batch(const std::uint8_t* codes, std::size_t count,
                                               float* out) const noexcept {
     impl_->inner_product_batch(codes, count, out);
+}
+void PQInnerProductQuery::inner_product_batch_fastscan(const std::uint8_t* codes, std::size_t count,
+                                                       float* out) const noexcept {
+    impl_->inner_product_batch_fastscan(codes, count, out);
 }
 void PQInnerProductQuery::inner_product_gather(const std::uint8_t* codes,
                                                const std::size_t* indices, std::size_t count,

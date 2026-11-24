@@ -186,4 +186,22 @@ void bf16_unpack_scalar(const std::uint16_t* src, float* dst, std::uint32_t n) n
     }
 }
 
+void pq_fastscan_lut16_scalar(const std::uint8_t* lut_u8, const std::uint8_t* codes,
+                              std::uint32_t m, std::size_t count, float scale, float offset,
+                              float* out) noexcept {
+    if (count == 0)
+        return;
+    detail::debug_assert_buffer(lut_u8, m * 16u);
+    detail::debug_assert_required(codes);
+    detail::debug_assert_required(out);
+    for (std::size_t v = 0; v < count; ++v) {
+        const std::uint8_t* c = codes + v * m;
+        std::uint32_t sum = 0;
+        for (std::uint32_t mi = 0; mi < m; ++mi) {
+            sum += lut_u8[static_cast<std::size_t>(mi) * 16 + (c[mi] & 0x0Fu)];
+        }
+        out[v] = std::fma(static_cast<float>(sum), scale, offset);
+    }
+}
+
 } // namespace simeon::simd

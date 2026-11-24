@@ -426,6 +426,182 @@ void test_inner_product_batch_bit_identical() {
     }
 }
 
+void l2_normalize_rows(std::vector<float>& vecs, std::uint32_t n, std::uint32_t dim) {
+    for (std::uint32_t i = 0; i < n; ++i) {
+        float* row = vecs.data() + static_cast<std::size_t>(i) * dim;
+        double sq = 0.0;
+        for (std::uint32_t d = 0; d < dim; ++d)
+            sq += static_cast<double>(row[d]) * row[d];
+        const float inv = sq > 0.0 ? static_cast<float>(1.0 / std::sqrt(sq)) : 0.0f;
+        for (std::uint32_t d = 0; d < dim; ++d)
+            row[d] *= inv;
+    }
+}
+
+// Exercises parallel subspace training (m >= 8 && n >= 1024) and small-dsub SIMD dot
+// (dim=384, m=32 -> dsub=12 < 16, plus dsub=4, 6, 8). Verifies bit-identical
+// determinism across runs and SIMD-vs-scalar ADC LUT parity.
+void test_parallel_train_deterministic_and_small_dsub() {
+    for (std::uint32_t dsub : {4u, 6u, 8u, 12u}) {
+        const std::uint32_t m = (dsub == 12u) ? 32u : 8u;
+        PQConfig cfg{.dim = m * dsub, .m = m, .k = 16, .seed = 0x51A11D5Bu ^ dsub};
+        constexpr std::uint32_t kTrain = 1024;
+        auto train_data = make_random_vectors(kTrain, cfg.dim, 700 + dsub);
+
+        ProductQuantizer pq_a(cfg);
+        ProductQuantizer pq_b(cfg);
+        pq_a.train(train_data.data(), kTrain, 12);
+        pq_b.train(train_data.data(), kTrain, 12);
+
+        const auto cb_a = pq_a.codebooks();
+        const auto cb_b = pq_b.codebooks();
+        assert(cb_a.size() == cb_b.size());
+        for (std::size_t i = 0; i < cb_a.size(); ++i)
+            assert(cb_a[i] == cb_b[i]);
+
+        // Verify SIMD dot() LUT matches scalar dot(query, decode(code)).
+        auto query = make_random_vectors(1, cfg.dim, 800 + dsub);
+        auto db = make_random_vectors(32, cfg.dim, 900 + dsub);
+        std::vector<std::uint8_t> codes(32 * cfg.m);
+        pq_a.encode_batch(db.data(), 32, codes.data());
+        PQInnerProductQuery ipq(pq_a, query.data());
+        std::vector<float> recon(cfg.dim);
+        for (std::uint32_t i = 0; i < 32; ++i) {
+            pq_a.decode(codes.data() + i * cfg.m, recon.data());
+            const float adc = ipq.inner_product(codes.data() + i * cfg.m);
+            const float ref = dot(query.data(), recon.data(), cfg.dim);
+            assert(std::fabs(adc - ref) < kEps * std::max(1.0f, std::fabs(ref)));
+        }
+    }
+}
+
+// Verifies 4-bit SIMD FastScan LUT path (k <= 16) matches exact ADC within
+// uint8 quantization error across tail sizes, and falls back bit-identically when k > 16.
+void test_fastscan_lut16_parity_and_fallback() {
+    for (std::uint32_t k : {12u, 16u}) {
+        PQConfig cfg{.dim = 384, .m = 32, .k = k, .seed = 0xFA570000u ^ k};
+        auto train_data = make_random_vectors(1024, cfg.dim, 1000 + k);
+        l2_normalize_rows(train_data, 1024, cfg.dim);
+        ProductQuantizer pq(cfg);
+        pq.train(train_data.data(), 1024, 10);
+
+        constexpr std::uint32_t kRows = 67;
+        auto query = make_random_vectors(1, cfg.dim, 1100 + k);
+        l2_normalize_rows(query, 1, cfg.dim);
+        auto db = make_random_vectors(kRows, cfg.dim, 1200 + k);
+        l2_normalize_rows(db, kRows, cfg.dim);
+
+        std::vector<std::uint8_t> codes(static_cast<std::size_t>(kRows) * cfg.m);
+        pq.encode_batch(db.data(), kRows, codes.data());
+
+        PQInnerProductQuery q(pq, query.data());
+        for (std::size_t count :
+             {std::size_t{0}, std::size_t{1}, std::size_t{7}, std::size_t{8}, std::size_t{15},
+              std::size_t{16}, std::size_t{17}, std::size_t{31}, std::size_t{32}, std::size_t{33},
+              std::size_t{kRows}}) {
+            std::vector<float> exact(count + 1, -2.0f);
+            std::vector<float> fast(count + 1, -2.0f);
+            q.inner_product_batch(codes.data(), count, exact.data());
+            q.inner_product_batch_fastscan(codes.data(), count, fast.data());
+            for (std::size_t i = 0; i < count; ++i) {
+                assert(std::fabs(fast[i] - exact[i]) < 0.05f);
+            }
+            assert(fast[count] == -2.0f);
+        }
+    }
+
+    // Fallback when k > 16 must be bit-identical to inner_product_batch.
+    PQConfig cfg_wide{.dim = 64, .m = 8, .k = 32, .seed = 0xFA570032u};
+    auto train_wide = make_random_vectors(256, cfg_wide.dim, 1300);
+    ProductQuantizer pq_wide(cfg_wide);
+    pq_wide.train(train_wide.data(), 256, 8);
+    auto query = make_random_vectors(1, cfg_wide.dim, 1301);
+    auto db = make_random_vectors(40, cfg_wide.dim, 1302);
+    std::vector<std::uint8_t> codes(40 * cfg_wide.m);
+    pq_wide.encode_batch(db.data(), 40, codes.data());
+    PQInnerProductQuery q_wide(pq_wide, query.data());
+    std::vector<float> exact(40), fast(40);
+    q_wide.inner_product_batch(codes.data(), 40, exact.data());
+    q_wide.inner_product_batch_fastscan(codes.data(), 40, fast.data());
+    for (std::size_t i = 0; i < 40; ++i)
+        assert(fast[i] == exact[i]);
+}
+
+// PQ inner-product recall on L2-normalized clustered vectors (dim=384, m=32, k=16 -> dsub=12).
+void test_inner_product_recall_l2_normalized() {
+    PQConfig cfg{.dim = 384, .m = 32, .k = 16, .seed = 0xC0514E16u};
+    constexpr std::uint32_t kClusters = 32;
+    constexpr float kSigmaC = 4.0f;
+    constexpr float kSigmaPt = 0.75f;
+
+    const auto centers = make_cluster_centers(kClusters, cfg.dim, kSigmaC, 2001);
+    auto train_data = make_clustered_vectors(2048, cfg.dim, centers, kSigmaPt, 2002);
+    l2_normalize_rows(train_data, 2048, cfg.dim);
+
+    ProductQuantizer pq(cfg);
+    pq.train(train_data.data(), 2048, 20);
+
+    constexpr std::uint32_t kDb = 512;
+    constexpr std::uint32_t kQ = 16;
+    constexpr std::uint32_t kTopK = 10;
+
+    auto db = make_clustered_vectors(kDb, cfg.dim, centers, kSigmaPt, 2003);
+    auto queries = make_clustered_vectors(kQ, cfg.dim, centers, kSigmaPt, 2004);
+    l2_normalize_rows(db, kDb, cfg.dim);
+    l2_normalize_rows(queries, kQ, cfg.dim);
+
+    std::vector<std::uint8_t> codes(static_cast<std::size_t>(kDb) * cfg.m);
+    pq.encode_batch(db.data(), kDb, codes.data());
+
+    std::uint32_t exact_hits = 0;
+    std::uint32_t fastscan_hits = 0;
+    std::vector<float> batch_scores(kDb);
+    std::vector<float> fast_scores(kDb);
+
+    auto count_hits = [&](const std::vector<std::uint32_t>& gt_sorted,
+                          const std::vector<float>& scores) {
+        std::vector<std::pair<float, std::uint32_t>> ranked(kDb);
+        for (std::uint32_t i = 0; i < kDb; ++i)
+            ranked[i] = {scores[i], i};
+        std::partial_sort(ranked.begin(), ranked.begin() + kTopK, ranked.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::vector<std::uint32_t> top(kTopK);
+        for (std::uint32_t i = 0; i < kTopK; ++i)
+            top[i] = ranked[i].second;
+        std::sort(top.begin(), top.end());
+        std::vector<std::uint32_t> inter;
+        std::set_intersection(gt_sorted.begin(), gt_sorted.end(), top.begin(), top.end(),
+                              std::back_inserter(inter));
+        return static_cast<std::uint32_t>(inter.size());
+    };
+
+    for (std::uint32_t qi = 0; qi < kQ; ++qi) {
+        const float* q = queries.data() + static_cast<std::size_t>(qi) * cfg.dim;
+        std::vector<std::pair<float, std::uint32_t>> gt(kDb);
+        for (std::uint32_t i = 0; i < kDb; ++i)
+            gt[i] = {dot(q, db.data() + static_cast<std::size_t>(i) * cfg.dim, cfg.dim), i};
+        std::partial_sort(gt.begin(), gt.begin() + kTopK, gt.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::vector<std::uint32_t> gt_top(kTopK);
+        for (std::uint32_t i = 0; i < kTopK; ++i)
+            gt_top[i] = gt[i].second;
+        std::sort(gt_top.begin(), gt_top.end());
+
+        PQInnerProductQuery ipq(pq, q);
+        ipq.inner_product_batch(codes.data(), kDb, batch_scores.data());
+        ipq.inner_product_batch_fastscan(codes.data(), kDb, fast_scores.data());
+        exact_hits += count_hits(gt_top, batch_scores);
+        fastscan_hits += count_hits(gt_top, fast_scores);
+    }
+
+    const double recall_exact = static_cast<double>(exact_hits) / (kQ * kTopK);
+    const double recall_fast = static_cast<double>(fastscan_hits) / (kQ * kTopK);
+    std::printf("PQ IP Recall@10 (L2-norm 384d, m=32, k=16): exact=%.3f fastscan=%.3f\n",
+                recall_exact, recall_fast);
+    assert(recall_exact >= 0.5);
+    assert(recall_fast >= 0.45);
+}
+
 int main() {
     test_construction_validation();
     test_random_gaussian_init_deterministic();
@@ -437,6 +613,9 @@ int main() {
     test_inner_product_batch_bit_identical();
     test_non_multiple_of_four_centroids();
     test_recall_at_10();
+    test_parallel_train_deterministic_and_small_dsub();
+    test_fastscan_lut16_parity_and_fallback();
+    test_inner_product_recall_l2_normalized();
     std::printf("test_pq: all passed\n");
     return 0;
 }

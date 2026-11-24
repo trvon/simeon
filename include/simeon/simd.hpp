@@ -186,15 +186,27 @@ void affine_norm_avx2(const float* src, const float* mean, const float* std_dev,
 void bf16_pack_scalar(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept;
 void bf16_unpack_scalar(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept;
 
+// 4-bit SIMD FastScan PQ LUT inner product (André et al. 2021 TPAMI).
+// `lut_u8` has `m * 16` quantized uint8 entries (16 per subspace); `codes` has
+// `count * m` code bytes in [0, 15]. Writes
+// `out[v] = fma(sum_{mi} lut_u8[mi * 16 + (codes[v * m + mi] & 0x0F)], scale, offset)`.
+void pq_fastscan_lut16_scalar(const std::uint8_t* lut_u8, const std::uint8_t* codes,
+                              std::uint32_t m, std::size_t count, float scale, float offset,
+                              float* out) noexcept;
+
 #if defined(SIMEON_HAS_NEON)
 void bf16_pack_neon(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept;
 void bf16_unpack_neon(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept;
+void pq_fastscan_lut16_neon(const std::uint8_t* lut_u8, const std::uint8_t* codes, std::uint32_t m,
+                            std::size_t count, float scale, float offset, float* out) noexcept;
 #endif
 
 #if defined(SIMEON_HAS_AVX2)
 void bf16_pack_avx2(const float* src, std::uint16_t* dst, std::uint32_t n) noexcept;
 void bf16_unpack_avx2(const std::uint16_t* src, float* dst, std::uint32_t n) noexcept;
 void fwht_inplace_avx2(float* data, std::uint32_t n) noexcept;
+void pq_fastscan_lut16_avx2(const std::uint8_t* lut_u8, const std::uint8_t* codes, std::uint32_t m,
+                            std::size_t count, float scale, float offset, float* out) noexcept;
 #endif
 
 // Runtime-selected dispatcher.
@@ -460,6 +472,27 @@ inline void bf16_unpack(const std::uint16_t* src, float* dst, std::uint32_t n) n
 #endif
         default:
             bf16_unpack_scalar(src, dst, n);
+            return;
+    }
+}
+
+inline void pq_fastscan_lut16(const std::uint8_t* lut_u8, const std::uint8_t* codes,
+                              std::uint32_t m, std::size_t count, float scale, float offset,
+                              float* out) noexcept {
+    SimdTier tier = active_simd_tier();
+    switch (tier) {
+#if defined(SIMEON_HAS_NEON)
+        case SimdTier::Neon:
+            pq_fastscan_lut16_neon(lut_u8, codes, m, count, scale, offset, out);
+            return;
+#endif
+#if defined(SIMEON_HAS_AVX2)
+        case SimdTier::Avx2:
+            pq_fastscan_lut16_avx2(lut_u8, codes, m, count, scale, offset, out);
+            return;
+#endif
+        default:
+            pq_fastscan_lut16_scalar(lut_u8, codes, m, count, scale, offset, out);
             return;
     }
 }

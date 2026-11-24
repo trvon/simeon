@@ -175,6 +175,7 @@ struct FragmentGeometryProfile {
     bool phss_used = false;
     float phss_selected_scale = 0.0f;
     float query_confidence = 0.0f;
+    double diffused_mass_sum = 0.0;
 };
 
 // ---------------------------------------------------------------------------

@@ -132,6 +132,11 @@ public:
     /// Scores `count` contiguous codes (stride m) into `out`; bit-identical to inner_product().
     void inner_product_batch(const std::uint8_t* codes, std::size_t count,
                              float* out) const noexcept;
+    /// FastScan 4-bit SIMD LUT path (André et al. 2021 TPAMI) for k <= 16 using quantized
+    /// uint8 LUTs (`vqtbl1q_u8` on NEON / `_mm256_shuffle_epi8` on AVX2). Falls back to
+    /// inner_product_batch() when k > 16.
+    void inner_product_batch_fastscan(const std::uint8_t* codes, std::size_t count,
+                                      float* out) const noexcept;
     /// Scores codes[indices[i] * m] for i < count into `out`; bit-identical to inner_product().
     void inner_product_gather(const std::uint8_t* codes, const std::size_t* indices,
                               std::size_t count, float* out) const noexcept;

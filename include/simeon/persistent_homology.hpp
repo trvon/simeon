@@ -71,6 +71,10 @@ struct PhssConfig {
 
     // When true, also return the full persistence diagram for telemetry.
     bool output_diagram = false;
+
+    // When true, collect per-phase steady_clock timings into PhssResult::*_us.
+    // Default false avoids steady_clock::now() syscalls on the hot query path.
+    bool collect_timings = false;
 };
 
 // Scale selection result.
@@ -93,9 +97,9 @@ struct PhssResult {
     // Diagnostic: number of persistence pairs.
     std::uint32_t n_pairs = 0;
 
-    // Sub-phase wall-clock timers (µs). Always populated by
-    // phss_select_scale(); zero on the LargestGapApprox fast path for
-    // phases that don't run (uf_traversal, survivor_scan).
+    // Sub-phase wall-clock timers (µs). Populated when PhssConfig::collect_timings
+    // is true; zero otherwise (and zero on the LargestGapApprox fast path for
+    // phases that don't run: uf_traversal, survivor_scan).
     double edge_gather_us = 0.0;
     double edge_sort_us = 0.0;
     double uf_traversal_us = 0.0;
@@ -136,7 +140,8 @@ namespace detail {
 // Reference O(m log m) LargestGapApprox: threshold-filter + full sort + largest
 // adjacent-gap scan. Retained as the differential-test oracle and as the
 // degenerate-case fallback for the O(m) bucket path in phss_select_scale.
-PhssResult phss_largest_gap_sorted(std::span<const float> similarities, float threshold);
+PhssResult phss_largest_gap_sorted(std::span<const float> similarities, float threshold,
+                                   bool collect_timings = false);
 
 } // namespace detail
 
