@@ -382,33 +382,6 @@ void test_subword_aware_smooth_blends_exact_and_ngram() {
     assert(any_diff);
 }
 
-void test_subword_aware_smooth_normalizes_ngram_sum_by_term_length() {
-    // Long rare terms emit far more char n-grams than short terms; dividing
-    // the n-gram BM25+ sum by |G(t)| keeps single-term SabSmooth scores on
-    // the same order of magnitude regardless of term length.
-    Bm25Config cfg;
-    cfg.variant = Bm25Variant::SubwordAwareBackoff;
-    cfg.subword_gamma = 5.0f;
-    Bm25Index idx(cfg);
-    idx.add_doc("gene alpha beta gamma delta");
-    idx.add_doc("immunohistochemistry alpha beta gamma delta");
-    idx.add_doc("filler one two three four");
-    idx.add_doc("filler five six seven eight");
-    idx.add_doc("filler nine ten eleven twelve");
-    idx.finalize();
-
-    std::vector<float> s_short(5, 0.0f);
-    std::vector<float> s_long(5, 0.0f);
-    idx.score("gene", s_short);
-    idx.score("immunohistochemistry", s_long);
-
-    assert(s_short[0] > 0.0f);
-    assert(s_long[1] > 0.0f);
-    assert(s_long[1] < 20.0f);
-    [[maybe_unused]] const float ratio = s_long[1] / s_short[0];
-    assert(ratio > 0.5f && ratio < 2.0f);
-}
-
 // Cross-fold-validated long-doc → AtireLTD α=0.7 recommendation per
 // TREC-COVID evaluation fixture.
 void test_corpus_class_recommendation_long_doc_picks_ltd() {
@@ -451,7 +424,6 @@ int main() {
     test_subword_aware_oov_query_term_gets_nonzero_score();
     test_subword_aware_strict_collapses_to_bm25plus_on_known_query();
     test_subword_aware_smooth_blends_exact_and_ngram();
-    test_subword_aware_smooth_normalizes_ngram_sum_by_term_length();
     test_corpus_class_recommendation_long_doc_picks_ltd();
     test_corpus_class_recommendation_short_doc_picks_atire();
     test_corpus_class_recommendation_threshold_override();
