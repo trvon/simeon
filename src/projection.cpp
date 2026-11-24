@@ -10,7 +10,9 @@
 #include "simeon/hasher.hpp"
 #include "simeon/simd.hpp"
 
-#if defined(SIMEON_HAS_NEON)
+#if defined(__AVX2__)
+#include <immintrin.h>
+#elif defined(SIMEON_HAS_NEON)
 #include <arm_neon.h>
 #endif
 namespace simeon {
@@ -48,10 +50,23 @@ float gaussian_entry(std::uint32_t row, std::uint32_t col, std::uint64_t seed) n
 // In-place iterative Walsh-Hadamard transform. n must be a power of 2.
 // Unnormalized: applying twice multiplies by n. Caller scales as needed.
 void fwht_inplace(float* data, std::uint32_t n) noexcept {
+#if !defined(__AVX2__) && defined(SIMEON_HAS_AVX2)
+    if (active_simd_tier() == SimdTier::Avx2) {
+        simd::fwht_inplace_avx2(data, n);
+        return;
+    }
+#endif
     for (std::uint32_t h = 1; h < n; h <<= 1) {
         for (std::uint32_t i = 0; i < n; i += h << 1) {
             std::uint32_t j = i;
-#if defined(SIMEON_HAS_NEON)
+#if defined(__AVX2__)
+            for (; j + 8 <= i + h; j += 8) {
+                const __m256 x = _mm256_loadu_ps(data + j);
+                const __m256 y = _mm256_loadu_ps(data + j + h);
+                _mm256_storeu_ps(data + j, _mm256_add_ps(x, y));
+                _mm256_storeu_ps(data + j + h, _mm256_sub_ps(x, y));
+            }
+#elif defined(SIMEON_HAS_NEON)
             for (; j + 4 <= i + h; j += 4) {
                 const float32x4_t x = vld1q_f32(data + j);
                 const float32x4_t y = vld1q_f32(data + j + h);

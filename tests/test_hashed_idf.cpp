@@ -171,6 +171,56 @@ void test_invalid_build_inputs_fail() {
     }
 }
 
+void test_sqrt_tf_composes_with_hashed_idf() {
+    const std::vector<std::string_view> corpus = {"common rare", "common other", "common filler"};
+    auto base = word_config();
+    base.feature_weighting = simeon::FeatureWeighting::SqrtTf;
+
+    // HashedIdf::learn accepts SqrtTf configs and produces the exact same
+    // document-frequency table as Raw.
+    const auto idf_from_sqrt = simeon::HashedIdf::learn(corpus, base, {.hash_dim = 65'536});
+    const auto idf_from_raw = simeon::HashedIdf::learn(corpus, word_config(), {.hash_dim = 65'536});
+    assert(idf_from_sqrt.fingerprint() == idf_from_raw.fingerprint());
+
+    // When tf == 1 for every token, SqrtTf + HashedIdf matches Raw + HashedIdf exactly.
+    auto raw_idf_cfg = word_config();
+    raw_idf_cfg.hashed_idf = &idf_from_raw;
+    auto sqrt_idf_cfg = base;
+    sqrt_idf_cfg.hashed_idf = &idf_from_sqrt;
+
+    simeon::Encoder raw_idf_enc(raw_idf_cfg);
+    simeon::Encoder sqrt_idf_enc(sqrt_idf_cfg);
+    std::vector<float> out_raw_once(raw_idf_enc.output_dim(), 0.0f);
+    std::vector<float> out_sqrt_once(sqrt_idf_enc.output_dim(), 0.0f);
+    raw_idf_enc.encode("common rare", out_raw_once.data());
+    sqrt_idf_enc.encode("common rare", out_sqrt_once.data());
+    assert(out_raw_once == out_sqrt_once);
+
+    // When tf == 4, SqrtTf + HashedIdf saturates TF by sqrt(4) = 2 while
+    // retaining IDF scaling (2 * idf instead of 4 * idf).
+    std::vector<float> out_raw_rep(raw_idf_enc.output_dim(), 0.0f);
+    std::vector<float> out_sqrt_rep(sqrt_idf_enc.output_dim(), 0.0f);
+    raw_idf_enc.encode("rare rare rare rare", out_raw_rep.data());
+    sqrt_idf_enc.encode("rare rare rare rare", out_sqrt_rep.data());
+
+    const auto rare_hash = simeon::hash64("rare", base.hash_seed, base.hash);
+    const auto rare_bucket = static_cast<std::uint32_t>(rare_hash) % base.sketch_dim;
+    const float sign = ((rare_hash >> 63) & 1ULL) ? -1.0f : 1.0f;
+    const float idf_w = static_cast<float>(idf_from_sqrt.weight_q10(rare_hash, 0.5f));
+    assert(out_raw_rep[rare_bucket] == sign * 4.0f * idf_w);
+    assert(out_sqrt_rep[rare_bucket] == sign * 2.0f * idf_w);
+
+    // SketchWeighting::SignedSqrt remains rejected with HashedIdf.
+    auto bad_sketch = word_config();
+    bad_sketch.sketch_weighting = simeon::SketchWeighting::SignedSqrt;
+    bad_sketch.hashed_idf = &idf_from_raw;
+    try {
+        simeon::Encoder bad(bad_sketch);
+        assert(false && "SignedSqrt + HashedIdf must still be rejected");
+    } catch (const std::invalid_argument&) {
+    }
+}
+
 } // namespace
 
 int main() {
@@ -182,5 +232,6 @@ int main() {
     test_compact_corpus_adaptive_preset_attaches_compatible_artifact();
     test_quality_corpus_adaptive_preset_retains_768_coordinates();
     test_invalid_build_inputs_fail();
+    test_sqrt_tf_composes_with_hashed_idf();
     return 0;
 }

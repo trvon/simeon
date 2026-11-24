@@ -125,9 +125,10 @@ HashedIdf HashedIdf::learn(std::span<const std::string_view> corpus,
             "HashedIdf::learn: only char/word hashed encoders are supported");
     if (encoder_config.ngram_min == 0 || encoder_config.ngram_max < encoder_config.ngram_min)
         throw std::invalid_argument("HashedIdf::learn: ngram range invalid");
-    if (encoder_config.feature_weighting != FeatureWeighting::Raw ||
+    if (static_cast<std::uint8_t>(encoder_config.feature_weighting) >
+            static_cast<std::uint8_t>(FeatureWeighting::SqrtTf) ||
         encoder_config.sketch_weighting != SketchWeighting::Raw)
-        throw std::invalid_argument("HashedIdf::learn: non-raw weighting is not composable");
+        throw std::invalid_argument("HashedIdf::learn: non-raw sketch weighting is not composable");
 
     HashedIdf result;
     result.document_count_ = static_cast<std::uint32_t>(corpus.size());

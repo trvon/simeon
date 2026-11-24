@@ -10,8 +10,10 @@
 // Uses explicit checks (not assert) so it is meaningful under NDEBUG/release.
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -178,6 +180,70 @@ void check_invalid_inputs_fail_closed() {
         "non-finite blend weight is rejected");
 }
 
+void check_precomputed_bm25_matches_bit_identically() {
+    const auto& docs = corpus();
+    simeon::Bm25Config bcfg;
+    bcfg.variant = simeon::Bm25Variant::SubwordAwareBackoff;
+    bcfg.subword_gamma = 5.0f;
+    simeon::Bm25Index idx(bcfg);
+    for (const auto& d : docs)
+        idx.add_doc(d);
+    idx.finalize();
+
+    std::vector<std::string_view> views;
+    views.reserve(docs.size());
+    for (const auto& d : docs)
+        views.emplace_back(d);
+    simeon::PmiConfig pcfg;
+    pcfg.target_rank = 64;
+    pcfg.min_token_count = 1;
+    pcfg.max_vocab_size = 5000;
+    auto pmi = simeon::PmiEmbeddings::learn(std::span<const std::string_view>(views), pcfg);
+
+    simeon::EncoderConfig ecfg;
+    ecfg.ngram_mode = simeon::NGramMode::WordOnly;
+    ecfg.ngram_min = 1;
+    ecfg.ngram_max = 1;
+    ecfg.sketch_dim = 0;
+    ecfg.output_dim = pmi.dim();
+    ecfg.projection = simeon::ProjectionMode::None;
+    ecfg.l2_normalize = true;
+    ecfg.pmi_rows = &pmi;
+    simeon::Encoder enc(ecfg);
+
+    std::vector<std::vector<simeon::SemanticFragment>> frags;
+    frags.reserve(docs.size());
+    for (const auto& d : docs)
+        frags.push_back(simeon::build_doc_semantic_fragments(enc, d, idx, 6, 8));
+
+    simeon::FragmentGeometryConfig cfg;
+    cfg.pool_size = 5;
+    cfg.use_phss = true;
+    cfg.outer_maxsim = true;
+    cfg.doc_scorer_kind = simeon::FragmentGeometryConfig::DocScorerKind::MaxSim;
+
+    std::vector<float> precomputed(docs.size(), 0.0f);
+    idx.score(kQuery, precomputed);
+
+    const auto baseline = simeon::score_fragment_geometry(kQuery, idx, enc, frags, cfg);
+    const auto reused = simeon::score_fragment_geometry(kQuery, idx, enc, frags, cfg, precomputed);
+    expect(baseline.size() == reused.size(), "precomputed BM25 score vector size matches");
+    bool identical = (baseline.size() == reused.size());
+    for (std::size_t i = 0; i < baseline.size() && identical; ++i) {
+        std::uint32_t a_bits = 0, b_bits = 0;
+        std::memcpy(&a_bits, &baseline[i], sizeof(a_bits));
+        std::memcpy(&b_bits, &reused[i], sizeof(b_bits));
+        if (a_bits != b_bits)
+            identical = false;
+    }
+    expect(identical, "precomputed BM25 produces bit-identical fragment geometry scores");
+
+    std::vector<float> bad_size(docs.size() - 1, 0.0f);
+    expect_invalid_argument(
+        [&] { (void)simeon::score_fragment_geometry(kQuery, idx, enc, frags, cfg, bad_size); },
+        "mismatched precomputed BM25 length is rejected");
+}
+
 } // namespace
 
 int main() {
@@ -185,6 +251,7 @@ int main() {
     check(/*whiten=*/true);
     check(/*whiten=*/false);
     check_invalid_inputs_fail_closed();
+    check_precomputed_bm25_matches_bit_identically();
     if (g_failures > 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

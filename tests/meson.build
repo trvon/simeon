@@ -32,6 +32,7 @@ simeon_tests = {
   'test_text_rank': 'test_text_rank.cpp',
   'test_persistent_homology': 'test_persistent_homology.cpp',
   'test_fragment_geometry': 'test_fragment_geometry.cpp',
+  'test_case_folding': 'test_case_folding.cpp',
 }
 
 foreach name, src : simeon_tests

@@ -4,6 +4,7 @@
 #include <intrin.h>
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -250,7 +251,7 @@ public:
             tokenize(text, tok_cfg_, sink);
 
             weighted_sketch.assign(cfg_.sketch_dim, 0);
-            sink.materialize(weighted_sketch.data(), cfg_.sketch_dim);
+            sink.materialize(weighted_sketch.data(), cfg_.sketch_dim, cfg_.hashed_idf);
             for (std::uint32_t i = 0; i < cfg_.sketch_dim; ++i) {
                 const auto value = weighted_sketch[i];
                 if (value < std::numeric_limits<std::int32_t>::min() ||
@@ -328,16 +329,31 @@ private:
             }
         }
 
-        void materialize(std::int64_t* sketch, std::uint32_t dim) const {
+        void materialize(std::int64_t* sketch, std::uint32_t dim,
+                         const HashedIdf* idf = nullptr) const {
             for (const auto& [h, count] : counts) {
                 std::int64_t magnitude = 0;
                 if (count.half_weight != 0) {
-                    magnitude += static_cast<std::int64_t>(
+                    const std::int64_t tf_q10 = static_cast<std::int64_t>(
                         integer_sqrt(static_cast<std::uint64_t>(count.half_weight) << 20));
+                    if (idf != nullptr) {
+                        const std::int64_t idf_q10 =
+                            static_cast<std::int64_t>(idf->weight_q10(h, 0.5f));
+                        magnitude += (tf_q10 * idf_q10) >> 10;
+                    } else {
+                        magnitude += tf_q10;
+                    }
                 }
                 if (count.full_weight != 0) {
-                    magnitude += 2 * static_cast<std::int64_t>(integer_sqrt(
-                                         static_cast<std::uint64_t>(count.full_weight) << 20));
+                    const std::int64_t tf_q10 = static_cast<std::int64_t>(
+                        integer_sqrt(static_cast<std::uint64_t>(count.full_weight) << 20));
+                    if (idf != nullptr) {
+                        const std::int64_t idf_q10 =
+                            static_cast<std::int64_t>(idf->weight_q10(h, 1.0f));
+                        magnitude += 2 * ((tf_q10 * idf_q10) >> 10);
+                    } else {
+                        magnitude += 2 * tf_q10;
+                    }
                 }
                 const std::uint32_t bucket = sketch_bucket(h, dim);
                 const std::int64_t sign = ((h >> 63) & 1ULL) ? -1 : 1;
@@ -398,11 +414,15 @@ private:
         void on_token(std::string_view token, float weight) override {
             const std::uint64_t h = hash64(token, seed, family);
             const std::uint32_t bucket = sketch_bucket(h, dim);
-            const std::int32_t sign = ((h >> 63) & 1ULL) ? -1 : +1;
+            const std::int64_t sign = ((h >> 63) & 1ULL) ? -1 : +1;
             // Integer-weighted count-sketch: char n-grams weight=1.0 → ±2, word tokens
-            // weight=0.5 → ±1. Keeps the sketch deterministic int32 across platforms.
-            const std::int32_t mag = static_cast<std::int32_t>(weight * 2.0f + 0.5f);
-            data[bucket] += sign * mag;
+            // weight=0.5 → ±1. Keeps the sketch deterministic int32 across platforms
+            // while saturating in int64 to avoid signed int32 overflow UB.
+            const std::int64_t mag = static_cast<std::int64_t>(weight * 2.0f + 0.5f);
+            const std::int64_t updated = static_cast<std::int64_t>(data[bucket]) + sign * mag;
+            data[bucket] = static_cast<std::int32_t>(
+                std::clamp<std::int64_t>(updated, std::numeric_limits<std::int32_t>::min(),
+                                         std::numeric_limits<std::int32_t>::max()));
         }
     };
 
@@ -459,10 +479,9 @@ private:
             if (has_pmi)
                 throw std::invalid_argument(
                     "simeon::Encoder: hashed_idf and pmi_rows are mutually exclusive");
-            if (cfg_.feature_weighting != FeatureWeighting::Raw ||
-                cfg_.sketch_weighting != SketchWeighting::Raw)
+            if (cfg_.sketch_weighting != SketchWeighting::Raw)
                 throw std::invalid_argument(
-                    "simeon::Encoder: hashed_idf requires raw feature and sketch weighting");
+                    "simeon::Encoder: hashed_idf requires raw sketch weighting");
             if (!cfg_.hashed_idf->compatible(cfg_))
                 throw std::invalid_argument("simeon::Encoder: hashed_idf does not match encoder "
                                             "tokenization/hash identity");
