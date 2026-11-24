@@ -936,25 +936,22 @@ void Bm25Index::score(std::string_view query, std::span<float> out_scores) const
             }
 
             // N-gram contribution: tokenize this query term into char
-            // n-grams, look each up in ngram_postings_, and take the mean
-            // BM25+ score over |G(t)| weighted by (1-α) so long terms stay
-            // commensurate with exact single-term BM25+. Skips if α==1.
+            // n-grams, look each up in ngram_postings_, sum BM25+ scoring
+            // weighted by (1-α). Skips entirely if α==1 (γ=0 + df>0).
             if (alpha < 1.0f) {
                 collect_unique_query_ngrams(q_strs[qi], cfg_.hash, cfg_.hash_seed, cfg_.ngram_min,
                                             cfg_.ngram_max, term_ngram_hashes);
-                if (!term_ngram_hashes.empty()) {
-                    const float w = (1.0f - alpha) / static_cast<float>(term_ngram_hashes.size());
-                    for (const auto gh : term_ngram_hashes) {
-                        const auto git = ngram_postings_.find(gh);
-                        if (git == ngram_postings_.end())
-                            continue;
-                        const float idf_g = git->second.idf;
-                        for (const auto& [did, tf] : git->second.docs) {
-                            const float tff = static_cast<float>(tf);
-                            const float dl = static_cast<float>(ngram_doc_lengths_[did]);
-                            out_scores[did] +=
-                                w * score_bm25_plus(tff, dl, idf_g, k1, b, ngram_avg, delta);
-                        }
+                const float w = 1.0f - alpha;
+                for (const auto gh : term_ngram_hashes) {
+                    const auto git = ngram_postings_.find(gh);
+                    if (git == ngram_postings_.end())
+                        continue;
+                    const float idf_g = git->second.idf;
+                    for (const auto& [did, tf] : git->second.docs) {
+                        const float tff = static_cast<float>(tf);
+                        const float dl = static_cast<float>(ngram_doc_lengths_[did]);
+                        out_scores[did] +=
+                            w * score_bm25_plus(tff, dl, idf_g, k1, b, ngram_avg, delta);
                     }
                 }
             }
